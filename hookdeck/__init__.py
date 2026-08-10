@@ -68,14 +68,28 @@ def _register_platform(ctx: Any) -> None:
 
 def register(ctx: Any) -> None:
     """Plugin entry point, called once by the Hermes plugin loader."""
+    # Each surface registers independently: a missing optional dependency
+    # should cost the surface that needs it, not the whole plugin. Registering
+    # them in one block is how a plugin becomes a silent absence with no error
+    # to debug.
+    _try_register(ctx, "gateway platform", _register_platform)
+    _try_register(ctx, "CLI commands", _register_cli_commands)
+    _try_register(ctx, "agent tools", _register_tools)
+    _try_register(ctx, "bundled skill", _register_skill)
+
+
+def _try_register(ctx: Any, what: str, register_one: Any) -> None:
     try:
-        _register_platform(ctx)
+        register_one(ctx)
     except Exception:
         logger.exception(
-            "[hookdeck] Could not register the gateway platform — the CLI and "
-            "tools are still available"
+            "[hookdeck] Could not register the %s — the plugin's other "
+            "surfaces are unaffected",
+            what,
         )
 
+
+def _register_cli_commands(ctx: Any) -> None:
     from .cli import hookdeck_command, register_cli
 
     ctx.register_cli_command(
@@ -90,16 +104,17 @@ def register(ctx: Any) -> None:
         ),
     )
 
+def _register_tools(ctx: Any) -> None:
     from .tools import register_tools
 
     register_tools(ctx)
 
-    register_skill = getattr(ctx, "register_skill", None)
-    if callable(register_skill):
-        try:
-            register_skill(
-                name="triage-webhook-failures",
-                path=str(Path(__file__).parent / "skills" / "triage-webhook-failures"),
-            )
-        except Exception:
-            logger.debug("[hookdeck] Skill registration skipped", exc_info=True)
+
+def _register_skill(ctx: Any) -> None:
+    register = getattr(ctx, "register_skill", None)
+    if not callable(register):
+        return
+    register(
+        name="triage-webhook-failures",
+        path=str(Path(__file__).parent / "skills" / "triage-webhook-failures"),
+    )

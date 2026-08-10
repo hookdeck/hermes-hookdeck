@@ -499,9 +499,16 @@ async def _check_live_connections(routes: dict) -> list[Check]:
     """
     checks: list[Check] = []
     async with _api() as api:
-        result = await api.list_connections(limit=100)
-        models = (result or {}).get("models") or (result or {}).get("data") or []
-        for connection in models:
+        # By name, one request per configured route. Listing a page and
+        # filtering would silently skip routes in a project with more
+        # connections than fit — which is precisely the drift this check exists
+        # to catch.
+        found: list[dict] = []
+        for route_name in routes:
+            result = await api.list_connections(name=route_name, limit=10)
+            found += (result or {}).get("models") or (result or {}).get("data") or []
+
+        for connection in found:
             if connection.get("name") not in routes:
                 continue
             for rule in connection.get("rules") or []:

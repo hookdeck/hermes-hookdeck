@@ -26,6 +26,9 @@ _BACKOFF_MAX = 60.0
 # session that happened to end, so backoff keeps growing instead of resetting.
 _HEALTHY_RUN_SECONDS = 20.0
 
+# Generous enough that CLI output never kills a working tunnel.
+_STDOUT_LINE_LIMIT = 1024 * 1024
+
 
 class HookdeckCLIMissing(RuntimeError):
     """The ``hookdeck`` binary is not on PATH."""
@@ -204,6 +207,10 @@ class HookdeckTunnel:
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # A single long line — a large payload echoed into the log — would
+            # otherwise exceed asyncio's 64KiB default and raise, bouncing an
+            # otherwise healthy tunnel through the restart backoff.
+            limit=_STDOUT_LINE_LIMIT,
             env={**os.environ, **({"HOOKDECK_API_KEY": self._api_key} if self._api_key else {})},
         )
         assert self._process.stdout is not None

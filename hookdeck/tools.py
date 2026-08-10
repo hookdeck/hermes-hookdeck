@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
+import time
 from typing import Any, Optional
 
 from .api import HookdeckAPI, HookdeckAPIError
@@ -47,6 +49,43 @@ def _run(coro: Any) -> Any:
     if "error" in box:
         raise box["error"]
     return box.get("value")
+
+
+def _pause_minutes(args: dict) -> int:
+    """Clamp the requested pause to something a forgotten agent cannot hurt."""
+    try:
+        requested = int(args.get("minutes") or DEFAULT_PAUSE_MINUTES)
+    except (TypeError, ValueError):
+        requested = DEFAULT_PAUSE_MINUTES
+    return max(1, min(requested, MAX_PAUSE_MINUTES))
+
+
+def _schedule_resume(connection_id: str, name: str, minutes: int) -> None:
+    """Resume *connection_id* later, in a thread that outlives this tool call.
+
+    A daemon thread rather than a task: the tool's event loop ends with the
+    call, so anything scheduled on it would never run.
+    """
+
+    def _resume_later() -> None:
+        time.sleep(minutes * 60)
+        try:
+            asyncio.run(_unpause(connection_id))
+        except Exception as exc:  # noqa: BLE001 - best effort, logged only
+            logging.getLogger(__name__).error(
+                "[hookdeck] Auto-resume of %s failed: %s. Resume it with "
+                "`hermes hookdeck resume %s`.",
+                name,
+                exc,
+                name,
+            )
+
+    threading.Thread(target=_resume_later, daemon=True).start()
+
+
+async def _unpause(connection_id: str) -> None:
+    async with HookdeckAPI() as api:
+        await api.unpause_connection(connection_id)
 
 
 def _models(result: Any) -> list[dict]:
@@ -175,6 +214,13 @@ def hookdeck_bulk_retry(args: dict) -> str:
     return _run(_go())
 
 
+#: Longest an agent may pause a connection for. Pausing is safe — events are
+#: held rather than dropped — but only until someone resumes, and an agent that
+#: pauses and then fails leaves the queue growing with nobody watching.
+MAX_PAUSE_MINUTES = 60
+DEFAULT_PAUSE_MINUTES = 15
+
+
 def _connection_action(args: dict, pause: bool) -> str:
     name = str(args.get("connection") or "").strip()
     if not name:
@@ -189,11 +235,19 @@ def _connection_action(args: dict, pause: bool) -> str:
                 if not models:
                     return f"No connection named '{name}'."
                 connection_id = models[0].get("id")
-            if pause:
-                await api.pause_connection(connection_id)
-                return f"Paused {name}. Events are queued in Hookdeck until resumed."
-            await api.unpause_connection(connection_id)
-            return f"Resumed {name}. Held events will be delivered."
+            if not pause:
+                await api.unpause_connection(connection_id)
+                return f"Resumed {name}. Held events will be delivered."
+
+            await api.pause_connection(connection_id)
+            minutes = _pause_minutes(args)
+            asyncio.get_running_loop()  # we are inside _run's private loop
+            _schedule_resume(connection_id, name, minutes)
+            return (
+                f"Paused {name}. Events are queued in Hookdeck, and it will "
+                f"resume automatically in {minutes} minutes — resume it sooner "
+                "with hookdeck_resume_connection once the cause is fixed."
+            )
 
     return _run(_go())
 
@@ -289,7 +343,17 @@ SCHEMAS = {
         "Pause a Hookdeck connection so events queue up instead of being "
         "delivered. Use before a restart or when you are about to be unable to "
         "process events correctly.",
-        {"connection": {"type": "string", "description": "Connection name or id."}},
+        {
+            "connection": {"type": "string", "description": "Connection name or id."},
+            "minutes": {
+                "type": "integer",
+                "description": (
+                    f"Auto-resume after this many minutes (default "
+                    f"{DEFAULT_PAUSE_MINUTES}, max {MAX_PAUSE_MINUTES}). The "
+                    "pause always expires — resume sooner once fixed."
+                ),
+            },
+        },
         ["connection"],
     ),
     "hookdeck_resume_connection": _schema(

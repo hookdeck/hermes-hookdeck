@@ -66,6 +66,11 @@ logger = logging.getLogger(__name__)
 # How often the in-flight sweep runs, at most.
 _SWEEP_INTERVAL_SECONDS = 30
 
+# Handing a failed run back to Hookdeck is the last thing standing between it
+# and a lost event, so a transient API failure is retried rather than logged.
+_REDELIVERY_ATTEMPTS = 3
+_REDELIVERY_RETRY_INITIAL_SECONDS = 1.0
+
 
 @dataclass
 class Delivery:
@@ -127,6 +132,10 @@ class HookdeckAdapter(WebhookAdapter):
         self._inflight: dict[str, InFlightRun] = {}
         # Resolved by on_processing_complete; only `sync` mode waits on these.
         self._waiters: dict[str, asyncio.Future] = {}
+        # sync-mode runs that outlasted their timeout and were acked 202. Their
+        # failures need the same explicit hand-back an async_retry run gets,
+        # because Hookdeck has already recorded the delivery as successful.
+        self._acked_before_completion: set[str] = set()
         self._last_sweep = 0.0
 
     @staticmethod
@@ -200,11 +209,11 @@ class HookdeckAdapter(WebhookAdapter):
         self._site_runner = web.AppRunner(self.build_app())
         await self._site_runner.setup()
         if not await self._start_sites():
-            await self._teardown_server()
+            await self._abandon_connect()
             return False
 
         if self.settings.mode == "cli" and not await self._start_tunnels():
-            await self._teardown_server()
+            await self._abandon_connect()
             return False
 
         await self._recover_orphaned_runs()
@@ -283,6 +292,20 @@ class HookdeckAdapter(WebhookAdapter):
         for tunnel in self._tunnels:
             await tunnel.stop()
         self._tunnels = []
+
+    async def _abandon_connect(self) -> None:
+        """Undo a partial connect, so a failed start leaks nothing.
+
+        The gateway may retry ``connect``; a leaked SQLite handle or HTTP
+        client per attempt is how a retry loop becomes a resource leak.
+        """
+        await self._teardown_server()
+        if self._api is not None:
+            await self._api.aclose()
+            self._api = None
+        if self._ledger is not None:
+            self._ledger.close()
+            self._ledger = None
 
     async def _teardown_server(self) -> None:
         if self._site_runner is not None:
@@ -385,6 +408,15 @@ class HookdeckAdapter(WebhookAdapter):
             delivery.event_type,
             delivery.route_name,
         )
+
+        # Before anything acts on the delivery, and before capacity is
+        # considered: a duplicate is a duplicate whether or not there is room
+        # to run it, and deliver_only posts to a channel where a repeat is
+        # visible to a human.
+        if self._is_duplicate(delivery):
+            return self._respond(
+                {"status": "duplicate", "event_id": delivery.event_id}, status=200
+            )
 
         if delivery.route.get("deliver_only"):
             return await self._deliver_without_agent(delivery)
@@ -494,8 +526,14 @@ class HookdeckAdapter(WebhookAdapter):
             is_last_attempt=not self._header(request, WILL_RETRY_AFTER).strip(),
             surrogates_replaced=surrogates_replaced,
         )
+        # Attempt-scoped, not just event-scoped. A redelivery arriving while
+        # the previous run is still going — possible once the sweep releases a
+        # timed-out slot — would otherwise reuse the same identity, overwrite
+        # the in-flight entry, and have the two runs record each other's
+        # outcomes.
         delivery.session_chat_id = (
             f"hookdeck:{route_name}:{event_id or int(time.time() * 1000)}"
+            f":{attempt}"
         )
         return delivery, None
 
@@ -550,6 +588,19 @@ class HookdeckAdapter(WebhookAdapter):
             # the event as delivered.
             return self._respond({"status": "error", "error": "Delivery failed"}, status=502)
 
+        # Recorded so a redelivery is recognised as a duplicate rather than
+        # posting to the channel twice. Hookdeck's own dedupe rule only covers
+        # a short window, and its signature carries no timestamp, so this is
+        # the only replay protection these routes get.
+        if delivery.event_id and self._ledger is not None:
+            self._ledger.admit(
+                delivery.event_id,
+                route=delivery.route_name,
+                attempt=delivery.attempt,
+                session_chat_id=delivery.session_chat_id,
+            )
+            self._ledger.mark_succeeded(delivery.event_id)
+
         return self._respond(
             {
                 "status": "delivered",
@@ -559,8 +610,27 @@ class HookdeckAdapter(WebhookAdapter):
             }
         )
 
+    def _is_duplicate(self, delivery: Delivery) -> bool:
+        """Has this exact delivery already been handled?
+
+        Read-only on purpose. Answering this *before* the capacity check is
+        what stops a duplicate arriving at a busy moment being deferred
+        instead: Hookdeck would redeliver it with a higher attempt number,
+        which then reads as new work and runs the agent a second time.
+        """
+        if not delivery.event_id or self._ledger is None:
+            return False
+        if not self._ledger.is_duplicate(delivery.event_id, delivery.attempt):
+            return False
+        logger.info(
+            "[hookdeck] Skipping %s: already handled at attempt %s",
+            delivery.event_id,
+            delivery.attempt,
+        )
+        return True
+
     def _admit(self, delivery: Delivery) -> Optional[web.Response]:
-        """Capacity check, then deduplication. Order matters.
+        """Claim a slot and a ledger entry, or defer.
 
         Nothing is recorded for a deferred event: a ledger entry would make
         Hookdeck's redelivery look like a duplicate, and the event would vanish.
@@ -721,6 +791,8 @@ class HookdeckAdapter(WebhookAdapter):
                 delivery.session_chat_id,
                 self.settings.sync_timeout_seconds,
             )
+            if delivery.event_id:
+                self._acked_before_completion.add(delivery.event_id)
             return self._respond(
                 {
                     "status": "accepted",
@@ -815,10 +887,9 @@ class HookdeckAdapter(WebhookAdapter):
             )
 
         self._ledger.mark_failed(event_id, reason)
-        if self.settings.ack_mode != "async_retry" or self._api is None:
+        if not self._should_hand_back(event_id):
             return
-        try:
-            await self._api.retry_event(event_id)
+        if await self._request_redelivery(event_id):
             logger.info(
                 "[hookdeck] Agent run failed for event %s (run %d of %d) — "
                 "asked Hookdeck to redeliver",
@@ -826,8 +897,52 @@ class HookdeckAdapter(WebhookAdapter):
                 runs,
                 self.settings.max_agent_retries + 1,
             )
-        except HookdeckAPIError as exc:
-            logger.error("[hookdeck] Could not request redelivery: %s", exc)
+
+    def _should_hand_back(self, event_id: str) -> bool:
+        """Whether this failure needs an explicit redelivery request.
+
+        In ``sync`` mode the 5xx response is the request, so Hookdeck's own
+        rules take over — unless the run outlasted ``sync_timeout_seconds`` and
+        already degraded to 202, at which point Hookdeck believes the delivery
+        succeeded and this *is* the async situation.
+        """
+        if self._api is None:
+            return False
+        if self.settings.ack_mode == "async_retry":
+            return True
+        return event_id in self._acked_before_completion
+
+    async def _request_redelivery(self, event_id: str) -> bool:
+        """Ask Hookdeck to redeliver, retrying a transient API failure.
+
+        This is the only thing standing between a failed run and a lost event:
+        the 202 has already gone, so nothing else will bring it back. A single
+        un-retried call would strand the event on any network blip.
+        """
+        assert self._api is not None
+        delay = _REDELIVERY_RETRY_INITIAL_SECONDS
+        last: Optional[HookdeckAPIError] = None
+        for _ in range(_REDELIVERY_ATTEMPTS):
+            try:
+                await self._api.retry_event(event_id)
+                self._acked_before_completion.discard(event_id)
+                return True
+            except HookdeckAPIError as exc:
+                last = exc
+                await asyncio.sleep(delay)
+                delay *= 2
+
+        logger.error(
+            "[hookdeck] Could not hand event %s back to Hookdeck after %d "
+            "attempts (%s). It is marked failed locally and will be picked up "
+            "by boot recovery on the next restart; `hermes hookdeck replay %s` "
+            "brings it back now.",
+            event_id,
+            _REDELIVERY_ATTEMPTS,
+            last,
+            event_id,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Helpers
@@ -881,20 +996,23 @@ class HookdeckAdapter(WebhookAdapter):
         would discard live traffic, unrecoverable once retention lapses. Turn
         it on only after watching the counter in ``hermes hookdeck status``.
         """
-        headers = {}
-        if self.settings.cancel_retries_on_unparseable:
-            headers["Retry-After"] = "-1"
-            logger.warning(
-                "[hookdeck] Event %s has an unparseable body — cancelling its "
-                "automatic retries (cancel_retries_on_unparseable is on)",
-                event_id or "(no id)",
+        cancelling = self.settings.cancel_retries_on_unparseable
+        headers = {"Retry-After": "-1"} if cancelling else {}
+
+        if self._ledger is not None and event_id:
+            # Recorded either way. With the flag off this is the counter the
+            # advice above refers to: `hermes hookdeck status` shows how often
+            # cancellation *would* have fired, which is the only way to judge
+            # whether turning it on is safe.
+            self._ledger.record_cancelled(
+                event_id, "unparseable body", cancelled=cancelling
             )
-            if self._ledger is not None and event_id:
-                self._ledger.record_cancelled(event_id, "unparseable body")
-        else:
-            logger.warning(
-                "[hookdeck] Event %s has an unparseable body", event_id or "(no id)"
-            )
+
+        logger.warning(
+            "[hookdeck] Event %s has an unparseable body%s",
+            event_id or "(no id)",
+            " — cancelling its automatic retries" if cancelling else "",
+        )
         return self._respond({"error": "Cannot parse body"}, status=400, headers=headers)
 
     def _header(self, request: web.Request, suffix: str) -> str:

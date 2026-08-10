@@ -10,11 +10,25 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping, Optional
-
-import httpx
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from .constants import API_BASE_URL
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import httpx
+
+
+def _httpx():
+    """Import httpx on first use.
+
+    Like aiohttp, httpx is a Hermes extra rather than a core dependency. A
+    module-level import would make the whole plugin — platform, CLI and tools
+    — vanish at discovery on an install without it, which is the silent
+    absence the guards elsewhere exist to prevent.
+    """
+    import httpx
+
+    return httpx
 
 
 def _clean_params(params: Any) -> Any:
@@ -55,7 +69,7 @@ class HookdeckAPI:
         *,
         base_url: str = API_BASE_URL,
         timeout: float = 20.0,
-        client: Optional[httpx.AsyncClient] = None,
+        client: Optional["httpx.AsyncClient"] = None,
     ):
         self.api_key = api_key or os.getenv("HOOKDECK_API_KEY", "")
         self.base_url = base_url.rstrip("/")
@@ -67,9 +81,9 @@ class HookdeckAPI:
     # Plumbing
     # ------------------------------------------------------------------
 
-    def _ensure_client(self) -> httpx.AsyncClient:
+    def _ensure_client(self) -> "httpx.AsyncClient":
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._timeout)
+            self._client = _httpx().AsyncClient(timeout=self._timeout)
         return self._client
 
     async def aclose(self) -> None:

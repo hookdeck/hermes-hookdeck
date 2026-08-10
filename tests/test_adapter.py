@@ -530,7 +530,9 @@ async def test_an_unparseable_body_is_rejected_without_cancelling_retries(client
     # Default is off: cancelling retries on a parser's say-so is unrecoverable
     # once retention lapses, so it must be opted into.
     assert "Retry-After" not in response.headers
-    assert adapter._ledger.get("evt_bad_body") is None
+    # Still recorded, as `would_cancel`. "Measure how often this would fire
+    # before enabling it" needs something to measure, and a log line is not it.
+    assert adapter._ledger.get("evt_bad_body")["status"] == "would_cancel"
 
 
 async def test_cancel_on_unparseable_emits_retry_after_minus_one(client_factory):
@@ -887,3 +889,158 @@ async def test_a_delivery_with_no_event_id_is_processed_but_warned_about(
     # No id means no dedup and no retry — a real loss of guarantees, so it must
     # not degrade quietly.
     assert "without deduplication or retry" in caplog.text
+
+
+# ----------------------------------------------------------------------
+# Deduplication precedence
+# ----------------------------------------------------------------------
+
+
+async def test_a_duplicate_at_capacity_is_answered_as_a_duplicate(client_factory):
+    # If a duplicate were deferred instead, Hookdeck would redeliver it with a
+    # higher attempt number — which reads as new work, and runs the agent a
+    # second time for an event already handled.
+    adapter, client = await client_factory({"default": {}}, max_concurrent=1)
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    await post(client, {"n": 1}, event_id="evt_a", attempt=1)
+    await _settle()
+
+    gate = asyncio.Event()
+
+    async def _slow(_event):
+        await gate.wait()
+        return ProcessingOutcome.SUCCESS
+
+    adapter.run_agent = _slow
+    await post(client, {"n": 2}, event_id="evt_b", attempt=1)  # occupies the slot
+    await _settle()
+
+    repeat = await post(client, {"n": 1}, event_id="evt_a", attempt=1)
+    assert repeat.status == 200
+    assert (await repeat.json())["status"] == "duplicate"
+
+    gate.set()
+    await _settle()
+    assert len(seen) == 1
+
+
+async def test_deliver_only_routes_are_deduplicated_too(client_factory):
+    # A repeat here posts to a channel a human is reading. Hookdeck's signature
+    # carries no timestamp, so this ledger check is the only replay protection
+    # these routes get.
+    adapter, client = await client_factory(
+        {"default": {"deliver_only": True, "deliver": "slack", "prompt": "alert"}}
+    )
+
+    first = await post(client, {"n": 1}, event_id="evt_dup", attempt=1)
+    assert (await first.json())["status"] == "delivered"
+
+    second = await post(client, {"n": 1}, event_id="evt_dup", attempt=1)
+    assert (await second.json())["status"] == "duplicate"
+    assert len(adapter.direct_deliveries) == 1
+
+
+async def test_a_redelivery_does_not_reuse_the_previous_runs_identity(client_factory):
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    await post(client, {"n": 1}, event_id="evt_x", attempt=1)
+    await _settle()
+    await post(client, {"n": 1}, event_id="evt_x", attempt=2)
+    await _settle()
+
+    # Distinct session ids: otherwise a redelivery arriving while the previous
+    # run is still going overwrites its in-flight entry, and the two runs
+    # record each other's outcomes.
+    assert seen[0].source.chat_id != seen[1].source.chat_id
+
+
+async def test_an_exhausted_event_is_not_admitted_again(client_factory):
+    # Hookdeck's own retries keep arriving in sync mode; without this the
+    # retry budget would be spent by them rather than by max_agent_retries.
+    adapter, client = await client_factory({"default": {}}, max_agent_retries=1)
+
+    async def _fail(_event):
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _fail
+    for attempt in (1, 2):
+        await post(client, {"n": 1}, event_id="evt_spent", attempt=attempt)
+        await _settle()
+    assert adapter._ledger.get("evt_spent")["status"] == "exhausted"
+
+    later = await post(client, {"n": 1}, event_id="evt_spent", attempt=3)
+    assert (await later.json())["status"] == "duplicate"
+
+
+# ----------------------------------------------------------------------
+# Handing failures back
+# ----------------------------------------------------------------------
+
+
+async def test_a_transient_api_failure_does_not_strand_the_event(client_factory, monkeypatch):
+    from hookdeck.api import HookdeckAPIError
+
+    monkeypatch.setattr("hookdeck.adapter._REDELIVERY_RETRY_INITIAL_SECONDS", 0.0)
+    adapter, client = await client_factory({"default": {}})
+
+    calls = {"n": 0}
+
+    async def _flaky(event_id: str):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise HookdeckAPIError(503, "POST", "/retry", "temporarily unavailable")
+        adapter._api.retried.append(event_id)
+
+    adapter._api.retry_event = _flaky
+
+    async def _fail(_event):
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _fail
+    await post(client, {"n": 1}, event_id="evt_flaky")
+    await _settle()
+    await asyncio.sleep(0.05)
+
+    # The 202 is already sent, so a single un-retried call losing to a network
+    # blip would strand the event with nothing left to bring it back.
+    assert adapter._api.retried == ["evt_flaky"]
+
+
+async def test_a_timed_out_sync_run_still_hands_its_failure_back(client_factory, monkeypatch):
+    # Once sync degrades to 202, Hookdeck records the delivery as successful —
+    # so its own retry rules will not fire, and this is the async situation.
+    monkeypatch.setattr("hookdeck.adapter._REDELIVERY_RETRY_INITIAL_SECONDS", 0.0)
+    adapter, client = await client_factory(
+        {"default": {}}, ack_mode="sync", sync_timeout_seconds=0.05
+    )
+    gate = asyncio.Event()
+
+    async def _slow_failure(_event):
+        await gate.wait()
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _slow_failure
+    response = await post(client, {"n": 1}, event_id="evt_slow_fail")
+    assert response.status == 202
+
+    gate.set()
+    await _settle()
+    assert adapter._api.retried == ["evt_slow_fail"]
+
+
+async def test_a_sync_failure_within_the_timeout_is_left_to_hookdeck(client_factory):
+    # The 5xx response *is* the retry request there; asking again would double
+    # the redeliveries.
+    adapter, client = await client_factory({"default": {}}, ack_mode="sync")
+
+    async def _fail(_event):
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _fail
+    assert (await post(client, {"n": 1}, event_id="evt_sync_fail")).status == 500
+    await _settle()
+    assert adapter._api.retried == []

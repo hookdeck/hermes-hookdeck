@@ -41,11 +41,11 @@ optional_env:
     prompt: "Base path"
     password: false
   - name: HOOKDECK_SOURCE
-    description: "Hookdeck source name to listen to in cli mode (default: all sources)"
+    description: "Hookdeck source to forward in cli mode. Required unless every route sets its own `source`."
     prompt: "Hookdeck source name"
     password: false
   - name: HOOKDECK_ALLOWED_USERS
-    description: "Comma-separated route names allowed to trigger the agent (allowlist)"
+    description: "Allowlist, only consulted for INSECURE_NO_AUTH routes. Entries are the sender ids the adapter reports: hookdeck:<route>."
     prompt: "Allowed route names"
     password: false
   - name: HOOKDECK_ALLOW_ALL_USERS

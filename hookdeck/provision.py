@@ -19,7 +19,10 @@ from typing import Any, Mapping, Optional
 
 from .constants import RETRYABLE_STATUSES
 
-DEFAULT_RETRY_COUNT = 5
+# Comfortably more than DEFAULT_DEFER_ATTEMPT_LIMIT: the first few attempts of
+# a deferred event carry a short Retry-After, and these are the attempts left
+# for exponential backoff to spread once saturation proves persistent.
+DEFAULT_RETRY_COUNT = 10
 DEFAULT_RETRY_INTERVAL_MS = 30_000
 DEFAULT_DEDUPE_WINDOW_MS = 60_000
 DEFAULT_GROUP_RATE = 1
@@ -173,6 +176,14 @@ def _destination_spec(
 ) -> dict[str, Any]:
     """The inline destination: a CLI tunnel target, or a reachable URL."""
     if mode == "cli":
+        if rate_limit or delivery_group_key:
+            # CLI destinations have no rate_limit field at all, so accepting
+            # these silently would promise throttling that never happens.
+            raise ValueError(
+                "cli mode cannot throttle: Hookdeck CLI destinations have no "
+                "rate limit or delivery groups. Use mode: push for those, or "
+                "cap runs with platforms.hookdeck.extra.max_concurrent."
+            )
         return {
             "name": name,
             "type": "CLI",

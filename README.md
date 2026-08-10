@@ -255,6 +255,10 @@ than core's exemption, which covers built-in webhook routes even unverified.
 - Every recovery path is bounded by your plan's retention: 3 days on
   Developer, 7 on Team, 30 on Growth. An outage longer than that is not
   replayable.
+- Only JSON and form-encoded bodies are understood. XML or plain-text
+  providers are rejected with 400 and, since no operator change makes such a
+  body parse, never retried. Put a Hookdeck transformation in front of the
+  connection to convert them, or use a provider webhook that speaks JSON.
 - Boot-time recovery re-runs an event whose run might in fact have completed
   in the instant before a crash. That is the at-least-once contract the whole
   design assumes; set `recover_on_boot: false` if it is wrong for your routes.

@@ -201,9 +201,30 @@ async def retry_event(event_id: str) -> dict:
     return {"status": "queued", "event_id": event_id}
 
 
+async def _require_own_connection(api: HookdeckAPI, connection_id: str) -> None:
+    """Refuse to act on a connection this gateway does not own.
+
+    Filtering the *list* keeps other people's connections off the page, but the
+    endpoint is reachable regardless — and pausing a stranger's production
+    connection is exactly the outage the filtering exists to prevent. The check
+    belongs on the action, not the display.
+    """
+    mine, _ = _own_connections(await _call(api.list_connections, limit=100))
+    if not any(c["id"] == connection_id for c in mine):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "That connection does not belong to a configured route. This "
+                "tab only controls connections named by "
+                "platforms.hookdeck.extra.routes."
+            ),
+        )
+
+
 @router.post("/connections/{connection_id}/pause")
 async def pause(connection_id: str) -> dict:
     async with HookdeckAPI() as api:
+        await _require_own_connection(api, connection_id)
         await _call(api.pause_connection, connection_id)
     return {"status": "paused", "connection_id": connection_id}
 
@@ -211,5 +232,6 @@ async def pause(connection_id: str) -> dict:
 @router.post("/connections/{connection_id}/resume")
 async def resume(connection_id: str) -> dict:
     async with HookdeckAPI() as api:
+        await _require_own_connection(api, connection_id)
         await _call(api.unpause_connection, connection_id)
     return {"status": "resumed", "connection_id": connection_id}
