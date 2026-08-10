@@ -85,9 +85,13 @@ def _cancel_scheduled_resume(connection_id: str) -> None:
 
 
 def _with_ledger(action) -> None:
-    from .state import DeliveryLedger, default_state_path
+    from .settings import configured_state_path
+    from .state import DeliveryLedger
 
-    path = default_state_path()
+    # The path the adapter actually reads, honouring a configured state_path.
+    # Writing a pause deadline anywhere else records it where nothing will
+    # honour it, and the pause simply never ends.
+    path = configured_state_path()
     try:
         ledger = DeliveryLedger(path)
     except Exception as exc:  # noqa: BLE001 - observability, never fatal

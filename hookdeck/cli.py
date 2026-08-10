@@ -25,7 +25,8 @@ from .provision import (
     summarise_payload,
     uncovered_statuses,
 )
-from .state import DeliveryLedger, default_state_path
+from .settings import configured_state_path, load_hermes_config, platform_extra
+from .state import DeliveryLedger
 
 # ----------------------------------------------------------------------
 # Config helpers
@@ -72,36 +73,12 @@ def _other_hookdeck_binaries(chosen: str) -> list[str]:
     return found
 
 
-def _hermes_home() -> Path:
-    return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
-
-
-def _load_hermes_config() -> dict:
-    path = _hermes_home() / "config.yaml"
-    if not path.exists():
-        return {}
-    try:
-        import yaml
-    except ImportError:
-        print(f"! Cannot read {path}: PyYAML is not installed")
-        return {}
-    try:
-        return yaml.safe_load(path.read_text()) or {}
-    except Exception as exc:
-        print(f"! Cannot parse {path}: {exc}")
-        return {}
-
-
-def _platform_extra() -> dict:
-    config = _load_hermes_config()
-    gateway = config.get("gateway") or {}
-    platforms = gateway.get("platforms") or config.get("platforms") or {}
-    return ((platforms.get("hookdeck") or {}).get("extra")) or {}
-
-
-def _ledger_path() -> Path:
-    extra = _platform_extra()
-    return Path(extra.get("state_path") or default_state_path())
+# Re-exported under their historical names; the definitions live in settings so
+# the adapter, CLI, dashboard and agent tools cannot drift apart on where the
+# config and the ledger are.
+_load_hermes_config = load_hermes_config
+_platform_extra = platform_extra
+_ledger_path = configured_state_path
 
 
 # ----------------------------------------------------------------------

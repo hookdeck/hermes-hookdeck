@@ -57,20 +57,15 @@ def _load_plugin_package():
 _load_plugin_package()
 
 from hookdeck.api import HookdeckAPI, HookdeckAPIError  # noqa: E402
-from hookdeck.cli import _load_hermes_config  # noqa: E402
 from hookdeck.provision import routes_from_config  # noqa: E402
-from hookdeck.state import DeliveryLedger, default_state_path  # noqa: E402
+from hookdeck.settings import configured_state_path  # noqa: E402
+from hookdeck.settings import load_hermes_config as _load_hermes_config  # noqa: E402
+from hookdeck.state import DeliveryLedger  # noqa: E402
 
 router = APIRouter()
 
 
-def _ledger_path() -> Path:
-    """Honour an explicit state_path in config, else the shared default."""
-    extra = ((_load_hermes_config().get("gateway") or {}).get("platforms") or {}).get(
-        "hookdeck"
-    ) or {}
-    configured = (extra.get("extra") or {}).get("state_path")
-    return Path(configured) if configured else default_state_path()
+_ledger_path = configured_state_path
 
 
 def _models(result: Any) -> list[dict]:

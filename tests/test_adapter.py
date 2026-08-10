@@ -1141,3 +1141,56 @@ async def test_a_due_pause_is_resumed_at_boot(client_factory):
     assert resumed == ["web_due"]
     # Cleared, so it does not fire again against a later pause.
     assert [r["connection_id"] for r in adapter._ledger.due_resumes()] == []
+
+
+async def test_upkeep_runs_without_any_traffic(client_factory, monkeypatch):
+    # A paused connection produces no deliveries, so a resume deadline driven
+    # off the request path would never come due — the tool promises a pause
+    # that ends, and on a quiet gateway it would not.
+    import time as _time
+
+    monkeypatch.setattr("hookdeck.adapter._MAINTENANCE_INTERVAL_SECONDS", 0.01)
+    adapter, _client = await client_factory({"default": {}})
+    resumed: list[str] = []
+
+    async def _unpause(connection_id: str):
+        resumed.append(connection_id)
+
+    adapter._api.unpause_connection = _unpause
+    adapter._ledger.schedule_resume("web_due", "mine", _time.time() - 1)
+
+    adapter._maintenance = asyncio.create_task(adapter._maintain())
+    try:
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if resumed:
+                break
+    finally:
+        await adapter._stop_maintenance()
+
+    assert resumed == ["web_due"]
+
+
+async def test_a_failing_upkeep_tick_does_not_stop_the_adapter(client_factory, monkeypatch):
+    monkeypatch.setattr("hookdeck.adapter._MAINTENANCE_INTERVAL_SECONDS", 0.01)
+    adapter, _client = await client_factory({"default": {}})
+
+    calls = {"n": 0}
+
+    async def _explode() -> int:
+        calls["n"] += 1
+        raise RuntimeError("boom")
+
+    adapter._resume_due_connections = _explode
+    adapter._maintenance = asyncio.create_task(adapter._maintain())
+    try:
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if calls["n"] >= 2:
+                break
+    finally:
+        await adapter._stop_maintenance()
+
+    # Still ticking after the first failure: upkeep must not be the thing that
+    # takes the adapter down.
+    assert calls["n"] >= 2

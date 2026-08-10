@@ -35,6 +35,53 @@ from .routing import tunnel_plan
 from .state import default_state_path
 
 MODES = ("cli", "push")
+
+
+def hermes_home() -> Path:
+    return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def load_hermes_config() -> dict:
+    """Parse ``config.yaml``, or an empty dict if it cannot be read.
+
+    Never raises: every caller is a diagnostic or an operator command that is
+    more useful degraded than absent.
+    """
+    path = hermes_home() / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+    except ImportError:
+        print(f"! Cannot read {path}: PyYAML is not installed")
+        return {}
+    try:
+        return yaml.safe_load(path.read_text()) or {}
+    except Exception as exc:  # noqa: BLE001 - surfaced, not raised
+        print(f"! Cannot parse {path}: {exc}")
+        return {}
+
+
+def platform_extra(config: Optional[Mapping[str, Any]] = None) -> dict:
+    """``gateway.platforms.hookdeck.extra`` from a parsed config."""
+    parsed = load_hermes_config() if config is None else config
+    gateway = parsed.get("gateway") or {}
+    platforms = gateway.get("platforms") or parsed.get("platforms") or {}
+    return ((platforms.get("hookdeck") or {}).get("extra")) or {}
+
+
+def configured_state_path() -> Path:
+    """The ledger the *running adapter* uses, honouring an explicit override.
+
+    The adapter, the CLI, the dashboard and the agent tools all read and write
+    this file. Resolving it differently in any one of them means writing to a
+    database nobody else reads — which looks exactly like the feature silently
+    not working.
+    """
+    configured = platform_extra().get("state_path")
+    return Path(configured).expanduser() if configured else default_state_path()
+
+
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 

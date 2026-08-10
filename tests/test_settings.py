@@ -82,3 +82,33 @@ def test_a_configuration_that_cannot_run_is_refused_at_startup(extra, message, m
 def test_a_valid_configuration_passes(monkeypatch):
     monkeypatch.delenv("HOOKDECK_MODE", raising=False)
     AdapterSettings.from_extra(MINIMAL).validate()
+
+
+def test_every_caller_resolves_the_same_ledger(tmp_path, monkeypatch):
+    # The adapter writes this file; the CLI, dashboard and agent tools read and
+    # write it. A caller resolving it differently records pause deadlines and
+    # outcomes where nothing else will look — indistinguishable from the
+    # feature silently not working.
+    from hookdeck import cli
+    from hookdeck.settings import configured_state_path
+
+    monkeypatch.setattr(
+        "hookdeck.settings.load_hermes_config",
+        lambda: {
+            "gateway": {
+                "platforms": {
+                    "hookdeck": {"extra": {"state_path": str(tmp_path / "custom.db")}}
+                }
+            }
+        },
+    )
+    assert configured_state_path() == tmp_path / "custom.db"
+    assert cli._ledger_path() == configured_state_path()
+
+
+def test_the_default_is_used_when_nothing_is_configured(monkeypatch):
+    from hookdeck.settings import configured_state_path
+    from hookdeck.state import default_state_path
+
+    monkeypatch.setattr("hookdeck.settings.load_hermes_config", dict)
+    assert configured_state_path() == default_state_path()

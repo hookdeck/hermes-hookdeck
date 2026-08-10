@@ -65,8 +65,10 @@ from .tunnel import HookdeckCLIMissing, HookdeckTunnel
 
 logger = logging.getLogger(__name__)
 
-# How often the in-flight sweep runs, at most.
+# How often the in-flight sweep runs when driven by the request path, at most.
 _SWEEP_INTERVAL_SECONDS = 30
+# How often upkeep runs regardless of traffic.
+_MAINTENANCE_INTERVAL_SECONDS = 30
 
 # Handing a failed run back to Hookdeck is the last thing standing between it
 # and a lost event, so a transient API failure is retried rather than logged.
@@ -145,6 +147,7 @@ class HookdeckAdapter(WebhookAdapter):
         # failures need the same explicit hand-back an async_retry run gets,
         # because Hookdeck has already recorded the delivery as successful.
         self._acked_before_completion: set[str] = set()
+        self._maintenance: Optional[asyncio.Task] = None
         self._last_sweep = 0.0
 
     @staticmethod
@@ -227,6 +230,7 @@ class HookdeckAdapter(WebhookAdapter):
 
         await self._recover_orphaned_runs()
         await self._resume_due_connections()
+        self._maintenance = asyncio.create_task(self._maintain())
 
         self._mark_connected()
         logger.info(
@@ -243,6 +247,7 @@ class HookdeckAdapter(WebhookAdapter):
         return True
 
     async def disconnect(self) -> None:
+        await self._stop_maintenance()
         await self._stop_tunnels()
         await self._teardown_server()
         if self._api is not None:
@@ -297,6 +302,36 @@ class HookdeckAdapter(WebhookAdapter):
             await self._stop_tunnels()
             return False
         return True
+
+    async def _maintain(self) -> None:
+        """Periodic upkeep, independent of traffic.
+
+        Both things this does are needed precisely when nothing is arriving. A
+        paused connection produces no deliveries, so a resume deadline driven
+        off the request path would never come due — the tool promises "it will
+        resume automatically in N minutes" and it would not. A wedged run holds
+        its slot on a quiet gateway for the same reason.
+        """
+        while True:
+            await asyncio.sleep(_MAINTENANCE_INTERVAL_SECONDS)
+            try:
+                self._sweep_inflight(force=True)
+                await self._resume_due_connections()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Upkeep must not be the thing that stops the adapter.
+                logger.exception("[hookdeck] Maintenance tick failed")
+
+    async def _stop_maintenance(self) -> None:
+        if self._maintenance is None:
+            return
+        self._maintenance.cancel()
+        try:
+            await self._maintenance
+        except asyncio.CancelledError:
+            pass
+        self._maintenance = None
 
     async def _resume_due_connections(self) -> int:
         """Unpause anything whose scheduled pause has expired.
@@ -986,13 +1021,15 @@ class HookdeckAdapter(WebhookAdapter):
         assert self._api is not None
         delay = _REDELIVERY_RETRY_INITIAL_SECONDS
         last: Optional[HookdeckAPIError] = None
-        for _ in range(_REDELIVERY_ATTEMPTS):
+        for attempt in range(1, _REDELIVERY_ATTEMPTS + 1):
             try:
                 await self._api.retry_event(event_id)
                 self._acked_before_completion.discard(event_id)
                 return True
             except HookdeckAPIError as exc:
                 last = exc
+                if attempt == _REDELIVERY_ATTEMPTS:
+                    break  # nothing left to wait for
                 await asyncio.sleep(delay)
                 delay *= 2
 
@@ -1127,16 +1164,20 @@ class HookdeckAdapter(WebhookAdapter):
             logger.warning("[hookdeck] Skill loading failed: %s", exc)
         return prompt
 
-    def _sweep_inflight(self) -> None:
+    def _sweep_inflight(self, *, force: bool = False) -> None:
         """Release slots whose completion hook never fired.
 
         ``on_processing_complete`` runs on the success, failure and cancellation
         paths, so this should find nothing — but a slot leaked by an unexpected
         crash would wedge admission control at zero capacity, which is worse
         than the small chance of releasing a slot early.
+
+        Called both from the request path (rate-limited, so a busy gateway
+        reclaims slots promptly without sweeping on every delivery) and from
+        the maintenance tick, which is what covers a gateway with no traffic.
         """
         now = time.time()
-        if now - self._last_sweep < _SWEEP_INTERVAL_SECONDS:
+        if not force and now - self._last_sweep < _SWEEP_INTERVAL_SECONDS:
             return
         self._last_sweep = now
 
@@ -1164,8 +1205,6 @@ class HookdeckAdapter(WebhookAdapter):
 
         if self._ledger is not None:
             self._ledger.prune(self.settings.ledger_ttl_seconds)
-            if self._ledger.due_resumes():
-                self._spawn(self._resume_due_connections())
 
     # Kept for tests and callers that predate `settings`.
     def _validate_startup(self) -> None:
