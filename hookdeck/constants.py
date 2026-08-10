@@ -57,6 +57,51 @@ DEFAULT_RUN_TIMEOUT_SECONDS = 900
 # that arrives over the limit gets 503 + Retry-After so it stays queued.
 ACK_MODES = ("async_retry", "sync")
 
+# Every HTTP status the adapter answers a Hookdeck delivery with, and whether a
+# redelivery of THAT EXACT EVENT could still succeed. This is the single place
+# the question is decided: the provisioned retry rule is derived from it, and
+# emitting an undeclared status raises. Stating the two halves separately is
+# what let an earlier version answer 401 and 404 while provisioning a rule that
+# retried neither — recoverable events, silently discarded.
+#
+# The test is "can a retry of this stored request ever succeed", and it is
+# answered against *this adapter's* operator surface, not the status code in
+# the abstract: 413 is retryable here only because max_body_bytes is operator
+# config. A host that hardcodes its body limit would answer differently.
+EMITTED_STATUS_RETRYABLE = {
+    200: False,  # duplicate, ignored, delivered — nothing to retry
+    202: False,  # accepted
+    400: False,  # unparseable body — part of the stored request, never parses
+    401: True,   # operator fixes destination auth; Hookdeck signs at delivery
+    404: True,   # operator adds or enables the route; same event then matches
+    413: True,   # operator raises max_body_bytes; same event then fits
+    500: True,   # failed run in sync mode
+    502: True,   # direct delivery rejected downstream
+    503: True,   # admission control — capacity frees up
+}
+
+# Statuses a provisioned retry rule must cover. Derived, never hand-written.
+RETRYABLE_STATUSES = tuple(
+    sorted(status for status, retry in EMITTED_STATUS_RETRYABLE.items() if retry)
+)
+
+
+def assert_declared_status(status: int) -> int:
+    """Guard every delivery response against an undeclared status.
+
+    Adding a status without deciding its retryability is the drift this whole
+    table exists to prevent, so it fails at the call site rather than in
+    production six weeks later.
+    """
+    if status not in EMITTED_STATUS_RETRYABLE:
+        raise AssertionError(
+            f"[hookdeck] status {status} is not declared in "
+            "EMITTED_STATUS_RETRYABLE. Decide whether a redelivery of the same "
+            "event could succeed, add it there, and re-run "
+            "`hermes hookdeck setup` so the connection's retry rule matches."
+        )
+    return status
+
 # Matches the built-in webhook adapter's local-testing escape hatch, so the
 # two platforms behave the same way when someone is poking at them with curl.
 INSECURE_NO_AUTH = "INSECURE_NO_AUTH"

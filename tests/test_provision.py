@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from hookdeck.provision import (
+    ADAPTER_RETRYABLE_STATUSES,
     build_connection_payload,
     build_event_filter,
     routes_from_config,
@@ -225,3 +226,29 @@ def test_destination_paths_are_pinned():
         name="x", source_name="x", mode="push", url="https://example.com/hookdeck/x"
     )
     assert http["destination"]["config"]["path_forwarding_disabled"] is True
+
+
+def test_the_retry_rule_is_derived_from_what_the_adapter_emits():
+    from hookdeck.constants import EMITTED_STATUS_RETRYABLE
+    from hookdeck.provision import retryable_status_codes
+
+    codes = retryable_status_codes()
+    # Every retryable emitted status is covered...
+    assert uncovered_statuses(codes, ADAPTER_RETRYABLE_STATUSES) == []
+    # ...and the non-retryable ones are not, so a doomed event fails fast.
+    never = tuple(s for s, r in EMITTED_STATUS_RETRYABLE.items() if not r and s >= 400)
+    assert uncovered_statuses(codes, never) == list(never)
+
+
+def test_adding_a_status_without_deciding_retryability_is_caught():
+    from hookdeck.constants import assert_declared_status
+
+    for declared in (200, 202, 400, 401, 404, 413, 500, 502, 503):
+        assert assert_declared_status(declared) == declared
+    # The whole point: a new status cannot reach the wire without someone
+    # deciding whether a redelivery of the same event could succeed, and the
+    # provisioned rule following from that decision.
+    import pytest as _pytest
+
+    with _pytest.raises(AssertionError, match="EMITTED_STATUS_RETRYABLE"):
+        assert_declared_status(409)

@@ -206,8 +206,11 @@ appends the source request's own path to the destination path — a provider
 POSTing to `<source-url>/events` arrives at `<your-path>/events`. A host
 matching its route path exactly will 404 that, and if the 404 is not retried
 (see §10) the event is gone. Handle a forwarded tail on the receiving side too,
-for connections the plugin did not provision; match on the *segment* rather
-than a string prefix, or route `stripe` will swallow `stripe-test`.
+for connections the plugin did not provision — an operator who wires one up by
+hand still sends sub-path traffic. Guard against route `stripe` swallowing
+`stripe-test`; first-segment matching gets that for free, longest-prefix needs
+an explicit boundary check but can express `/hookdeck/stripe` and
+`/hookdeck/stripe/refunds` as distinct routes. Either is fine.
 
 Destination auth is always `HOOKDECK_SIGNATURE`, in CLI and HTTP modes alike —
 and `auth_type` must be accompanied by an `auth` object, even though
@@ -302,6 +305,19 @@ The same test governs a connection's `response_status_codes`, and getting it
 wrong there is the quieter failure: no cancellation to audit, just an event
 that is never retried. A rule narrowed to `500-599` silently discards every
 recoverable 401 and 404.
+
+**Make the two halves impossible to state separately.** A hand-written rule and
+the code that emits statuses will drift again; both plugins had exactly that
+drift. Declare the emitted statuses and their retryability once, derive the
+connection's `response_status_codes` from that declaration, and make emitting
+an undeclared status an error — a type union in TypeScript, an assert at the
+call site in Python. Adding a status then forces the decision, and the
+provisioned rule follows from it.
+
+Note the test is answered against **this host's operator surface**, not the
+status code in the abstract. `413` is retryable where the body limit is
+operator config and permanent where it is a compiled-in constant. Same rule,
+different answers.
 
 **Last-attempt detection.** An absent or empty `x-hookdeck-will-retry-after`
 means this is the final automatic attempt — the cleanest dead-letter trigger

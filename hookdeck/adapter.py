@@ -67,6 +67,7 @@ from .constants import (
     DEFAULT_RUN_TIMEOUT_SECONDS,
     DEFAULT_SYNC_TIMEOUT_SECONDS,
     EVENT_ID,
+    assert_declared_status,
     INSECURE_NO_AUTH,
     PLATFORM_NAME,
     SOURCE_NAME,
@@ -611,16 +612,16 @@ class HookdeckAdapter(WebhookAdapter):
         self._sweep_inflight()
 
         if (request.content_length or 0) > self._max_body_bytes:
-            return web.json_response({"error": "Payload too large"}, status=413)
+            return web.json_response({"error": "Payload too large"}, status=assert_declared_status(413))
         try:
             raw_body = await request.read()
         except web.HTTPRequestEntityTooLarge:
-            return web.json_response({"error": "Payload too large"}, status=413)
+            return web.json_response({"error": "Payload too large"}, status=assert_declared_status(413))
         except Exception as exc:
             logger.error("[hookdeck] Failed to read body: %s", exc)
-            return web.json_response({"error": "Bad request"}, status=400)
+            return web.json_response({"error": "Bad request"}, status=assert_declared_status(400))
         if len(raw_body) > self._max_body_bytes:
-            return web.json_response({"error": "Payload too large"}, status=413)
+            return web.json_response({"error": "Payload too large"}, status=assert_declared_status(413))
 
         # ── Verify before anything else touches the payload ──────────
         if self._signing_secret != INSECURE_NO_AUTH:
@@ -635,7 +636,7 @@ class HookdeckAdapter(WebhookAdapter):
                     "(source=%s)",
                     self._header(request, SOURCE_NAME) or "unknown",
                 )
-                return web.json_response({"error": "Invalid signature"}, status=401)
+                return web.json_response({"error": "Invalid signature"}, status=assert_declared_status(401))
 
         source_name = self._header(request, SOURCE_NAME)
         event_id = self._header(request, EVENT_ID) or request.headers.get(
@@ -657,7 +658,7 @@ class HookdeckAdapter(WebhookAdapter):
                 request.path,
             )
             return web.json_response(
-                {"error": f"No route matches source '{source_name}'"}, status=404
+                {"error": f"No route matches source '{source_name}'"}, status=assert_declared_status(404)
             )
         if route.get("enabled", True) is False:
             return web.json_response(
@@ -750,7 +751,7 @@ class HookdeckAdapter(WebhookAdapter):
                 )
                 # 5xx so Hookdeck retries this delivery on its own schedule.
                 return web.json_response(
-                    {"status": "error", "error": "Delivery failed"}, status=502
+                    {"status": "error", "error": "Delivery failed"}, status=assert_declared_status(502)
                 )
             if result.success:
                 return web.json_response(
@@ -762,7 +763,7 @@ class HookdeckAdapter(WebhookAdapter):
                     }
                 )
             return web.json_response(
-                {"status": "error", "error": "Delivery failed"}, status=502
+                {"status": "error", "error": "Delivery failed"}, status=assert_declared_status(502)
             )
 
         # ── Admission control ────────────────────────────────────────
@@ -800,7 +801,7 @@ class HookdeckAdapter(WebhookAdapter):
                     "reason": "max_concurrent",
                     "in_flight": len(self._inflight),
                 },
-                status=503,
+                status=assert_declared_status(503),
                 headers=headers,
             )
 
@@ -832,7 +833,7 @@ class HookdeckAdapter(WebhookAdapter):
                     "[hookdeck] Skipping %s: %s", event_id, admission.reason
                 )
                 return web.json_response(
-                    {"status": "duplicate", "event_id": event_id}, status=200
+                    {"status": "duplicate", "event_id": event_id}, status=assert_declared_status(200)
                 )
 
         prompt = self._apply_skills(route, prompt)
@@ -900,7 +901,7 @@ class HookdeckAdapter(WebhookAdapter):
                 "event": event_type,
                 "event_id": event_id,
             },
-            status=202,
+            status=assert_declared_status(202),
         )
 
     def _unparseable_response(self, event_id: str) -> web.Response:
@@ -929,7 +930,7 @@ class HookdeckAdapter(WebhookAdapter):
                 "[hookdeck] Event %s has an unparseable body", event_id or "(no id)"
             )
         return web.json_response(
-            {"error": "Cannot parse body"}, status=400, headers=headers
+            {"error": "Cannot parse body"}, status=assert_declared_status(400), headers=headers
         )
 
     def _apply_skills(self, route: dict, prompt: str) -> str:
@@ -986,7 +987,7 @@ class HookdeckAdapter(WebhookAdapter):
             )
             return web.json_response(
                 {"status": "accepted", "reason": "still running", "route": route_name},
-                status=202,
+                status=assert_declared_status(202),
             )
         finally:
             self._waiters.pop(session_chat_id, None)
@@ -996,7 +997,7 @@ class HookdeckAdapter(WebhookAdapter):
         # 5xx puts the event back on Hookdeck's retry schedule.
         return web.json_response(
             {"status": "failed", "route": route_name, "outcome": str(outcome)},
-            status=500,
+            status=assert_declared_status(500),
         )
 
     # ------------------------------------------------------------------

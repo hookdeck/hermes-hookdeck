@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
+from .constants import RETRYABLE_STATUSES
+
 DEFAULT_RETRY_COUNT = 5
 DEFAULT_RETRY_INTERVAL_MS = 30_000
 DEFAULT_DEDUPE_WINDOW_MS = 60_000
@@ -160,28 +162,7 @@ def build_connection_payload(
             ),
         }
 
-    # The test for "should this be retried" is whether a retry of THIS EXACT
-    # event could ever succeed, given that Hookdeck replays the stored request
-    # byte-for-byte. Only what is baked into the request fails that test.
-    #
-    # An earlier version narrowed this to 500-599, reasoning that a 401 or a
-    # 404 "cannot be fixed by retrying". That was wrong in both cases, and the
-    # cost was permanent loss of real events:
-    #
-    #   401 — the operator sets the destination's auth to HOOKDECK_SIGNATURE
-    #         and retries of the same event ARE signed, because Hookdeck
-    #         computes the signature at delivery time rather than storing it
-    #   404 — the operator adds or enables the route and the same event matches
-    #   413 — the operator raises max_body_bytes and the same event fits
-    #
-    # 400 stays out: an unparseable body is part of the stored request and no
-    # operator change makes it parse.
-    response_status_codes = ["401", "404", "408", "413", "429", "500-599"]
-    still_missing = uncovered_statuses(response_status_codes)
-    if still_missing:  # pragma: no cover - guards against editing the list above
-        raise ValueError(
-            f"retry rule would not cover statuses the adapter emits: {still_missing}"
-        )
+    response_status_codes = retryable_status_codes()
 
     rules: list[dict[str, Any]] = [
         {
@@ -230,15 +211,30 @@ def build_event_filter(
     return None
 
 
-# Statuses the adapter emits that a retry could still resolve. 503 is admission
-# control, 500 a failed run in sync mode, 502 a rejected direct delivery, and
-# 401/404/413 are all operator-fixable — the signature, the route and the size
-# cap are gateway-side config, not properties of the stored request. A retry
-# rule missing any of these turns a recoverable condition into silent loss.
-#
-# 400 is deliberately absent: an unparseable body is part of the stored request
-# and no operator change makes it parse.
-ADAPTER_RETRYABLE_STATUSES = (401, 404, 413, 500, 502, 503)
+# Re-exported from the single declaration in constants, which also gates what
+# the adapter is allowed to emit. Do not redefine it here.
+ADAPTER_RETRYABLE_STATUSES = RETRYABLE_STATUSES
+
+
+def retryable_status_codes() -> list[str]:
+    """The connection's ``response_status_codes``, derived from what we emit.
+
+    Never hand-written: the list and the emitting code drifting apart is the
+    defect this is built to make impossible. 5xx collapses to a range so a
+    transient failure from something in front of the adapter — a proxy, the
+    CLI reporting a refused local connection as 500 — is retried too, and the
+    extra transient 4xx are ones we never emit but might receive.
+    """
+    codes = [str(s) for s in RETRYABLE_STATUSES if s < 500]
+    codes += ["408", "429"]  # transient, and emitted by proxies rather than us
+    codes.append("500-599")
+    ordered = sorted(set(codes), key=lambda c: (c.endswith("599"), c))
+    missing = uncovered_statuses(ordered)
+    if missing:  # pragma: no cover - unreachable while the derivation is honest
+        raise AssertionError(
+            f"derived retry codes miss emitted statuses: {missing}"
+        )
+    return ordered
 
 
 def _code_expression_matches(expression: str, status: int) -> Optional[bool]:
