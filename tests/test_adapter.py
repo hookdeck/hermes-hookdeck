@@ -769,3 +769,34 @@ async def test_nested_and_listed_surrogates_are_reached(client_factory):
     await _post_raw(client, b'{"a": {"b": ["ok", "x\\ud800"]}}', "evt_nested")
     await _settle()
     assert seen[0].raw_message["a"]["b"] == ["ok", "x�"]
+
+
+# ----------------------------------------------------------------------
+# Gateway authorization
+# ----------------------------------------------------------------------
+
+
+async def test_verified_routes_declare_upstream_authorization(client_factory):
+    # Without this the gateway refuses every delivery as
+    # "Unauthorized user: hookdeck:<route>". Core exempts the built-in webhook
+    # platform by enum member, on the grounds that HMAC verification in the
+    # adapter is the authorization — the same reasoning applies here, but the
+    # membership test cannot, since this is Platform.HOOKDECK.
+    adapter, _client = await client_factory({"default": {}})
+    assert adapter.authorization_is_upstream is True
+
+
+def test_unverified_routes_do_not_claim_upstream_authorization(tmp_path):
+    # INSECURE_NO_AUTH skips signature checking, so there is no upstream
+    # decision to delegate to and the local allowlist must still apply. This is
+    # narrower than core's blanket exemption, which covers built-in webhook
+    # routes even when they skip verification.
+    config = PlatformConfig(
+        extra={
+            "mode": "push",
+            "host": "127.0.0.1",
+            "secret": "INSECURE_NO_AUTH",
+            "routes": {"a": {}},
+        }
+    )
+    assert HookdeckAdapter(config).authorization_is_upstream is False

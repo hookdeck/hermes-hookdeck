@@ -269,7 +269,31 @@ means this is the final automatic attempt — the cleanest dead-letter trigger
 available. No downside; surface it in logs and in whatever the host uses for
 run metadata.
 
-## 11. What each host may legitimately differ on
+## 11. Check the host's own authorization layer
+
+A signature-verified webhook has no user in the messaging sense, and a host
+that gates inbound on a user allowlist will refuse every delivery — for Hermes,
+`Unauthorized user: hookdeck:<route>`, logged as a warning with the event
+otherwise looking perfectly delivered.
+
+Hosts usually exempt their *own* webhook surface from this and forget that a
+plugin platform is not covered by the exemption. Hermes hardcodes
+`if source.platform in {HOMEASSISTANT, WEBHOOK}: return True` on the grounds
+that HMAC verification in the adapter is the authorization — true of any
+Hookdeck plugin too, but the test is on the enum member, so a plugin registered
+under its own name falls through to default-deny.
+
+Find the host's sanctioned mechanism rather than reaching for an allow-all
+switch (Hermes exposes `authorization_is_upstream`, whose contract is exactly
+"authorized by a trusted upstream over an authenticated transport"). And gate
+it on verification actually being on, so a local-testing escape hatch does not
+also switch off the host's allowlist.
+
+This only shows up when running a real host process. It is invisible to unit
+tests, and invisible to an ingress-only live test, because the request
+succeeds — it is the dispatch after it that is dropped.
+
+## 12. What each host may legitimately differ on
 
 - **Transport.** CLI tunnel, HTTP push, or whatever the host natively offers.
 - **Storage.** Any durable store that can express the section 3 rule.

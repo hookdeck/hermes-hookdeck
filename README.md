@@ -199,6 +199,15 @@ telling the model that payload text is data, never instructions addressed to it.
 For local testing only, `secret: INSECURE_NO_AUTH` skips verification. It is
 refused unless the listener is bound to loopback.
 
+The adapter declares `authorization_is_upstream`, which is what stops the
+gateway refusing every delivery as `Unauthorized user: hookdeck:<route>`. Core
+exempts its own webhook platform from the user allowlist by enum member,
+reasoning that HMAC verification in the adapter *is* the authorization; the
+reasoning carries over but the membership test cannot, since this platform is
+`Platform.HOOKDECK`. The flag goes false whenever verification is off, so an
+`INSECURE_NO_AUTH` route still falls under `HOOKDECK_ALLOWED_USERS` — narrower
+than core's exemption, which covers built-in webhook routes even unverified.
+
 ## Limitations
 
 - CLI destinations do not support delivery rate limits or issue triggers — a
@@ -227,10 +236,25 @@ refused unless the listener is bound to loopback.
   in the instant before a crash. That is the at-least-once contract the whole
   design assumes; set `recover_on_boot: false` if it is wrong for your routes.
 
-## Verified against a live project
+## Verified end to end
 
-The reliability claims above are not just unit-tested. Run against a real
-Hookdeck project with the Hookdeck CLI, the event log shows:
+Against a real Hermes 0.20.0 gateway, a real Hookdeck project and the Hookdeck
+CLI — not just unit tests. The gateway log:
+
+```
+gateway.run: ✓ hookdeck connected
+hookdeck.adapter: dispatch route=hermes-livetest event_id=evt_S1Sp… attempt=1
+gateway.run: inbound message: platform=hookdeck chat=hookdeck:hermes-livetest:evt_S1Sp…
+webhook: Response for hookdeck:hermes-livetest:evt_S1Sp…: …
+hookdeck.adapter: Found 1 run(s) interrupted by a previous shutdown; asked Hookdeck to redeliver 1 of them
+```
+
+That last line is boot recovery working against live Hookdeck: a run left
+`running` by a killed gateway was found at startup, handed back, redelivered
+and re-run. The ledger recording `succeeded` afterwards is also what confirms
+`on_processing_complete` fires and the outcome is recorded.
+
+The reliability claims are not just unit-tested either. In the event log:
 
 ```
 evt_jyjuqko…  SUCCESSFUL  attempts=3  [(202,INITIAL), (202,MANUAL), (202,MANUAL)]

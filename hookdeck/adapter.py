@@ -219,6 +219,33 @@ class HookdeckAdapter(WebhookAdapter):
         self._waiters: Dict[str, asyncio.Future] = {}
         self._last_prune = 0.0
 
+    @property
+    def authorization_is_upstream(self) -> bool:
+        """Inbound events were authorized before they got here.
+
+        Without this every delivery is refused as ``Unauthorized user:
+        hookdeck:<route>``. Core exempts the built-in webhook platform from the
+        user allowlist by enum member —
+
+            if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
+                return True
+
+        — on the grounds that "webhook events are authenticated via HMAC
+        signature validation in the adapter itself". That reasoning applies here
+        exactly, but the membership test cannot: this platform is
+        ``Platform.HOOKDECK``. ``authorization_is_upstream`` is the sanctioned
+        route to the same outcome, and its contract fits — authorization
+        performed by a trusted upstream over an authenticated transport, with no
+        local policy to consult, because a Hookdeck source is not a platform
+        account an operator configures in ``HOOKDECK_ALLOWED_USERS``.
+
+        Not a fail-open. It is false whenever verification is actually off, so
+        the local allowlist still applies to an ``INSECURE_NO_AUTH`` route —
+        which makes this narrower than core's blanket exemption, since that
+        covers built-in webhook routes even when they skip verification.
+        """
+        return self._signing_secret not in ("", INSECURE_NO_AUTH)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
