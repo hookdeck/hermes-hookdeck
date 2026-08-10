@@ -291,6 +291,26 @@ accepted two `MANUAL` retries afterwards. An early ack really is recoverable.
 The second is admission control: deferred with 503 while a run was in flight,
 then redelivered automatically and processed. Deferred, not dropped.
 
+## Code layout
+
+| Module | What lives there |
+|---|---|
+| `adapter.py` | The platform adapter: lifecycle, the delivery pipeline, outcome reporting |
+| `settings.py` | Every knob, resolved once from config + env, validated before start |
+| `routing.py` | Which route a delivery belongs to, and what event it is |
+| `payload.py` | Bytes → payload, including the encoding rules that bite |
+| `verify.py` | The one signature scheme |
+| `state.py` | The SQLite delivery ledger |
+| `api.py` | A thin async client for the Hookdeck API |
+| `provision.py` | Building the connection Hookdeck should have |
+| `cli.py` | `hermes hookdeck …` |
+| `tools.py` | The agent-facing toolset |
+| `dashboard/` | The dashboard tab: manifest, backend routes, and a no-build bundle |
+
+`routing.py`, `payload.py`, `verify.py`, `provision.py` and `settings.py` are
+pure — no Hermes, no HTTP, no state — so the rules they encode can be read and
+tested on their own. `adapter.py` is the only module that needs a gateway.
+
 ## Development
 
 ```bash

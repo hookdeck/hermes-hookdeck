@@ -12,10 +12,10 @@ What it replaces is the ingest half:
 * one signature scheme (Hookdeck's) instead of a per-provider zoo
 * deduplication keyed on the Hookdeck event id and persisted to SQLite, so a
   gateway restart cannot cause a second agent run for the same event
-* admission control — an event that arrives while ``max_concurrent`` runs are
-  already in flight gets 503 + ``Retry-After`` and stays in Hookdeck's queue
-  instead of being dropped by a fixed per-minute rate limit
-* outcome reporting — the built-in adapter returns 202 and then forgets, so a
+* admission control — an event arriving while ``max_concurrent`` runs are
+  already in flight is deferred with 503 and stays in Hookdeck's queue, rather
+  than being dropped by a fixed per-minute rate limit
+* outcome reporting — the built-in adapter answers 202 and then forgets, so a
   failed run is lost. This one records the real outcome and hands failures back
   to Hookdeck for redelivery.
 """
@@ -23,12 +23,10 @@ What it replaces is the ingest half:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import time
-from pathlib import Path
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
 try:
     from aiohttp import web
@@ -37,97 +35,68 @@ try:
 except ImportError:  # pragma: no cover - exercised by installs without the extra
     # aiohttp is a Hermes *extra* (`messaging`, `slack`, …), not a core
     # dependency, and core's own webhook adapter guards it the same way. A bare
-    # module-level import here would raise during plugin discovery, and since
+    # module-level import would raise during plugin discovery, and since
     # `register()` degrades rather than crashes, the platform would simply
     # never appear — a silent absence with no error to debug.
     web = None  # type: ignore[assignment]
     AIOHTTP_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import (
-    MessageEvent,
-    MessageType,
-    ProcessingOutcome,
-)
+from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.webhook import WebhookAdapter
 
+from . import payload as payload_mod
+from . import routing
 from .api import HookdeckAPI, HookdeckAPIError
 from .constants import (
-    ACK_MODES,
     ATTEMPT_COUNT,
-    DEFAULT_ACK_MODE,
-    DEFAULT_HEADER_PREFIX,
-    DEFAULT_LEDGER_TTL_SECONDS,
-    DEFAULT_MAX_AGENT_RETRIES,
-    DEFAULT_MAX_CONCURRENT,
-    DEFAULT_PATH,
-    DEFAULT_PORT,
-    DEFAULT_DEFER_ATTEMPT_LIMIT,
-    DEFAULT_RETRY_AFTER_SECONDS,
-    DEFAULT_RUN_TIMEOUT_SECONDS,
-    DEFAULT_SYNC_TIMEOUT_SECONDS,
     EVENT_ID,
-    assert_declared_status,
-    INSECURE_NO_AUTH,
     PLATFORM_NAME,
     SOURCE_NAME,
     WILL_RETRY_AFTER,
+    assert_declared_status,
     header_name,
 )
-from .state import DeliveryLedger, default_state_path
+from .settings import AdapterSettings
+from .state import DeliveryLedger
 from .tunnel import HookdeckCLIMissing, HookdeckTunnel
-from .verify import verify_signature
 
 logger = logging.getLogger(__name__)
 
-_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+# How often the in-flight sweep runs, at most.
+_SWEEP_INTERVAL_SECONDS = 30
 
 
-def _is_loopback(host: Optional[str]) -> bool:
-    return bool(host) and host in _LOOPBACK_HOSTS
+@dataclass
+class Delivery:
+    """One Hookdeck delivery, after parsing and before dispatch."""
+
+    event_id: str
+    attempt: int
+    source_name: str
+    route_name: str
+    route: dict
+    payload: Any
+    event_type: str
+    is_last_attempt: bool
+    surrogates_replaced: bool = False
+    session_chat_id: str = ""
+    prompt: str = ""
+
+    @property
+    def label(self) -> str:
+        """Event id for logs, or a stand-in when the delivery carried none."""
+        return self.event_id or "(no id)"
 
 
-def _has_lone_surrogates(payload: Any) -> bool:
-    """True when any string in *payload* cannot be encoded as UTF-8."""
-    try:
-        json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    except UnicodeEncodeError:
-        return True
-    return False
+@dataclass
+class InFlightRun:
+    """Bookkeeping for a dispatched run, held until its outcome is known."""
 
-
-def _replace_lone_surrogates(value: Any) -> Any:
-    """Swap unpaired surrogates for U+FFFD, leaving everything else intact.
-
-    ``"\\ud800"`` written as a JSON *escape* is pure ASCII on the wire, so the
-    body is valid UTF-8 and RFC 8259 explicitly permits any ``\\uXXXX`` escape
-    including an unpaired surrogate. Rejecting it would mean rejecting
-    conforming JSON. But Python decodes it to a ``str`` that raises
-    ``UnicodeEncodeError`` the moment anything encodes it — which, for a
-    webhook, is somewhere inside the agent run, long after the ack.
-
-    So the character is replaced rather than the event refused, matching what
-    JavaScript runtimes do anyway. Unlike their silent substitution, the caller
-    logs it and records it on the event, because quietly altering payload text
-    is exactly the failure mode this whole area is about.
-    """
-    if isinstance(value, str):
-        return value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
-    if isinstance(value, dict):
-        return {k: _replace_lone_surrogates(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_replace_lone_surrogates(v) for v in value]
-    return value
-
-
-def _dig(payload: Any, dotted: str) -> Any:
-    value = payload
-    for part in dotted.split("."):
-        if isinstance(value, dict) and part in value:
-            value = value[part]
-        else:
-            return None
-    return value
+    event_id: str
+    route: str
+    started: float
+    is_last_attempt: bool = False
 
 
 class HookdeckAdapter(WebhookAdapter):
@@ -139,17 +108,40 @@ class HookdeckAdapter(WebhookAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config)
-        # WebhookAdapter pins Platform.WEBHOOK; this adapter is registered under
-        # its own name so the gateway can run both side by side.
-        #
-        # Platform._missing_ only mints a member for a name the registry
-        # already knows, so this depends on register() having run — which it
-        # has on the real path, since the gateway builds adapters through
-        # platform_registry.create_adapter. Constructing the class directly
-        # beforehand fails here, and must: silently staying Platform.WEBHOOK
-        # would collide with the built-in adapter.
+        self.platform = self._resolve_platform()
+
+        self.settings = AdapterSettings.from_extra(config.extra)
+        # WebhookAdapter's own fields, kept in step so inherited helpers
+        # (delivery-info pruning, body limits) see the same configuration.
+        self._host = self.settings.host
+        self._port = self.settings.port
+        self._path = self.settings.path
+        self._routes = self.settings.routes
+        self._max_body_bytes = self.settings.max_body_bytes
+
+        self._ledger: Optional[DeliveryLedger] = None
+        self._api: Optional[HookdeckAPI] = None
+        self._tunnels: list[HookdeckTunnel] = []
+        self._site_runner = None
+
+        self._inflight: dict[str, InFlightRun] = {}
+        # Resolved by on_processing_complete; only `sync` mode waits on these.
+        self._waiters: dict[str, asyncio.Future] = {}
+        self._last_sweep = 0.0
+
+    @staticmethod
+    def _resolve_platform() -> Platform:
+        """This adapter's ``Platform`` member, which registration mints.
+
+        ``WebhookAdapter`` pins ``Platform.WEBHOOK``; running alongside it
+        requires a distinct member. Hermes only creates one for a name its
+        registry already knows, which the real path satisfies because the
+        gateway builds adapters through ``platform_registry.create_adapter``.
+        Constructing the class directly beforehand fails here, and should:
+        silently staying ``Platform.WEBHOOK`` would collide with the built-in.
+        """
         try:
-            self.platform = Platform(PLATFORM_NAME)
+            return Platform(PLATFORM_NAME)
         except ValueError as exc:
             raise RuntimeError(
                 f"[hookdeck] Platform({PLATFORM_NAME!r}) is not registered. "
@@ -158,206 +150,62 @@ class HookdeckAdapter(WebhookAdapter):
                 "Platform member for names the registry already knows."
             ) from exc
 
-        extra = config.extra or {}
-        self._mode = str(extra.get("mode") or os.getenv("HOOKDECK_MODE") or "cli").lower()
-        self._port = int(extra.get("port") or os.getenv("HOOKDECK_PORT") or DEFAULT_PORT)
-        raw_path = str(extra.get("path") or os.getenv("HOOKDECK_PATH") or DEFAULT_PATH)
-        self._path = "/" + raw_path.strip("/")
-
-        # cli mode is loopback-only by construction: the CLI is the only thing
-        # that should be able to reach the listener.
-        if self._mode == "cli":
-            self._host = "127.0.0.1"
-        else:
-            self._host = extra.get("host") or None
-
-        self._signing_secret = str(
-            extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET") or ""
-        )
-        self._header_prefix = str(extra.get("header_prefix") or DEFAULT_HEADER_PREFIX)
-        self._ack_mode = str(extra.get("ack_mode") or DEFAULT_ACK_MODE).lower()
-        self._max_concurrent = int(extra.get("max_concurrent", DEFAULT_MAX_CONCURRENT))
-        self._max_agent_retries = int(
-            extra.get("max_agent_retries", DEFAULT_MAX_AGENT_RETRIES)
-        )
-        self._retry_after = int(
-            extra.get("retry_after_seconds", DEFAULT_RETRY_AFTER_SECONDS)
-        )
-        self._defer_attempt_limit = int(
-            extra.get("defer_attempt_limit", DEFAULT_DEFER_ATTEMPT_LIMIT)
-        )
-        self._sync_timeout = float(
-            extra.get("sync_timeout_seconds", DEFAULT_SYNC_TIMEOUT_SECONDS)
-        )
-        self._run_timeout = float(
-            extra.get("run_timeout_seconds", DEFAULT_RUN_TIMEOUT_SECONDS)
-        )
-        self._ledger_ttl = float(
-            extra.get("ledger_ttl_seconds", DEFAULT_LEDGER_TTL_SECONDS)
-        )
-        self._source = str(extra.get("source") or os.getenv("HOOKDECK_SOURCE") or "")
-        self._cancel_retries_on_unparseable = bool(
-            extra.get("cancel_retries_on_unparseable", False)
-        )
-        self._recover_on_boot = bool(extra.get("recover_on_boot", True))
-        # Explicit binary for setups with more than one hookdeck on PATH — an
-        # npm global shim shadowing a Homebrew install is the common case, and
-        # it silently picks the older one.
-        self._cli_binary = str(extra.get("cli_binary") or "hookdeck")
-        # Off by default: `hookdeck ci` rewrites the shared CLI config and
-        # repoints its active project, which is not a side effect starting
-        # a gateway should have.
-        self._cli_login = bool(extra.get("cli_login", False))
-        self._state_path = Path(
-            extra.get("state_path") or default_state_path()
-        ).expanduser()
-
-        self._ledger: Optional[DeliveryLedger] = None
-        self._api: Optional[HookdeckAPI] = None
-        self._tunnels: list[HookdeckTunnel] = []
-        self._hd_runner = None
-
-        # session chat_id -> in-flight run bookkeeping
-        self._inflight: Dict[str, dict] = {}
-        # session chat_id -> future resolved by on_processing_complete (sync mode)
-        self._waiters: Dict[str, asyncio.Future] = {}
-        self._last_prune = 0.0
-
     @property
     def authorization_is_upstream(self) -> bool:
         """Inbound events were authorized before they got here.
 
         Without this every delivery is refused as ``Unauthorized user:
-        hookdeck:<route>``. Core exempts the built-in webhook platform from the
-        user allowlist by enum member —
-
-            if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
-                return True
-
-        — on the grounds that "webhook events are authenticated via HMAC
-        signature validation in the adapter itself". That reasoning applies here
-        exactly, but the membership test cannot: this platform is
+        hookdeck:<route>``. Core exempts its own webhook platform from the user
+        allowlist by enum member, reasoning that HMAC verification in the
+        adapter *is* the authorization. That reasoning applies here exactly,
+        but the membership test cannot, since this platform is
         ``Platform.HOOKDECK``. ``authorization_is_upstream`` is the sanctioned
-        route to the same outcome, and its contract fits — authorization
-        performed by a trusted upstream over an authenticated transport, with no
-        local policy to consult, because a Hookdeck source is not a platform
-        account an operator configures in ``HOOKDECK_ALLOWED_USERS``.
+        route to the same outcome, and its contract fits: authorization
+        performed by a trusted upstream over an authenticated transport, with
+        no local policy to consult, because a Hookdeck source is not an account
+        an operator configures in ``HOOKDECK_ALLOWED_USERS``.
 
-        Not a fail-open. It is false whenever verification is actually off, so
-        the local allowlist still applies to an ``INSECURE_NO_AUTH`` route —
-        which makes this narrower than core's blanket exemption, since that
-        covers built-in webhook routes even when they skip verification.
+        Not a fail-open — false whenever verification is off, so the local
+        allowlist still applies to an ``INSECURE_NO_AUTH`` route. That makes it
+        narrower than core's exemption, which covers built-in webhook routes
+        even unverified.
         """
-        return self._signing_secret not in ("", INSECURE_NO_AUTH)
+        return self.settings.verifies_signatures
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def _validate_startup(self) -> None:
-        if self._ack_mode not in ACK_MODES:
-            raise ValueError(
-                f"[hookdeck] Unknown ack_mode {self._ack_mode!r}. "
-                f"Expected one of: {', '.join(ACK_MODES)}."
-            )
-        if self._mode not in {"cli", "push"}:
-            raise ValueError(
-                f"[hookdeck] Unknown mode {self._mode!r}. Expected 'cli' or 'push'."
-            )
-        if not self._signing_secret:
-            raise ValueError(
-                "[hookdeck] No signing secret. Set HOOKDECK_WEBHOOK_SECRET (or "
-                "platforms.hookdeck.extra.secret) to the signing secret from "
-                "your Hookdeck project settings. For local testing only, set it "
-                f"to '{INSECURE_NO_AUTH}' while bound to loopback."
-            )
-        if self._signing_secret == INSECURE_NO_AUTH and not _is_loopback(self._host):
-            raise ValueError(
-                f"[hookdeck] {INSECURE_NO_AUTH} is set but the listener is bound "
-                f"to non-loopback host {self._host!r}. Refusing to start: that "
-                "would expose an unauthenticated agent-dispatch endpoint."
-            )
-        for name, route in (self._routes or {}).items():
-            if route.get("deliver_only"):
-                deliver = route.get("deliver", "log")
-                if not deliver or deliver == "log":
-                    raise ValueError(
-                        f"[hookdeck] Route '{name}' sets deliver_only but "
-                        f"deliver is '{deliver}'. Direct delivery needs a real "
-                        "target (telegram, slack, github_comment, …)."
-                    )
-        if self._mode == "cli" and not self._tunnel_plan():
-            raise ValueError(
-                "[hookdeck] cli mode needs a Hookdeck source to listen to, and "
-                "no route declares one. Set `source` on each route, or "
-                "platforms.hookdeck.extra.source for a single-route setup."
-            )
-
-    def _tunnel_plan(self) -> dict[str, str]:
-        """Map route name -> Hookdeck source name for the CLI tunnels.
-
-        ``hookdeck listen`` forwards exactly one source, so each route gets its
-        own tunnel. Routes sharing a source still get one each, because the CLI
-        path — and therefore the route the adapter resolves — differs per route.
-        """
-        plan: dict[str, str] = {}
-        for name, route in (self._routes or {}).items():
-            source = str(route.get("source") or "")
-            if not source and self._source:
-                source = self._source
-            if source:
-                plan[name] = source
-        return plan
-
     def build_app(self) -> web.Application:
         """The aiohttp application serving Hookdeck deliveries.
 
-        Split out from :meth:`connect` so it can be driven directly by tests
-        without binding a port or starting the CLI tunnel.
+        Split out from :meth:`connect` so tests can drive it without binding a
+        port or starting a tunnel.
         """
-        app = web.Application(client_max_size=self._max_body_bytes)
-        app.router.add_get(f"{self._path}/health", self._handle_hookdeck_health)
-        app.router.add_post(self._path, self._handle_hookdeck)
-        # A tail, not a single segment. Hookdeck's `path_forwarding_disabled`
-        # defaults to false, so it appends the source request's own path to the
-        # destination path: a provider POSTing to <source-url>/events arrives
-        # here as /hookdeck/<route>/events. Matching one segment 404s that.
-        app.router.add_post(f"{self._path}/{{route_tail:.*}}", self._handle_hookdeck)
+        app = web.Application(client_max_size=self.settings.max_body_bytes)
+        app.router.add_get(f"{self._path}/health", self._handle_health)
+        app.router.add_post(self._path, self._handle_delivery)
+        # A tail, not a single segment: Hookdeck appends the source request's
+        # own path unless `path_forwarding_disabled` is set, so a provider
+        # POSTing to <source-url>/events arrives as /hookdeck/<route>/events.
+        app.router.add_post(f"{self._path}/{{route_tail:.*}}", self._handle_delivery)
         return app
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        self._validate_startup()
+        self.settings.validate()
 
-        self._ledger = DeliveryLedger(self._state_path)
+        self._ledger = DeliveryLedger(self.settings.state_path)
         self._api = HookdeckAPI()
 
-        app = self.build_app()
-        self._hd_runner = web.AppRunner(app)
-        await self._hd_runner.setup()
+        self._site_runner = web.AppRunner(self.build_app())
+        await self._site_runner.setup()
         if not await self._start_sites():
-            await self._hd_runner.cleanup()
-            self._hd_runner = None
+            await self._teardown_server()
             return False
 
-        if self._mode == "cli":
-            try:
-                for route_name, source in self._tunnel_plan().items():
-                    tunnel = HookdeckTunnel(
-                        port=self._port,
-                        path=f"{self._path}/{route_name}",
-                        source=source,
-                        connection_name=route_name,
-                        binary=self._cli_binary,
-                        login=self._cli_login,
-                    )
-                    await tunnel.start()
-                    self._tunnels.append(tunnel)
-            except HookdeckCLIMissing as exc:
-                logger.error("[hookdeck] %s", exc)
-                await self._stop_tunnels()
-                await self._hd_runner.cleanup()
-                self._hd_runner = None
-                return False
+        if self.settings.mode == "cli" and not await self._start_tunnels():
+            await self._teardown_server()
+            return False
 
         await self._recover_orphaned_runs()
 
@@ -365,56 +213,81 @@ class HookdeckAdapter(WebhookAdapter):
         logger.info(
             "[hookdeck] mode=%s listening on %s:%d%s — ack_mode=%s "
             "max_concurrent=%s routes=%s",
-            self._mode,
+            self.settings.mode,
             self._host or "*",
             self._port,
             self._path,
-            self._ack_mode,
-            self._max_concurrent or "unlimited",
-            ", ".join(self._routes.keys()) or "(none)",
+            self.settings.ack_mode,
+            self.settings.max_concurrent or "unlimited",
+            ", ".join(self._routes) or "(none)",
         )
         return True
 
-    def _bind_hosts(self) -> list[Optional[str]]:
-        """Addresses to listen on.
-
-        In cli mode this is both loopback families, not just ``127.0.0.1``.
-        The Hookdeck CLI forwards to ``http://localhost:<port>``, and on a
-        dual-stack machine that resolves to ``::1`` first — against an
-        IPv4-only listener every delivery fails with ECONNREFUSED while the
-        tunnel itself looks perfectly healthy. Binding a wildcard would fix it
-        too, and would also expose an agent-dispatch endpoint to the network,
-        so it binds each loopback address instead.
-        """
-        if self._mode == "cli":
-            return ["127.0.0.1", "::1"]
-        return [self._host]
+    async def disconnect(self) -> None:
+        await self._stop_tunnels()
+        await self._teardown_server()
+        if self._api is not None:
+            await self._api.aclose()
+            self._api = None
+        if self._ledger is not None:
+            self._ledger.close()
+            self._ledger = None
+        self._mark_disconnected()
+        logger.info("[hookdeck] Disconnected")
 
     async def _start_sites(self) -> bool:
         """Start a listener per address. One family may be absent; both failing is fatal."""
-        assert self._hd_runner is not None
+        assert self._site_runner is not None
         started: list[str] = []
         last_error: Optional[OSError] = None
-        for host in self._bind_hosts():
+        for host in self.settings.bind_hosts:
             try:
-                await web.TCPSite(self._hd_runner, host, self._port).start()
+                await web.TCPSite(self._site_runner, host, self._port).start()
                 started.append(host or "*")
             except OSError as exc:
                 last_error = exc
-                logger.debug(
-                    "[hookdeck] Could not bind %s:%d: %s", host, self._port, exc
-                )
+                logger.debug("[hookdeck] Could not bind %s:%d: %s", host, self._port, exc)
+
         if not started:
             logger.error(
                 "[hookdeck] Could not bind port %d on %s: %s. Change "
                 "platforms.hookdeck.extra.port in config.yaml.",
                 self._port,
-                ", ".join(str(h) for h in self._bind_hosts()),
+                ", ".join(str(h) for h in self.settings.bind_hosts),
                 last_error,
             )
             return False
         logger.debug("[hookdeck] Listening on %s", ", ".join(started))
         return True
+
+    async def _start_tunnels(self) -> bool:
+        try:
+            for route_name, source in self.settings.tunnels.items():
+                tunnel = HookdeckTunnel(
+                    port=self._port,
+                    path=f"{self._path}/{route_name}",
+                    source=source,
+                    connection_name=route_name,
+                    binary=self.settings.cli_binary,
+                    login=self.settings.cli_login,
+                )
+                await tunnel.start()
+                self._tunnels.append(tunnel)
+        except HookdeckCLIMissing as exc:
+            logger.error("[hookdeck] %s", exc)
+            await self._stop_tunnels()
+            return False
+        return True
+
+    async def _stop_tunnels(self) -> None:
+        for tunnel in self._tunnels:
+            await tunnel.stop()
+        self._tunnels = []
+
+    async def _teardown_server(self) -> None:
+        if self._site_runner is not None:
+            await self._site_runner.cleanup()
+            self._site_runner = None
 
     async def _recover_orphaned_runs(self) -> int:
         """Ask Hookdeck to redeliver runs the previous process died holding.
@@ -426,16 +299,16 @@ class HookdeckAdapter(WebhookAdapter):
 
         This is the second half of what makes Hookdeck the durable work queue
         and lets the plugin skip owning a local one — the first half being the
-        failed-run retry. It works because a successful event can still be
-        retried manually. It is also why terminal rows are pruned on a TTL but
+        failed-run retry. Both rest on a successful event still being
+        retryable. It is also why terminal rows are pruned on a TTL and
         ``running`` rows never are: pruning one would silently drop the work.
 
-        Recovery re-runs an event whose run may in fact have completed just
-        before the crash, which is the at-least-once contract the whole design
-        already assumes. Set ``recover_on_boot: false`` if that is wrong for
-        your routes.
+        Recovery re-runs an event whose run may in fact have completed in the
+        instant before the crash, which is the at-least-once contract the whole
+        design already assumes. Set ``recover_on_boot: false`` if that is wrong
+        for your routes.
         """
-        if not self._recover_on_boot or self._ledger is None or self._api is None:
+        if not self.settings.recover_on_boot or not (self._ledger and self._api):
             return 0
 
         orphans = self._ledger.all_running()
@@ -445,8 +318,7 @@ class HookdeckAdapter(WebhookAdapter):
         recovered = 0
         for row in orphans:
             event_id = row["event_id"]
-            attempts = int(row["agent_attempts"])
-            if attempts - 1 >= self._max_agent_retries:
+            if int(row["agent_attempts"]) - 1 >= self.settings.max_agent_retries:
                 self._ledger.mark_exhausted(event_id, "interrupted; retry budget spent")
                 continue
             self._ledger.mark_failed(event_id, "gateway stopped mid-run")
@@ -468,171 +340,104 @@ class HookdeckAdapter(WebhookAdapter):
         )
         return recovered
 
-    async def _stop_tunnels(self) -> None:
-        for tunnel in self._tunnels:
-            await tunnel.stop()
-        self._tunnels = []
-
-    async def disconnect(self) -> None:
-        await self._stop_tunnels()
-        if self._hd_runner is not None:
-            await self._hd_runner.cleanup()
-            self._hd_runner = None
-        if self._api is not None:
-            await self._api.aclose()
-            self._api = None
-        if self._ledger is not None:
-            self._ledger.close()
-            self._ledger = None
-        self._mark_disconnected()
-        logger.info("[hookdeck] Disconnected")
-
     # ------------------------------------------------------------------
     # Request handling
     # ------------------------------------------------------------------
 
-    async def _handle_hookdeck_health(self, request: web.Request) -> web.Response:
-        counts = self._ledger.counts() if self._ledger else {}
+    async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "status": "ok",
-                "mode": self._mode,
-                "ack_mode": self._ack_mode,
+                "mode": self.settings.mode,
+                "ack_mode": self.settings.ack_mode,
                 "in_flight": len(self._inflight),
-                "max_concurrent": self._max_concurrent,
-                "deliveries": counts,
+                "max_concurrent": self.settings.max_concurrent,
+                "deliveries": self._ledger.counts() if self._ledger else {},
             }
         )
 
-    def _header(self, request: web.Request, suffix: str) -> str:
-        return request.headers.get(header_name(suffix, self._header_prefix), "")
+    async def _handle_delivery(self, request: web.Request) -> web.Response:
+        """One Hookdeck delivery, from bytes on the wire to a dispatched run.
 
-    def _resolve_route(
-        self, request: web.Request, source_name: str
-    ) -> tuple[str, Optional[dict]]:
-        """Pick the route for this delivery.
-
-        Explicit path segment wins. Otherwise a route may claim a Hookdeck
-        source by name (``source: stripe``), then a route named after the
-        source, then a route literally named ``default``, and finally — when
-        only one route is configured — that one.
-
-        Only the first segment of the tail is the route name; anything after it
-        is the provider's own path, forwarded by Hookdeck. Taking a segment
-        rather than a string prefix is what stops route ``stripe`` swallowing a
-        delivery meant for ``stripe-test``.
+        Each step either produces a response and stops, or hands the delivery
+        to the next. The order matters and is the security-relevant part: the
+        signature is checked before anything reads the payload, and admission
+        control runs before the ledger records anything, so a deferred event is
+        not mistaken for a duplicate when Hookdeck brings it back.
         """
-        tail = request.match_info.get("route_tail", "")
-        explicit = tail.split("/", 1)[0] if tail else ""
-        if explicit:
-            return explicit, self._routes.get(explicit)
-
-        if source_name:
-            for name, route in self._routes.items():
-                if str(route.get("source", "")) == source_name:
-                    return name, route
-            if source_name in self._routes:
-                return source_name, self._routes[source_name]
-
-        if "default" in self._routes:
-            return "default", self._routes["default"]
-        if len(self._routes) == 1:
-            name = next(iter(self._routes))
-            return name, self._routes[name]
-        return source_name or "(unmatched)", None
-
-    def _event_type(self, request: web.Request, route: dict, payload: Any) -> str:
-        """Derive the event type used by the route's ``events`` filter.
-
-        Hookdeck forwards the provider's original headers, so the header-based
-        detection Hermes already does still works. ``event_path`` covers the
-        providers that put the type in the body under a non-standard key.
-        """
-        event_path = route.get("event_path")
-        if event_path:
-            value = _dig(payload, str(event_path))
-            if value is not None:
-                return str(value)
-        header_value = (
-            request.headers.get("X-GitHub-Event")
-            or request.headers.get("X-GitLab-Event")
-            or request.headers.get("X-Shopify-Topic")
-            or ""
-        )
-        if header_value:
-            return header_value
-        if isinstance(payload, dict):
-            for key in ("event_type", "type", "event", "topic"):
-                value = payload.get(key)
-                if isinstance(value, str) and value:
-                    return value
-        return "unknown"
-
-    def _sweep_inflight(self) -> None:
-        """Release slots whose completion hook never fired.
-
-        ``on_processing_complete`` runs on the success, failure and cancellation
-        paths, so this should stay empty — but a slot leaked by an unexpected
-        crash would silently wedge admission control at zero capacity, which is
-        worse than the small chance of releasing a slot early.
-        """
-        now = time.time()
-        if now - self._last_prune < 30:
-            return
-        self._last_prune = now
-        for chat_id, info in list(self._inflight.items()):
-            if now - info["started"] > self._run_timeout:
-                logger.warning(
-                    "[hookdeck] Run for %s exceeded %.0fs with no completion "
-                    "signal — releasing its slot and handing the event back",
-                    chat_id,
-                    self._run_timeout,
-                )
-                self._inflight.pop(chat_id, None)
-                # Leaving the ledger row `running` would strand the event until
-                # the next restart, since boot recovery is the only other thing
-                # that reads those rows. Treat it as a failure now, which also
-                # routes it through the normal retry budget.
-                event_id = info.get("event_id") or ""
-                if event_id:
-                    task = asyncio.create_task(
-                        self._record_outcome(event_id, ProcessingOutcome.FAILURE)
-                    )
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-        if self._ledger is not None:
-            self._ledger.prune(self._ledger_ttl)
-
-    async def _handle_hookdeck(self, request: web.Request) -> web.Response:
         self._sweep_inflight()
 
-        if (request.content_length or 0) > self._max_body_bytes:
-            return web.json_response({"error": "Payload too large"}, status=assert_declared_status(413))
+        raw_body, response = await self._read_verified_body(request)
+        if response is not None:
+            return response
+
+        delivery, response = self._parse_delivery(request, raw_body)
+        if response is not None:
+            return response
+
+        response = await self._reject_if_filtered(request, delivery)
+        if response is not None:
+            return response
+
+        delivery.prompt = self._render_prompt(
+            delivery.route.get("prompt", ""),
+            delivery.payload,
+            delivery.event_type,
+            delivery.route_name,
+        )
+
+        if delivery.route.get("deliver_only"):
+            return await self._deliver_without_agent(delivery)
+
+        response = self._admit(delivery)
+        if response is not None:
+            return response
+
+        return await self._dispatch(delivery)
+
+    async def _read_verified_body(
+        self, request: web.Request
+    ) -> tuple[bytes, Optional[web.Response]]:
+        """Read the body within limits and verify it, before anything parses it."""
+        too_large = self._respond({"error": "Payload too large"}, status=413)
+
+        if (request.content_length or 0) > self.settings.max_body_bytes:
+            return b"", too_large
         try:
             raw_body = await request.read()
         except web.HTTPRequestEntityTooLarge:
-            return web.json_response({"error": "Payload too large"}, status=assert_declared_status(413))
+            return b"", too_large
         except Exception as exc:
             logger.error("[hookdeck] Failed to read body: %s", exc)
-            return web.json_response({"error": "Bad request"}, status=assert_declared_status(400))
-        if len(raw_body) > self._max_body_bytes:
-            return web.json_response({"error": "Payload too large"}, status=assert_declared_status(413))
+            return b"", self._respond({"error": "Bad request"}, status=400)
+        if len(raw_body) > self.settings.max_body_bytes:
+            return b"", too_large
 
-        # ── Verify before anything else touches the payload ──────────
-        if self._signing_secret != INSECURE_NO_AUTH:
-            if not verify_signature(
-                request.headers,
-                raw_body,
-                self._signing_secret,
-                prefix=self._header_prefix,
-            ):
-                logger.warning(
-                    "[hookdeck] Rejected delivery with an invalid signature "
-                    "(source=%s)",
-                    self._header(request, SOURCE_NAME) or "unknown",
-                )
-                return web.json_response({"error": "Invalid signature"}, status=assert_declared_status(401))
+        if self.settings.verifies_signatures and not self._signature_valid(
+            request, raw_body
+        ):
+            logger.warning(
+                "[hookdeck] Rejected delivery with an invalid signature (source=%s)",
+                self._header(request, SOURCE_NAME) or "unknown",
+            )
+            return b"", self._respond({"error": "Invalid signature"}, status=401)
 
+        return raw_body, None
+
+    def _signature_valid(self, request: web.Request, raw_body: bytes) -> bool:
+        from .verify import verify_signature
+
+        return verify_signature(
+            request.headers,
+            raw_body,
+            self.settings.signing_secret,
+            prefix=self.settings.header_prefix,
+        )
+
+    def _parse_delivery(
+        self, request: web.Request, raw_body: bytes
+    ) -> tuple[Delivery, Optional[web.Response]]:
+        """Build a :class:`Delivery` from a verified request."""
         source_name = self._header(request, SOURCE_NAME)
         event_id = self._header(request, EVENT_ID) or request.headers.get(
             "X-Request-ID", ""
@@ -641,390 +446,330 @@ class HookdeckAdapter(WebhookAdapter):
             attempt = int(self._header(request, ATTEMPT_COUNT) or 0)
         except ValueError:
             attempt = 0
-        # Hookdeck omits (or empties) this header on the final automatic
-        # attempt, which is the cleanest dead-letter signal available.
-        is_last_attempt = not self._header(request, WILL_RETRY_AFTER).strip()
 
-        route_name, route = self._resolve_route(request, source_name)
+        route_name, route = routing.resolve(
+            self._routes,
+            path_tail=request.match_info.get("route_tail", ""),
+            source_name=source_name,
+        )
         if route is None:
             logger.warning(
                 "[hookdeck] No route for delivery (source=%s, path=%s)",
                 source_name or "unknown",
                 request.path,
             )
-            return web.json_response(
-                {"error": f"No route matches source '{source_name}'"}, status=assert_declared_status(404)
-            )
-        if route.get("enabled", True) is False:
-            return web.json_response(
-                {"status": "ignored", "reason": "route disabled", "route": route_name}
+            return _no_delivery(), self._respond(
+                {"error": f"No route matches source '{source_name}'"}, status=404
             )
 
-        # Decode strictly before parsing, rather than letting json.loads sniff
-        # the encoding. RFC 8259 §8.1 requires UTF-8 for JSON exchanged between
-        # systems, and json.loads is more permissive than that in two ways that
-        # both end badly:
-        #
-        #   * it decodes with `surrogatepass`, so a CESU-8 lone surrogate parses
-        #     cleanly, renders into the prompt cleanly, and then raises
-        #     UnicodeEncodeError at the network boundary inside the agent run —
-        #     long after the event was acked, in a layer with no idea why
-        #   * it accepts UTF-16/32 via BOM sniffing
-        #
-        # A strict decode collapses both into one honest rejection here. (Other
-        # runtimes get this wrong differently: Node's Buffer.toString("utf8")
-        # never throws and substitutes U+FFFD, silently corrupting payload text
-        # rather than failing.)
         try:
-            body_text = raw_body.decode("utf-8")
-        except UnicodeDecodeError:
-            return self._unparseable_response(event_id)
+            body_text = payload_mod.decode(raw_body)
+            parsed = payload_mod.parse(body_text)
+        except payload_mod.UndecodablePayload:
+            return _no_delivery(), self._reject_unparseable(event_id)
 
-        try:
-            payload = json.loads(body_text)
-        except json.JSONDecodeError:
-            try:
-                import urllib.parse
-
-                payload = dict(urllib.parse.parse_qsl(body_text))
-            except Exception:
-                return self._unparseable_response(event_id)
-
-        # A lone surrogate can also arrive as a JSON escape, which is valid
-        # JSON and valid UTF-8 on the wire — so the strict decode above cannot
-        # catch it, and it would detonate later inside the run instead.
-        surrogates_replaced = _has_lone_surrogates(payload)
+        surrogates_replaced = payload_mod.has_lone_surrogates(parsed)
         if surrogates_replaced:
-            payload = _replace_lone_surrogates(payload)
+            # Reachable even after a strict decode: a lone surrogate written as
+            # a JSON escape is pure ASCII on the wire.
+            parsed = payload_mod.replace_lone_surrogates(parsed)
             logger.warning(
                 "[hookdeck] Event %s contains unpaired surrogates; replaced "
                 "them with U+FFFD so the payload can be encoded",
                 event_id or "(no id)",
             )
 
-        event_type = self._event_type(request, route, payload)
+        delivery = Delivery(
+            event_id=event_id,
+            attempt=attempt,
+            source_name=source_name,
+            route_name=route_name,
+            route=route,
+            payload=parsed,
+            event_type=routing.event_type(
+                parsed, route=route, headers=request.headers
+            ),
+            # Hookdeck omits this header on the final automatic attempt, which
+            # is the cleanest dead-letter signal available.
+            is_last_attempt=not self._header(request, WILL_RETRY_AFTER).strip(),
+            surrogates_replaced=surrogates_replaced,
+        )
+        delivery.session_chat_id = (
+            f"hookdeck:{route_name}:{event_id or int(time.time() * 1000)}"
+        )
+        return delivery, None
+
+    async def _reject_if_filtered(
+        self, request: web.Request, delivery: Delivery
+    ) -> Optional[web.Response]:
+        """Apply the route's own filters. Ignored events answer 200, not an error."""
+        route = delivery.route
+
+        if route.get("enabled", True) is False:
+            return self._ignored(delivery, "route disabled")
+
         allowed = route.get("events", [])
-        if allowed and event_type not in allowed:
-            return web.json_response({"status": "ignored", "event": event_type})
+        if allowed and delivery.event_type not in allowed:
+            return self._ignored(delivery, "event type")
 
         if not self._route_processor.route_filters_match(
-            route, payload, event_type, request.headers
+            route, delivery.payload, delivery.event_type, request.headers
         ):
-            return web.json_response(
-                {"status": "ignored", "reason": "filter", "route": route_name}
-            )
+            return self._ignored(delivery, "filter")
 
         if route.get("script"):
             keep, transformed = await asyncio.to_thread(
-                self._route_processor.run_route_script, route.get("script"), payload
+                self._route_processor.run_route_script, route["script"], delivery.payload
             )
             if not keep:
-                return web.json_response(
-                    {"status": "ignored", "reason": "script", "route": route_name}
-                )
-            payload = transformed or payload
+                return self._ignored(delivery, "script")
+            delivery.payload = transformed or delivery.payload
 
-        prompt = self._render_prompt(
-            route.get("prompt", ""), payload, event_type, route_name
+        return None
+
+    async def _deliver_without_agent(self, delivery: Delivery) -> web.Response:
+        """``deliver_only``: render the template and push it, no run, no slot."""
+        target = {
+            "deliver": delivery.route.get("deliver", "log"),
+            "deliver_extra": self._render_delivery_extra(
+                delivery.route.get("deliver_extra", {}), delivery.payload
+            ),
+        }
+        try:
+            result = await self._direct_deliver(delivery.prompt, target)
+        except Exception:
+            logger.exception(
+                "[hookdeck] direct-deliver failed route=%s event=%s",
+                delivery.route_name,
+                delivery.label,
+            )
+            result = None
+
+        if result is None or not result.success:
+            # 5xx so Hookdeck retries on its own schedule rather than recording
+            # the event as delivered.
+            return self._respond({"status": "error", "error": "Delivery failed"}, status=502)
+
+        return self._respond(
+            {
+                "status": "delivered",
+                "route": delivery.route_name,
+                "target": target["deliver"],
+                "event_id": delivery.event_id,
+            }
         )
 
-        # ── Direct delivery: no agent, no queue slot ─────────────────
-        if route.get("deliver_only"):
-            delivery = {
-                "deliver": route.get("deliver", "log"),
-                "deliver_extra": self._render_delivery_extra(
-                    route.get("deliver_extra", {}), payload
-                ),
-            }
-            try:
-                result = await self._direct_deliver(prompt, delivery)
-            except Exception:
-                logger.exception(
-                    "[hookdeck] direct-deliver failed route=%s event=%s",
-                    route_name,
-                    event_id,
-                )
-                # 5xx so Hookdeck retries this delivery on its own schedule.
-                return web.json_response(
-                    {"status": "error", "error": "Delivery failed"}, status=assert_declared_status(502)
-                )
-            if result.success:
-                return web.json_response(
-                    {
-                        "status": "delivered",
-                        "route": route_name,
-                        "target": delivery["deliver"],
-                        "event_id": event_id,
-                    }
-                )
-            return web.json_response(
-                {"status": "error", "error": "Delivery failed"}, status=assert_declared_status(502)
-            )
+    def _admit(self, delivery: Delivery) -> Optional[web.Response]:
+        """Capacity check, then deduplication. Order matters.
 
-        # ── Admission control ────────────────────────────────────────
-        # 503 leaves the event in Hookdeck's queue instead of dropping it, and
-        # Retry-After tells Hookdeck when to come back. This is the difference
-        # between a burst being absorbed and a burst being lost.
-        if self._max_concurrent and len(self._inflight) >= self._max_concurrent:
-            logger.info(
-                "[hookdeck] At capacity (%d runs in flight) — deferring event %s",
-                len(self._inflight),
-                event_id or "(no id)",
-            )
-            # Retry-After overrides the connection's retry rule outright, so a
-            # fixed short interval spends the automatic-retry budget at that
-            # interval: 50 attempts at 30s is 25 minutes, and an event lost
-            # while nobody is looking. A short value is right *because*
-            # capacity normally frees in seconds — so it is sent only while
-            # that premise holds. Once an event has been deferred this many
-            # times the saturation is not transient, and the 503 goes bare so
-            # the connection's exponential rule spreads what budget remains.
-            headers = {}
-            if attempt <= self._defer_attempt_limit:
-                headers["Retry-After"] = str(self._retry_after)
-            else:
-                logger.warning(
-                    "[hookdeck] Event %s deferred %s times — capacity is not "
-                    "recovering; dropping Retry-After so Hookdeck backs off "
-                    "exponentially instead of burning its retry budget",
-                    event_id or "(no id)",
-                    attempt,
-                )
-            return web.json_response(
-                {
-                    "status": "deferred",
-                    "reason": "max_concurrent",
-                    "in_flight": len(self._inflight),
-                },
-                status=assert_declared_status(503),
-                headers=headers,
-            )
+        Nothing is recorded for a deferred event: a ledger entry would make
+        Hookdeck's redelivery look like a duplicate, and the event would vanish.
+        """
+        at_capacity = (
+            self.settings.max_concurrent
+            and len(self._inflight) >= self.settings.max_concurrent
+        )
+        if at_capacity:
+            return self._defer(delivery)
 
-        # ── Deduplication ────────────────────────────────────────────
-        session_chat_id = f"hookdeck:{route_name}:{event_id or int(time.time() * 1000)}"
-        if not event_id:
+        if not delivery.event_id:
             # No id means no dedup and no outcome reporting: a redelivery would
-            # run the agent twice and a failure could not be handed back. That
-            # is a real loss of guarantees, so say so rather than quietly
-            # degrading. It means the delivery did not come from Hookdeck, or
-            # the project uses a custom header prefix that is not configured.
+            # run the agent twice, and a failure could not be handed back. Say
+            # so rather than degrading quietly — it means the delivery did not
+            # come from Hookdeck, or the project customised the header prefix.
             logger.warning(
                 "[hookdeck] Delivery on route %s carries no %s header — "
                 "processing it without deduplication or retry. Check "
                 "platforms.hookdeck.extra.header_prefix if your project "
                 "customised the x-hookdeck prefix.",
-                route_name,
-                header_name(EVENT_ID, self._header_prefix),
+                delivery.route_name,
+                header_name(EVENT_ID, self.settings.header_prefix),
             )
-        if event_id and self._ledger is not None:
-            admission = self._ledger.admit(
-                event_id,
-                route=route_name,
-                attempt=attempt,
-                session_chat_id=session_chat_id,
-            )
-            if not admission.admitted:
-                logger.info(
-                    "[hookdeck] Skipping %s: %s", event_id, admission.reason
-                )
-                return web.json_response(
-                    {"status": "duplicate", "event_id": event_id}, status=assert_declared_status(200)
-                )
+            return None
 
-        prompt = self._apply_skills(route, prompt)
+        if self._ledger is None:
+            return None
 
-        self._delivery_info[session_chat_id] = {
-            "deliver": route.get("deliver", "log"),
-            "deliver_extra": self._render_delivery_extra(
-                route.get("deliver_extra", {}), payload
-            ),
-        }
-        now = time.time()
-        self._delivery_info_created[session_chat_id] = now
-        self._delivery_info_order.append((now, session_chat_id))
-        self._prune_delivery_info(now)
-
-        source = self.build_source(
-            chat_id=session_chat_id,
-            chat_name=f"hookdeck/{route_name}",
-            chat_type="webhook",
-            user_id=f"hookdeck:{route_name}",
-            user_name=route_name,
+        admission = self._ledger.admit(
+            delivery.event_id,
+            route=delivery.route_name,
+            attempt=delivery.attempt,
+            session_chat_id=delivery.session_chat_id,
         )
+        if not admission.admitted:
+            logger.info("[hookdeck] Skipping %s: %s", delivery.event_id, admission.reason)
+            return self._respond(
+                {"status": "duplicate", "event_id": delivery.event_id}, status=200
+            )
+        return None
+
+    def _defer(self, delivery: Delivery) -> web.Response:
+        """503 the delivery so Hookdeck keeps it queued and comes back.
+
+        ``Retry-After`` overrides the connection's retry rule outright, so a
+        fixed short interval spends the whole automatic budget at that
+        interval: 50 attempts at 30s is 25 minutes, then the event is gone. A
+        short value is right *because* capacity normally frees in seconds — so
+        it is sent only while that premise holds. Past ``defer_attempt_limit``
+        deferrals of one event the saturation is evidently not transient, and
+        the 503 goes bare so exponential backoff spreads what budget remains.
+        """
+        logger.info(
+            "[hookdeck] At capacity (%d runs in flight) — deferring event %s",
+            len(self._inflight),
+            delivery.label,
+        )
+        headers = {}
+        if delivery.attempt <= self.settings.defer_attempt_limit:
+            headers["Retry-After"] = str(self.settings.retry_after_seconds)
+        else:
+            logger.warning(
+                "[hookdeck] Event %s deferred %s times — capacity is not "
+                "recovering; dropping Retry-After so Hookdeck backs off "
+                "exponentially instead of burning its retry budget",
+                delivery.label,
+                delivery.attempt,
+            )
+        return self._respond(
+            {
+                "status": "deferred",
+                "reason": "max_concurrent",
+                "in_flight": len(self._inflight),
+            },
+            status=503,
+            headers=headers,
+        )
+
+    async def _dispatch(self, delivery: Delivery) -> web.Response:
+        """Hand the event to the agent, and answer according to ``ack_mode``."""
+        delivery.prompt = self._apply_skills(delivery.route, delivery.prompt)
+        self._remember_delivery_target(delivery)
+
         event = MessageEvent(
-            text=prompt,
+            text=delivery.prompt,
             message_type=MessageType.TEXT,
-            source=source,
-            raw_message=payload,
-            message_id=event_id or None,
+            source=self.build_source(
+                chat_id=delivery.session_chat_id,
+                chat_name=f"hookdeck/{delivery.route_name}",
+                chat_type="webhook",
+                user_id=f"hookdeck:{delivery.route_name}",
+                user_name=delivery.route_name,
+            ),
+            raw_message=delivery.payload,
+            message_id=delivery.event_id or None,
             metadata={
-                "hookdeck_event_id": event_id,
-                "hookdeck_source": source_name,
-                "hookdeck_attempt": attempt,
-                "hookdeck_route": route_name,
-                "hookdeck_last_automatic_attempt": is_last_attempt,
-                "hookdeck_surrogates_replaced": surrogates_replaced,
+                "hookdeck_event_id": delivery.event_id,
+                "hookdeck_source": delivery.source_name,
+                "hookdeck_attempt": delivery.attempt,
+                "hookdeck_route": delivery.route_name,
+                "hookdeck_last_automatic_attempt": delivery.is_last_attempt,
+                "hookdeck_surrogates_replaced": delivery.surrogates_replaced,
             },
         )
 
-        self._inflight[session_chat_id] = {
-            "event_id": event_id,
-            "route": route_name,
-            "started": now,
-            "last_attempt": is_last_attempt,
-        }
+        self._inflight[delivery.session_chat_id] = InFlightRun(
+            event_id=delivery.event_id,
+            route=delivery.route_name,
+            started=time.time(),
+            is_last_attempt=delivery.is_last_attempt,
+        )
         logger.info(
             "[hookdeck] dispatch route=%s event_type=%s event_id=%s attempt=%s "
             "prompt_len=%d",
-            route_name,
-            event_type,
-            event_id or "(none)",
-            attempt or "?",
-            len(prompt),
+            delivery.route_name,
+            delivery.event_type,
+            delivery.event_id or "(none)",
+            delivery.attempt or "?",
+            len(delivery.prompt),
         )
 
-        if self._ack_mode == "sync":
-            return await self._dispatch_sync(event, session_chat_id, route_name)
+        if self.settings.ack_mode == "sync":
+            return await self._dispatch_and_wait(event, delivery)
 
-        task = asyncio.create_task(self.handle_message(event))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return web.json_response(
+        self._spawn(self.handle_message(event))
+        return self._respond(
             {
                 "status": "accepted",
-                "route": route_name,
-                "event": event_type,
-                "event_id": event_id,
+                "route": delivery.route_name,
+                "event": delivery.event_type,
+                "event_id": delivery.event_id,
             },
-            status=assert_declared_status(202),
+            status=202,
         )
 
-    def _unparseable_response(self, event_id: str) -> web.Response:
-        """400 for a body that is neither JSON nor form-encoded.
-
-        Hookdeck honours ``Retry-After: -1`` as "cancel all further automatic
-        retries", which turns 50 doomed attempts into one for a payload no
-        retry can fix. It is off by default because the failure mode is
-        severe and silent: an over-strict parser would discard live traffic,
-        unrecoverable once retention lapses. Turn it on only once you have
-        watched the counter in ``hermes hookdeck status`` and are satisfied
-        nothing legitimate is landing here.
-        """
-        headers = {}
-        if self._cancel_retries_on_unparseable:
-            headers["Retry-After"] = "-1"
-            logger.warning(
-                "[hookdeck] Event %s has an unparseable body — cancelling its "
-                "automatic retries (cancel_retries_on_unparseable is on)",
-                event_id or "(no id)",
-            )
-            if self._ledger is not None and event_id:
-                self._ledger.record_cancelled(event_id, "unparseable body")
-        else:
-            logger.warning(
-                "[hookdeck] Event %s has an unparseable body", event_id or "(no id)"
-            )
-        return web.json_response(
-            {"error": "Cannot parse body"}, status=assert_declared_status(400), headers=headers
-        )
-
-    def _apply_skills(self, route: dict, prompt: str) -> str:
-        """Prepend the first configured skill's invocation to the prompt."""
-        skills = route.get("skills", [])
-        if not skills:
-            return prompt
-        try:
-            from agent.skill_commands import (
-                build_skill_invocation_message,
-                get_skill_commands,
-            )
-
-            skill_cmds = get_skill_commands()
-            for skill_name in skills:
-                key = f"/{skill_name}"
-                if key in skill_cmds:
-                    content = build_skill_invocation_message(
-                        key, user_instruction=prompt
-                    )
-                    if content:
-                        return content
-                else:
-                    logger.warning("[hookdeck] Skill '%s' not found", skill_name)
-        except Exception as exc:
-            logger.warning("[hookdeck] Skill loading failed: %s", exc)
-        return prompt
-
-    async def _dispatch_sync(
-        self, event: MessageEvent, session_chat_id: str, route_name: str
+    async def _dispatch_and_wait(
+        self, event: MessageEvent, delivery: Delivery
     ) -> web.Response:
-        """Hold the response open until the run finishes, or time out.
+        """``sync`` mode: hold the response until the run finishes, or time out.
 
-        ``handle_message`` is fire-and-forget by design, so "synchronous" here
-        means waiting on the completion hook rather than awaiting the dispatch
-        call. On timeout the response degrades to 202: the run is still going,
-        and answering 5xx would make Hookdeck redeliver work that is in flight.
+        ``handle_message`` is fire-and-forget by design, so "synchronous" means
+        waiting on the completion hook rather than awaiting the dispatch call.
+        On timeout the response degrades to 202: the run is still going, and
+        answering 5xx would have Hookdeck redeliver work that is in flight.
         """
-        loop = asyncio.get_running_loop()
-        waiter: asyncio.Future = loop.create_future()
-        self._waiters[session_chat_id] = waiter
-
-        task = asyncio.create_task(self.handle_message(event))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        waiter: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._waiters[delivery.session_chat_id] = waiter
+        self._spawn(self.handle_message(event))
 
         try:
-            outcome = await asyncio.wait_for(waiter, timeout=self._sync_timeout)
+            outcome = await asyncio.wait_for(
+                waiter, timeout=self.settings.sync_timeout_seconds
+            )
         except asyncio.TimeoutError:
             logger.info(
                 "[hookdeck] Run for %s still going after %.0fs — acking 202",
-                session_chat_id,
-                self._sync_timeout,
+                delivery.session_chat_id,
+                self.settings.sync_timeout_seconds,
             )
-            return web.json_response(
-                {"status": "accepted", "reason": "still running", "route": route_name},
-                status=assert_declared_status(202),
+            return self._respond(
+                {
+                    "status": "accepted",
+                    "reason": "still running",
+                    "route": delivery.route_name,
+                },
+                status=202,
             )
         finally:
-            self._waiters.pop(session_chat_id, None)
+            self._waiters.pop(delivery.session_chat_id, None)
 
         if outcome == ProcessingOutcome.SUCCESS:
-            return web.json_response({"status": "processed", "route": route_name})
+            return self._respond({"status": "processed", "route": delivery.route_name})
         # 5xx puts the event back on Hookdeck's retry schedule.
-        return web.json_response(
-            {"status": "failed", "route": route_name, "outcome": str(outcome)},
-            status=assert_declared_status(500),
+        return self._respond(
+            {
+                "status": "failed",
+                "route": delivery.route_name,
+                "outcome": str(outcome),
+            },
+            status=500,
         )
 
     # ------------------------------------------------------------------
     # Completion
     # ------------------------------------------------------------------
 
-    async def on_processing_complete(
-        self, event: MessageEvent, outcome: Any
-    ) -> None:
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
         """Record the run's true outcome, then let the base class close the session.
 
         This is the seam the built-in adapter leaves unused for reliability. It
-        fires at the real end of the run — success, failure and cancellation
-        alike — which is the only point at which we know whether the event was
-        actually handled.
+        fires at the real end of a run — success, failure and cancellation
+        alike — which is the only point at which the event's fate is known.
         """
         chat_id = getattr(getattr(event, "source", None), "chat_id", "") or ""
-        info = self._inflight.pop(chat_id, None)
+        run = self._inflight.pop(chat_id, None)
 
         waiter = self._waiters.get(chat_id)
         if waiter is not None and not waiter.done():
             waiter.set_result(outcome)
 
-        event_id = (info or {}).get("event_id") or ""
-        if event_id and self._ledger is not None:
+        if run and run.event_id and self._ledger is not None:
             try:
                 await self._record_outcome(
-                    event_id, outcome, last_attempt=(info or {}).get("last_attempt", False)
+                    run.event_id, outcome, last_attempt=run.is_last_attempt
                 )
             except Exception:
                 logger.exception(
-                    "[hookdeck] Failed to record outcome for event %s", event_id
+                    "[hookdeck] Failed to record outcome for event %s", run.event_id
                 )
 
         try:
@@ -1040,26 +785,27 @@ class HookdeckAdapter(WebhookAdapter):
             self._ledger.mark_succeeded(event_id)
             return
 
-        attempts = self._ledger.agent_attempts(event_id)
+        runs = self._ledger.agent_attempts(event_id)
         reason = str(getattr(outcome, "value", outcome))
-        # ``attempts`` counts runs, so retries already requested is one less.
+
+        # `runs` counts runs, so retries already requested is one less:
         # max_agent_retries=2 means the first run plus two more.
-        if attempts - 1 >= self._max_agent_retries:
+        if runs - 1 >= self.settings.max_agent_retries:
             self._ledger.mark_exhausted(event_id, reason)
             logger.error(
                 "[hookdeck] Event %s failed %d times — giving up. Inspect it in "
                 "Hookdeck and replay with `hermes hookdeck replay %s`.",
                 event_id,
-                attempts,
+                runs,
                 event_id,
             )
             return
 
         if last_attempt:
-            # Hookdeck's own automatic retries are done for this event, so
-            # nothing else will bring it back on its own. Manual retries are
-            # unlimited, which is what the request below is — but say so
-            # loudly, because this is the dead-letter moment.
+            # Hookdeck's automatic retries are spent for this event, so nothing
+            # will bring it back on its own. The request below is a manual
+            # retry, which is unlimited — but this is the dead-letter moment
+            # and deserves saying out loud.
             logger.warning(
                 "[hookdeck] Event %s failed on its last automatic attempt — "
                 "requesting a manual redelivery; if that fails too, only "
@@ -1069,19 +815,191 @@ class HookdeckAdapter(WebhookAdapter):
             )
 
         self._ledger.mark_failed(event_id, reason)
-        if self._ack_mode != "async_retry" or self._api is None:
+        if self.settings.ack_mode != "async_retry" or self._api is None:
             return
         try:
             await self._api.retry_event(event_id)
             logger.info(
-                "[hookdeck] Agent run failed for event %s (attempt %d/%d) — "
+                "[hookdeck] Agent run failed for event %s (run %d of %d) — "
                 "asked Hookdeck to redeliver",
                 event_id,
-                attempts,
-                self._max_agent_retries,
+                runs,
+                self.settings.max_agent_retries + 1,
             )
         except HookdeckAPIError as exc:
             logger.error("[hookdeck] Could not request redelivery: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _respond(
+        self,
+        body: dict,
+        *,
+        status: int = 200,
+        headers: Optional[dict] = None,
+    ) -> web.Response:
+        """Answer a delivery, refusing any status whose retryability is undeclared.
+
+        Every status the adapter emits is listed in ``EMITTED_STATUS_RETRYABLE``
+        alongside whether a redelivery of that event could succeed, and the
+        connection's retry rule is derived from that list. Routing responses
+        through here is what stops the two drifting apart.
+        """
+        return web.json_response(
+            body, status=assert_declared_status(status), headers=headers
+        )
+
+    def _ignored(self, delivery: Delivery, reason: str) -> web.Response:
+        """200 for an event the route deliberately does not want.
+
+        Not an error: the delivery arrived correctly and was considered. A 4xx
+        would have Hookdeck record a failure and, worse, retry it.
+        """
+        logger.debug(
+            "[hookdeck] Ignoring %s on route %s (%s)",
+            delivery.event_type,
+            delivery.route_name,
+            reason,
+        )
+        return self._respond(
+            {
+                "status": "ignored",
+                "reason": reason,
+                "route": delivery.route_name,
+                "event": delivery.event_type,
+            }
+        )
+
+    def _reject_unparseable(self, event_id: str) -> web.Response:
+        """400 for a body that no retry can fix.
+
+        ``Retry-After: -1`` asks Hookdeck to cancel the remaining automatic
+        retries, turning 50 doomed attempts into one. It is off by default
+        because the failure mode is severe and silent: an over-strict parser
+        would discard live traffic, unrecoverable once retention lapses. Turn
+        it on only after watching the counter in ``hermes hookdeck status``.
+        """
+        headers = {}
+        if self.settings.cancel_retries_on_unparseable:
+            headers["Retry-After"] = "-1"
+            logger.warning(
+                "[hookdeck] Event %s has an unparseable body — cancelling its "
+                "automatic retries (cancel_retries_on_unparseable is on)",
+                event_id or "(no id)",
+            )
+            if self._ledger is not None and event_id:
+                self._ledger.record_cancelled(event_id, "unparseable body")
+        else:
+            logger.warning(
+                "[hookdeck] Event %s has an unparseable body", event_id or "(no id)"
+            )
+        return self._respond({"error": "Cannot parse body"}, status=400, headers=headers)
+
+    def _header(self, request: web.Request, suffix: str) -> str:
+        return request.headers.get(
+            header_name(suffix, self.settings.header_prefix), ""
+        )
+
+    def _remember_delivery_target(self, delivery: Delivery) -> None:
+        """Record where this run's response goes, for the inherited ``send()``."""
+        now = time.time()
+        self._delivery_info[delivery.session_chat_id] = {
+            "deliver": delivery.route.get("deliver", "log"),
+            "deliver_extra": self._render_delivery_extra(
+                delivery.route.get("deliver_extra", {}), delivery.payload
+            ),
+        }
+        self._delivery_info_created[delivery.session_chat_id] = now
+        self._delivery_info_order.append((now, delivery.session_chat_id))
+        self._prune_delivery_info(now)
+
+    def _spawn(self, coro) -> None:
+        """Run *coro* detached, keeping a reference so it is not GC'd mid-flight."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _apply_skills(self, route: dict, prompt: str) -> str:
+        """Replace the prompt with the first configured skill's invocation."""
+        skills = route.get("skills", [])
+        if not skills:
+            return prompt
+        try:
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                get_skill_commands,
+            )
+
+            available = get_skill_commands()
+            for skill_name in skills:
+                command = f"/{skill_name}"
+                if command not in available:
+                    logger.warning("[hookdeck] Skill '%s' not found", skill_name)
+                    continue
+                content = build_skill_invocation_message(command, user_instruction=prompt)
+                if content:
+                    return content
+        except Exception as exc:
+            logger.warning("[hookdeck] Skill loading failed: %s", exc)
+        return prompt
+
+    def _sweep_inflight(self) -> None:
+        """Release slots whose completion hook never fired.
+
+        ``on_processing_complete`` runs on the success, failure and cancellation
+        paths, so this should find nothing — but a slot leaked by an unexpected
+        crash would wedge admission control at zero capacity, which is worse
+        than the small chance of releasing a slot early.
+        """
+        now = time.time()
+        if now - self._last_sweep < _SWEEP_INTERVAL_SECONDS:
+            return
+        self._last_sweep = now
+
+        for chat_id, run in list(self._inflight.items()):
+            if now - run.started <= self.settings.run_timeout_seconds:
+                continue
+            logger.warning(
+                "[hookdeck] Run for %s exceeded %.0fs with no completion signal "
+                "— releasing its slot and handing the event back",
+                chat_id,
+                self.settings.run_timeout_seconds,
+            )
+            self._inflight.pop(chat_id, None)
+            # Leaving the ledger row `running` would strand the event until the
+            # next restart, since boot recovery is the only other reader. Treat
+            # it as a failure now, which routes it through the retry budget.
+            if run.event_id:
+                self._spawn(self._record_outcome(run.event_id, ProcessingOutcome.FAILURE))
+
+        if self._ledger is not None:
+            self._ledger.prune(self.settings.ledger_ttl_seconds)
+
+    # Kept for tests and callers that predate `settings`.
+    def _validate_startup(self) -> None:
+        self.settings.validate()
+
+    def _bind_hosts(self) -> list[Optional[str]]:
+        return self.settings.bind_hosts
+
+    def _tunnel_plan(self) -> dict[str, str]:
+        return self.settings.tunnels
+
+
+def _no_delivery() -> Delivery:
+    """Placeholder for the error paths, which return a response instead."""
+    return Delivery(
+        event_id="",
+        attempt=0,
+        source_name="",
+        route_name="",
+        route={},
+        payload=None,
+        event_type="",
+        is_last_attempt=False,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -1092,10 +1010,10 @@ class HookdeckAdapter(WebhookAdapter):
 def check_requirements() -> bool:
     """Passive dependency probe — must not install anything.
 
-    Reports what the module-level guard actually found for aiohttp, so a
-    missing extra surfaces as "platform not ready, here's the install hint"
-    rather than as an absent platform. httpx is probed with ``find_spec``
-    because it is only needed once the adapter runs.
+    Reports what the module-level guard found for aiohttp, so a missing extra
+    surfaces as "platform not ready, here is the install hint" rather than as
+    an absent platform. httpx is probed lazily since it is only needed once the
+    adapter runs.
     """
     from importlib.util import find_spec
 
@@ -1103,10 +1021,8 @@ def check_requirements() -> bool:
 
 
 def validate_config(config: PlatformConfig) -> bool:
-    extra = getattr(config, "extra", None) or {}
-    has_secret = bool(extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET"))
-    has_routes = bool(extra.get("routes"))
-    return has_secret and has_routes
+    settings = AdapterSettings.from_extra(getattr(config, "extra", None))
+    return bool(settings.signing_secret and settings.routes)
 
 
 def is_connected(config: PlatformConfig) -> bool:
@@ -1114,8 +1030,13 @@ def is_connected(config: PlatformConfig) -> bool:
 
 
 def env_enablement() -> Optional[dict]:
-    """Seed ``PlatformConfig.extra`` from env so ``hermes gateway status`` can
-    report an env-only setup without constructing the adapter."""
+    """Seed ``PlatformConfig.extra`` from the environment.
+
+    Lets ``hermes gateway status`` report an env-only setup without
+    constructing the adapter.
+    """
+    import os
+
     if not os.getenv("HOOKDECK_WEBHOOK_SECRET"):
         return None
     seeded: dict[str, Any] = {"secret": os.getenv("HOOKDECK_WEBHOOK_SECRET", "")}
@@ -1126,9 +1047,10 @@ def env_enablement() -> Optional[dict]:
         ("HOOKDECK_SOURCE", "source", str),
     ):
         value = os.getenv(env_var)
-        if value:
-            try:
-                seeded[key] = cast(value)
-            except ValueError:
-                logger.warning("[hookdeck] Ignoring invalid %s=%r", env_var, value)
+        if not value:
+            continue
+        try:
+            seeded[key] = cast(value)
+        except ValueError:
+            logger.warning("[hookdeck] Ignoring invalid %s=%r", env_var, value)
     return seeded

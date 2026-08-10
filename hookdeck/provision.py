@@ -115,77 +115,119 @@ def build_connection_payload(
     same route always maps to the same connection.
     """
     source_type = (source_type or "WEBHOOK").upper()
-    destination_name = destination_name or f"hermes-{name}"
+    return {
+        "name": name,
+        "source": _source_spec(source_name, source_type, source_secret),
+        "destination": _destination_spec(
+            destination_name or f"hermes-{name}",
+            mode=mode,
+            path=path,
+            url=url,
+            rate_limit=rate_limit,
+            rate_limit_period=rate_limit_period,
+            delivery_group_key=delivery_group_key,
+            group_rate=group_rate,
+            group_rate_period=group_rate_period,
+        ),
+        "rules": _rules(
+            events=events or [],
+            source_type=source_type,
+            event_path=event_path,
+            retry_count=retry_count,
+            retry_interval_ms=retry_interval_ms,
+            dedupe_window_ms=dedupe_window_ms,
+        ),
+    }
 
-    source: dict[str, Any] = {"name": source_name, "type": source_type}
-    if source_secret and source_type in {"WEBHOOK", "HTTP"}:
-        # Only the generic source types take a caller-supplied HMAC config;
-        # named platform types carry their own verification shape, configured
-        # with the provider's own secret in the Hookdeck dashboard.
+
+def _source_spec(name: str, source_type: str, secret: str) -> dict[str, Any]:
+    """The inline source. Named platform types carry their own verification."""
+    source: dict[str, Any] = {"name": name, "type": source_type}
+    if secret and source_type in {"WEBHOOK", "HTTP"}:
+        # Only the generic types take a caller-supplied HMAC config. Inventing
+        # one for a named platform would produce a source that rejects the very
+        # traffic it exists to accept.
         source["config"] = {
             "auth_type": "HMAC",
             "auth": {
                 "algorithm": "sha256",
                 "encoding": "hex",
                 "header_key": "x-signature",
-                "webhook_secret_key": source_secret,
+                "webhook_secret_key": secret,
             },
         }
+    return source
 
+
+def _destination_spec(
+    name: str,
+    *,
+    mode: str,
+    path: str,
+    url: str,
+    rate_limit: Optional[int],
+    rate_limit_period: str,
+    delivery_group_key: str,
+    group_rate: int,
+    group_rate_period: str,
+) -> dict[str, Any]:
+    """The inline destination: a CLI tunnel target, or a reachable URL."""
     if mode == "cli":
-        destination = {
-            "name": destination_name,
+        return {
+            "name": name,
             "type": "CLI",
             "config": {
                 "path": path,
                 # Hookdeck otherwise appends the source request's own path to
-                # this one, so a provider POSTing to <source-url>/events
-                # arrives at <path>/events. The adapter tolerates that, but
-                # a fixed path is what we actually want.
+                # this one, so a provider POSTing to <source-url>/events would
+                # arrive at <path>/events. The adapter tolerates that; a fixed
+                # path is still what we want.
                 "path_forwarding_disabled": True,
                 **HOOKDECK_SIGNATURE_AUTH,
             },
         }
-    else:
-        if not url:
-            raise ValueError("push mode needs a destination URL")
-        destination = {
-            "name": destination_name,
-            "type": "HTTP",
-            "config": _http_destination_config(
-                url,
-                rate_limit=rate_limit,
-                rate_limit_period=rate_limit_period,
-                delivery_group_key=delivery_group_key,
-                group_rate=group_rate,
-                group_rate_period=group_rate_period,
-            ),
-        }
+    if not url:
+        raise ValueError("push mode needs a destination URL")
+    return {
+        "name": name,
+        "type": "HTTP",
+        "config": _http_destination_config(
+            url,
+            rate_limit=rate_limit,
+            rate_limit_period=rate_limit_period,
+            delivery_group_key=delivery_group_key,
+            group_rate=group_rate,
+            group_rate_period=group_rate_period,
+        ),
+    }
 
-    response_status_codes = retryable_status_codes()
 
+def _rules(
+    *,
+    events: list[str],
+    source_type: str,
+    event_path: str,
+    retry_count: int,
+    retry_interval_ms: int,
+    dedupe_window_ms: Optional[int],
+) -> list[dict[str, Any]]:
+    """Connection rules — where most of the reliability actually lives."""
     rules: list[dict[str, Any]] = [
         {
             "type": "retry",
             "strategy": "exponential",
             "count": retry_count,
             "interval": retry_interval_ms,
-            "response_status_codes": response_status_codes,
+            "response_status_codes": retryable_status_codes(),
         }
     ]
     if dedupe_window_ms:
         rules.append({"type": "deduplicate", "window": dedupe_window_ms})
 
-    event_filter = build_event_filter(events or [], source_type, event_path)
+    event_filter = build_event_filter(events, source_type, event_path)
     if event_filter:
         rules.append(event_filter)
-
-    return {
-        "name": name,
-        "source": source,
-        "destination": destination,
-        "rules": rules,
-    }
+    return rules
 
 
 def build_event_filter(

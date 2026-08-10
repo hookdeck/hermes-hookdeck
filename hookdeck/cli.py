@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -384,119 +385,182 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     return run_sync(_run())
 
 
+@dataclass
+class Check:
+    """One diagnostic result, rendered as a tick or a cross."""
+
+    ok: bool
+    message: str
+    #: Printed underneath, for context that is useful but not itself a failure.
+    note: str = ""
+
+    def render(self) -> None:
+        print(("✓ " if self.ok else "✗ ") + self.message)
+        if self.note:
+            print(f"  note: {self.note}")
+
+
+def _check_credentials(extra: dict) -> list[Check]:
+    return [
+        Check(
+            bool(os.getenv("HOOKDECK_API_KEY")),
+            "HOOKDECK_API_KEY is set"
+            if os.getenv("HOOKDECK_API_KEY")
+            else "HOOKDECK_API_KEY is not set — setup, status and replay will not work",
+        ),
+        Check(
+            bool(extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET")),
+            "Signing secret is configured"
+            if (extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET"))
+            else "No signing secret — the adapter will refuse to start. Set "
+            "HOOKDECK_WEBHOOK_SECRET to your project's signing secret.",
+        ),
+    ]
+
+
+def _check_routes(routes: dict) -> Check:
+    return Check(
+        bool(routes),
+        f"{len(routes)} route(s) configured: {', '.join(routes)}"
+        if routes
+        else "No routes under platforms.hookdeck.extra.routes",
+    )
+
+
+def _check_cli(extra: dict) -> list[Check]:
+    """The CLI is only reachable in cli mode, and only the resolved one matters."""
+    configured = extra.get("cli_binary") or "hookdeck"
+    resolved = shutil.which(configured)
+    if not resolved:
+        return [
+            Check(
+                False,
+                f"Hookdeck CLI '{configured}' not found — install it, set "
+                "platforms.hookdeck.extra.cli_binary, or switch to mode: push",
+            )
+        ]
+
+    # Report the path, not just the name: a shadowed install is how you end up
+    # version-checking one binary and launching another.
+    shadowed = _other_hookdeck_binaries(resolved)
+    found = Check(
+        True,
+        f"Hookdeck CLI found: {resolved}",
+        note=(
+            f"{len(shadowed)} other hookdeck binary(ies) shadowed by it: "
+            f"{', '.join(shadowed)}"
+            if shadowed
+            else ""
+        ),
+    )
+
+    version = _cli_version(resolved)
+    current = _version_at_least(version, MIN_CLI_VERSION)
+    return [
+        found,
+        Check(
+            current,
+            f"Hookdeck CLI {version or 'unknown'} meets the {MIN_CLI_VERSION_TEXT} minimum"
+            if current
+            else f"Hookdeck CLI {version or 'unknown'} at {resolved} is below "
+            f"{MIN_CLI_VERSION_TEXT}. Earlier versions stop delivering after a "
+            "session expires, without saying so. Upgrade, or point "
+            "platforms.hookdeck.extra.cli_binary at a newer install.",
+        ),
+    ]
+
+
+def _report_stranded_runs() -> None:
+    """Deliveries whose outcome was never recorded — usually none."""
+    path = _ledger_path()
+    if not path.exists():
+        return
+    ledger = DeliveryLedger(path)
+    try:
+        stale = ledger.stale_running(3600)
+        if not stale:
+            return
+        print(
+            f"\n! {len(stale)} delivery(ies) still marked running after an hour "
+            "— a crash probably lost their outcome. Replay them with:"
+        )
+        for row in stale[:10]:
+            print(f"    hermes hookdeck replay {row['event_id']}")
+    finally:
+        ledger.close()
+
+
+async def _check_live_connections(routes: dict) -> list[Check]:
+    """Reachability, plus whether each retry rule covers what the adapter emits.
+
+    A rule narrower than the emitted statuses is silent data loss — a deferred
+    or failed event that Hookdeck never brings back — so it is worth a network
+    round trip to catch.
+    """
+    checks: list[Check] = []
+    async with _api() as api:
+        result = await api.list_connections(limit=100)
+        models = (result or {}).get("models") or (result or {}).get("data") or []
+        for connection in models:
+            if connection.get("name") not in routes:
+                continue
+            for rule in connection.get("rules") or []:
+                if rule.get("type") != "retry":
+                    continue
+                missing = uncovered_statuses(rule.get("response_status_codes"))
+                if missing:
+                    checks.append(
+                        Check(
+                            False,
+                            f"connection '{connection.get('name')}' has a retry "
+                            f"rule that does not cover {missing} — the adapter "
+                            "emits those, so deferred and failed events would "
+                            "never come back. Re-run `hermes hookdeck setup`.",
+                        )
+                    )
+    checks.append(Check(True, "Hookdeck API reachable and the key is accepted"))
+    return checks
+
+
 def _cmd_doctor(_args: argparse.Namespace) -> int:
-    problems = 0
     extra = _platform_extra()
     mode = extra.get("mode") or os.getenv("HOOKDECK_MODE") or "cli"
-
-    def check(ok: bool, good: str, bad: str) -> None:
-        nonlocal problems
-        print(("✓ " if ok else "✗ ") + (good if ok else bad))
-        if not ok:
-            problems += 1
-
-    check(
-        bool(os.getenv("HOOKDECK_API_KEY")),
-        "HOOKDECK_API_KEY is set",
-        "HOOKDECK_API_KEY is not set — setup, status and replay will not work",
-    )
-    check(
-        bool(extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET")),
-        "Signing secret is configured",
-        "No signing secret — the adapter will refuse to start. Set "
-        "HOOKDECK_WEBHOOK_SECRET to your project's signing secret.",
-    )
     routes = routes_from_config(_load_hermes_config())
-    check(
-        bool(routes),
-        f"{len(routes)} route(s) configured: {', '.join(routes)}",
-        "No routes under platforms.hookdeck.extra.routes",
-    )
+
+    checks = [*_check_credentials(extra), _check_routes(routes)]
     if mode == "cli":
-        configured = extra.get("cli_binary") or "hookdeck"
-        cli_path = shutil.which(configured)
-        check(
-            bool(cli_path),
-            f"Hookdeck CLI found: {cli_path}",
-            f"Hookdeck CLI '{configured}' not found — install it, set "
-            "platforms.hookdeck.extra.cli_binary, or switch to mode: push",
-        )
-        if cli_path:
-            version = _cli_version(cli_path)
-            check(
-                _version_at_least(version, MIN_CLI_VERSION),
-                f"Hookdeck CLI {version or 'unknown'} meets the {MIN_CLI_VERSION_TEXT} minimum",
-                f"Hookdeck CLI {version or 'unknown'} at {cli_path} is below "
-                f"{MIN_CLI_VERSION_TEXT}. Earlier versions stop delivering "
-                "after a session expires, without saying so. Upgrade, or point "
-                "platforms.hookdeck.extra.cli_binary at a newer install.",
-            )
-            others = _other_hookdeck_binaries(cli_path)
-            if others:
-                # A shadowed install is how you end up version-checking one
-                # binary and launching another.
-                print(
-                    f"  note: {len(others)} other hookdeck binary(ies) on this "
-                    f"system are shadowed by {cli_path}: {', '.join(others)}"
-                )
+        checks += _check_cli(extra)
     else:
-        check(
-            bool(extra.get("public_url")),
-            "public_url is set for push mode",
-            "push mode with no public_url — setup cannot build a destination URL",
+        checks.append(
+            Check(
+                bool(extra.get("public_url")),
+                "public_url is set for push mode"
+                if extra.get("public_url")
+                else "push mode with no public_url — setup cannot build a "
+                "destination URL",
+            )
         )
 
-    print(f"\nMode: {mode}  port: {extra.get('port', DEFAULT_PORT)}  "
-          f"path: {extra.get('path', DEFAULT_PATH)}")
+    for check in checks:
+        check.render()
 
-    path = _ledger_path()
-    if path.exists():
-        ledger = DeliveryLedger(path)
-        try:
-            stale = ledger.stale_running(3600)
-            if stale:
-                print(
-                    f"\n! {len(stale)} delivery(ies) still marked running after an "
-                    "hour — a crash probably lost their outcome. Replay them with:"
-                )
-                for row in stale[:10]:
-                    print(f"    hermes hookdeck replay {row['event_id']}")
-        finally:
-            ledger.close()
+    print(
+        f"\nMode: {mode}  port: {extra.get('port', DEFAULT_PORT)}  "
+        f"path: {extra.get('path', DEFAULT_PATH)}"
+    )
+    _report_stranded_runs()
 
     if os.getenv("HOOKDECK_API_KEY"):
-        async def _inspect() -> list[str]:
-            """Reachability, plus whether each retry rule covers what we emit."""
-            warnings: list[str] = []
-            async with _api() as api:
-                result = await api.list_connections(limit=100)
-                models = (result or {}).get("models") or (result or {}).get("data") or []
-                for connection in models:
-                    if connection.get("name") not in routes:
-                        continue
-                    for rule in connection.get("rules") or []:
-                        if rule.get("type") != "retry":
-                            continue
-                        missing = uncovered_statuses(rule.get("response_status_codes"))
-                        if missing:
-                            warnings.append(
-                                f"connection '{connection.get('name')}' has a retry "
-                                f"rule that does not cover {missing} — the adapter "
-                                "emits those, so deferred and failed events would "
-                                "never come back. Re-run `hermes hookdeck setup`."
-                            )
-            return warnings
-
+        print()
         try:
-            for warning in run_sync(_inspect()):
-                problems += 1
-                print(f"✗ {warning}")
-            print("\n✓ Hookdeck API reachable and the key is accepted")
+            live = run_sync(_check_live_connections(routes))
         except HookdeckAPIError as exc:
-            problems += 1
-            print(f"\n✗ Hookdeck API check failed: {exc}")
+            live = [Check(False, f"Hookdeck API check failed: {exc}")]
+        for check in live:
+            check.render()
+        checks += live
 
-    return 1 if problems else 0
+    return 1 if any(not check.ok for check in checks) else 0
 
 
 def hookdeck_command(args: argparse.Namespace) -> int:

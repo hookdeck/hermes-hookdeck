@@ -58,15 +58,17 @@ DEFAULT_RUN_TIMEOUT_SECONDS = 900
 ACK_MODES = ("async_retry", "sync")
 
 # Every HTTP status the adapter answers a Hookdeck delivery with, and whether a
-# redelivery of THAT EXACT EVENT could still succeed. This is the single place
-# the question is decided: the provisioned retry rule is derived from it, and
-# emitting an undeclared status raises. Stating the two halves separately is
-# what let an earlier version answer 401 and 404 while provisioning a rule that
-# retried neither — recoverable events, silently discarded.
+# redelivery of THAT EXACT EVENT could still succeed.
 #
-# The test is "can a retry of this stored request ever succeed", and it is
-# answered against *this adapter's* operator surface, not the status code in
-# the abstract: 413 is retryable here only because max_body_bytes is operator
+# One declaration, two consumers: the connection's retry rule is derived from
+# it, and `assert_declared_status` refuses any status not listed. Keeping them
+# together is the point — a hand-written retry rule and the code that emits
+# statuses drift apart quietly, and the symptom is a recoverable event that is
+# simply never retried, with nothing recording that a choice was made.
+#
+# The test is "can a retry of this stored request ever succeed", answered
+# against *this adapter's* operator surface rather than the status code in the
+# abstract: 413 is retryable here only because max_body_bytes is operator
 # config. A host that hardcodes its body limit would answer differently.
 EMITTED_STATUS_RETRYABLE = {
     200: False,  # duplicate, ignored, delivered — nothing to retry

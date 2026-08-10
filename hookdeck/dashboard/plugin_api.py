@@ -88,97 +88,110 @@ async def _call(fn, *args, **kwargs):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+def _queue_depth(raw: Any) -> dict:
+    """The one queue metric worth showing, lifted out of its bucketed series.
+
+    ``max_age`` is deliberately not surfaced. Its unit is undocumented —
+    neither the OpenAPI spec nor the metrics docs say whether it is seconds,
+    minutes or hours — and it does not change over minutes of observation, so
+    it is a window maximum rather than a live age and no delta reveals the unit
+    either. A number whose meaning cannot be stated is worse on a dashboard
+    than no number.
+    """
+    rows = (raw or {}).get("data") or []
+    metrics = rows[0].get("metrics") if rows else {}
+    return {"max_depth": (metrics or {}).get("max_depth")}
+
+
+def _own_connections(raw: Any) -> tuple[list[dict], int]:
+    """This gateway's connections, and a count of the ones left out.
+
+    A project's other connections are someone else's production traffic, and a
+    tab that puts a Pause button beside all of them is one misclick from an
+    outage nobody would connect to this plugin. The count is reported so an
+    empty list reads as "none of yours" rather than "the project is empty".
+    """
+    routes = set(routes_from_config(_load_hermes_config()))
+    everything = _models(raw)
+    mine = [
+        {"id": c.get("id"), "name": c.get("name"), "paused": bool(c.get("paused_at"))}
+        for c in everything
+        if c.get("name") in routes
+    ]
+    return mine, len(everything) - len(mine)
+
+
+async def _hookdeck_state() -> dict:
+    """What Hookdeck still owes this gateway."""
+    if not os.getenv("HOOKDECK_API_KEY"):
+        return {"configured": False}
+
+    async with HookdeckAPI() as api:
+        # Four independent reads: gathered, so the tab costs one round trip's
+        # latency rather than four.
+        depth, failed, issues, connections = await asyncio.gather(
+            _call(api.queue_depth),
+            _call(api.list_events, status="FAILED", limit=25),
+            _call(api.list_issues, status="OPENED", limit=25),
+            _call(api.list_connections, limit=100),
+        )
+
+    mine, others = _own_connections(connections)
+    return {
+        "configured": True,
+        "depth": _queue_depth(depth),
+        "failed": [
+            {
+                "id": e.get("id"),
+                "error_code": e.get("error_code"),
+                "response_status": e.get("response_status"),
+                "attempts": e.get("attempts"),
+                "created_at": e.get("created_at"),
+            }
+            for e in _models(failed)
+        ],
+        "issues": [
+            {"id": i.get("id"), "type": i.get("type"), "error_code": i.get("error_code")}
+            for i in _models(issues)
+        ],
+        "connections": mine,
+        "other_connection_count": others,
+    }
+
+
+def _local_state() -> dict:
+    """What this gateway actually did with each delivery."""
+    path = _ledger_path()
+    state: dict[str, Any] = {"path": str(path), "exists": path.exists()}
+    if not state["exists"]:
+        return state
+
+    ledger = DeliveryLedger(path)
+    try:
+        state["counts"] = ledger.counts()
+        state["failures"] = [
+            {
+                "event_id": row["event_id"],
+                "route": row["route"],
+                "status": row["status"],
+                "agent_attempts": row["agent_attempts"],
+                "error": row["error"],
+            }
+            for row in ledger.recent_failures(25)
+        ]
+        # Runs whose outcome was never recorded. Normally empty; anything here
+        # means a crash lost the completion signal and boot recovery has not
+        # run since.
+        state["stranded"] = [row["event_id"] for row in ledger.stale_running(3600)]
+    finally:
+        ledger.close()
+    return state
+
+
 @router.get("/overview")
 async def overview() -> dict:
     """Everything the tab renders on load, in one round trip."""
-    hookdeck: dict[str, Any] = {"configured": bool(os.getenv("HOOKDECK_API_KEY"))}
-
-    if hookdeck["configured"]:
-        async with HookdeckAPI() as api:
-            # Four independent reads: gather rather than serialise, so the tab
-            # costs one round trip's latency instead of four.
-            depth_raw, failed, issues, connections = await asyncio.gather(
-                _call(api.queue_depth),
-                _call(api.list_events, status="FAILED", limit=25),
-                _call(api.list_issues, status="OPENED", limit=25),
-                _call(api.list_connections, limit=100),
-            )
-            hookdeck["failed"] = [
-                {
-                    "id": e.get("id"),
-                    "error_code": e.get("error_code"),
-                    "response_status": e.get("response_status"),
-                    "attempts": e.get("attempts"),
-                    "created_at": e.get("created_at"),
-                }
-                for e in _models(failed)
-            ]
-            hookdeck["issues"] = [
-                {
-                    "id": i.get("id"),
-                    "type": i.get("type"),
-                    "error_code": i.get("error_code"),
-                }
-                for i in _models(issues)
-            ]
-            # Only this gateway's connections get pause/resume controls. A
-            # project's other connections are someone else's production
-            # traffic, and a tab that puts a Pause button next to all of them
-            # is one misclick from an outage nobody connects to this plugin.
-            routes = set(routes_from_config(_load_hermes_config()))
-            all_conns = _models(connections)
-            hookdeck["connections"] = [
-                {
-                    "id": c.get("id"),
-                    "name": c.get("name"),
-                    "paused": bool(c.get("paused_at")),
-                }
-                for c in all_conns
-                if c.get("name") in routes
-            ]
-            hookdeck["other_connection_count"] = len(all_conns) - len(
-                hookdeck["connections"]
-            )
-
-            # Flatten the one metric worth showing. queue-depth returns a
-            # bucketed series wrapped in metadata; rendering that raw is a JSON
-            # dump, not an answer.
-            #
-            # `max_age` is deliberately not surfaced. Its unit is undocumented
-            # — neither the OpenAPI spec nor the metrics docs say whether it is
-            # seconds, minutes or hours — and it did not move over two minutes
-            # of observation, so it is a window maximum rather than a live age
-            # and cannot be inferred from a delta either. A number whose
-            # meaning cannot be stated is worse on a dashboard than no number.
-            metrics = {}
-            rows = (depth_raw or {}).get("data") or []
-            if rows:
-                metrics = rows[0].get("metrics") or {}
-            hookdeck["depth"] = {"max_depth": metrics.get("max_depth")}
-
-    local: dict[str, Any] = {"path": str(_ledger_path()), "exists": _ledger_path().exists()}
-    if local["exists"]:
-        ledger = DeliveryLedger(_ledger_path())
-        try:
-            local["counts"] = ledger.counts()
-            local["failures"] = [
-                {
-                    "event_id": row["event_id"],
-                    "route": row["route"],
-                    "status": row["status"],
-                    "agent_attempts": row["agent_attempts"],
-                    "error": row["error"],
-                }
-                for row in ledger.recent_failures(25)
-            ]
-            # Runs whose outcome was never recorded. Normally empty; a non-empty
-            # list means a crash lost the completion signal, and boot recovery
-            # has not run since.
-            local["stranded"] = [row["event_id"] for row in ledger.stale_running(3600)]
-        finally:
-            ledger.close()
-
-    return {"hookdeck": hookdeck, "local": local}
+    return {"hookdeck": await _hookdeck_state(), "local": _local_state()}
 
 
 @router.post("/events/{event_id}/retry")
