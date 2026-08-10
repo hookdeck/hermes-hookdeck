@@ -9,11 +9,25 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
 import httpx
 
 from .constants import API_BASE_URL
+
+
+def _clean_params(params: Any) -> Any:
+    """Drop empty values, preserving a list of pairs so keys can repeat.
+
+    Some Hookdeck query params are nested and bracket-encoded, and `measures[]`
+    legitimately appears more than once — which a dict cannot express.
+    """
+    if params is None:
+        return None
+    if isinstance(params, Mapping):
+        return {k: v for k, v in params.items() if v not in (None, "")}
+    return [(k, v) for k, v in params if v not in (None, "")]
 
 
 class HookdeckAPIError(RuntimeError):
@@ -75,7 +89,7 @@ class HookdeckAPI:
         path: str,
         *,
         json: Any = None,
-        params: Optional[Mapping[str, Any]] = None,
+        params: Any = None,
     ) -> Any:
         if not self.api_key:
             raise HookdeckAPIError(
@@ -86,7 +100,7 @@ class HookdeckAPI:
             method,
             f"{self.base_url}{path}",
             json=json,
-            params={k: v for k, v in (params or {}).items() if v not in (None, "")},
+            params=_clean_params(params),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -145,8 +159,27 @@ class HookdeckAPI:
     # Observability
     # ------------------------------------------------------------------
 
-    async def queue_depth(self, **params: Any) -> Any:
-        return await self.request("GET", "/metrics/queue-depth", params=params)
+    async def queue_depth(
+        self, *, hours: int = 24, measures: Optional[list[str]] = None
+    ) -> Any:
+        """GET /metrics/queue-depth over the last *hours*.
+
+        The endpoint looks parameterless and is not: without ``date_range`` and
+        ``measures`` it answers 422. Both are nested, and Hookdeck wants them
+        bracket-encoded (``date_range[start]``, repeated ``measures[]``) — a
+        JSON-encoded object is rejected with "must be of type object", which
+        reads like the opposite of what it means.
+
+        Valid measures are ``max_depth`` and ``max_age`` only.
+        """
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(hours=hours)
+        query = [
+            ("date_range[start]", start.isoformat().replace("+00:00", "Z")),
+            ("date_range[end]", now.isoformat().replace("+00:00", "Z")),
+        ]
+        query += [("measures[]", m) for m in (measures or ["max_depth", "max_age"])]
+        return await self.request("GET", "/metrics/queue-depth", params=query)
 
     async def list_issues(self, **params: Any) -> Any:
         return await self.request("GET", "/issues", params=params)

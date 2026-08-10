@@ -191,6 +191,22 @@ The bundled `triage-webhook-failures` skill drives them: group failures by
 error code, retry what a retry will actually fix, and report the rest instead of
 retrying hopefully.
 
+## Dashboard tab
+
+`hermes dashboard` gets a **Hookdeck** tab showing the queue depth, failed
+deliveries with a retry button, the local ledger's agent-run outcomes, and
+pause/resume per connection.
+
+The two panels are deliberately separate. Hookdeck's view is what is still
+*owed* to this gateway; the ledger is what this gateway *did* with each
+delivery. A run that fails after the 202 appears only in the second, because
+from Hookdeck's side that delivery succeeded.
+
+It needs nothing built: `dashboard/dist/index.js` is a plain IIFE against the
+host's `window.__HERMES_PLUGIN_SDK__`, which is why it is committed rather than
+generated. The tab is optional — without `HOOKDECK_API_KEY` it says so and the
+adapter carries on regardless.
+
 ## Trust boundary
 
 A valid signature proves Hookdeck sent the request. It says nothing about the
