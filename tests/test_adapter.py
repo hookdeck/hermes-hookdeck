@@ -590,3 +590,60 @@ async def test_a_failure_on_the_last_attempt_still_requests_redelivery(client_fa
     await post(client, {"n": 1}, event_id="evt_last_fail")
     await _settle()
     assert adapter._api.retried == ["evt_last_fail"]
+
+
+# ----------------------------------------------------------------------
+# Boot-time recovery of interrupted runs
+# ----------------------------------------------------------------------
+
+
+async def test_runs_interrupted_by_a_shutdown_are_recovered_on_boot(client_factory):
+    # The adapter acked 202 the moment it admitted the event, so Hookdeck has
+    # recorded that delivery as successful and will never bring it back. Only
+    # an explicit retry recovers it — which is why the ledger never prunes
+    # `running` rows.
+    adapter, _client = await client_factory({"default": {}})
+    adapter._ledger.admit("evt_orphan", route="default", attempt=1)
+
+    assert await adapter._recover_orphaned_runs() == 1
+    assert adapter._api.retried == ["evt_orphan"]
+    assert adapter._ledger.get("evt_orphan")["status"] == "failed"
+
+
+async def test_recovery_skips_events_that_already_spent_their_budget(client_factory):
+    adapter, _client = await client_factory({"default": {}}, max_agent_retries=1)
+    adapter._ledger.admit("evt_spent", route="default", attempt=1)
+    adapter._ledger.admit("evt_spent", route="default", attempt=2)  # second run
+
+    assert await adapter._recover_orphaned_runs() == 0
+    assert adapter._api.retried == []
+    assert adapter._ledger.get("evt_spent")["status"] == "exhausted"
+
+
+async def test_recovery_leaves_completed_deliveries_alone(client_factory):
+    adapter, _client = await client_factory({"default": {}})
+    adapter._ledger.admit("evt_done", route="default", attempt=1)
+    adapter._ledger.mark_succeeded("evt_done")
+
+    assert await adapter._recover_orphaned_runs() == 0
+    assert adapter._api.retried == []
+
+
+async def test_recovery_can_be_turned_off(client_factory):
+    adapter, _client = await client_factory({"default": {}}, recover_on_boot=False)
+    adapter._ledger.admit("evt_orphan", route="default", attempt=1)
+
+    assert await adapter._recover_orphaned_runs() == 0
+    assert adapter._api.retried == []
+    # Left running, so `doctor` still reports it for a human to decide on.
+    assert adapter._ledger.get("evt_orphan")["status"] == "running"
+
+
+async def test_a_failing_recovery_call_does_not_block_startup(client_factory):
+    from hookdeck.api import HookdeckAPIError
+
+    adapter, _client = await client_factory({"default": {}})
+    adapter._ledger.admit("evt_orphan", route="default", attempt=1)
+    adapter._api.fail_with = HookdeckAPIError(500, "POST", "/events/x/retry", "nope")
+
+    assert await adapter._recover_orphaned_runs() == 0

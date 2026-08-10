@@ -29,6 +29,11 @@ gateway:
         max_agent_retries: 3
         retry_after_seconds: 30
 
+        # At startup, ask Hookdeck to redeliver any run the previous process
+        # died holding. Set false if re-running a possibly-completed event is
+        # worse for your routes than losing it.
+        recover_on_boot: true
+
         # Each route needs a `source` in cli mode — the adapter runs one
         # `hookdeck listen` per route. A single shared source can be set here
         # instead and left off the routes.

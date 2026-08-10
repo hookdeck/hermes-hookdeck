@@ -20,6 +20,7 @@ money every time it happens, and it should not happen twice for the same event.
 | Burst | 30/min per route, excess dropped | Queued and throttled; over the limit gets 503 + `Retry-After` |
 | Duplicate delivery | In-memory 1h cache, lost on restart | SQLite ledger keyed on the Hookdeck event id |
 | Run fails | 202 was already sent; the event is gone | Handed back to Hookdeck for redelivery |
+| Gateway dies mid-run | Silently lost | Orphaned runs found in the ledger at boot and redelivered |
 | Replay | — | Per-event and bulk replay, from the CLI or by the agent itself |
 
 The last two rows are the ones that matter most. The built-in adapter answers
@@ -136,6 +137,13 @@ only `second|minute|hour`, so per-subject **concurrency** is not expressible;
   background, and call `POST /events/{id}/retry` if the run fails. Retry state
   lives in Hookdeck, so it survives a gateway restart. Stops after
   `max_agent_retries` and marks the event exhausted rather than looping.
+
+  The same call covers the harder case. If the gateway dies mid-run, Hookdeck
+  has already recorded that delivery as successful and will never redeliver it
+  on its own — so at startup the adapter reads every ledger row still marked
+  `running`, which by then can only be an orphan, and asks for redelivery.
+  Between the two, an early ack is recoverable in both directions, which is
+  what lets Hookdeck be the work queue instead of the plugin owning one.
 - `sync` — hold the HTTP response until the run finishes, bounded by
   `sync_timeout_seconds`, so the event's status in Hookdeck is the agent's real
   outcome and Hookdeck's own retry rules apply. A run that outlasts the timeout
@@ -205,12 +213,9 @@ refused unless the listener is bound to loopback.
 - Every recovery path is bounded by your plan's retention: 3 days on
   Developer, 7 on Team, 30 on Growth. An outage longer than that is not
   replayable.
-- `ack_mode: async_retry` calls `POST /events/{id}/retry` for an event Hookdeck
-  has already recorded as delivered. The spec documents only 200 and 404 for
-  that endpoint, with no "already successful" error, and manual retries are
-  documented as unlimited — but this has not yet been confirmed against a live
-  project. If it turns out to be rejected, use `ack_mode: sync`, where the
-  event's status is the run's real outcome and Hookdeck's own retry rules apply.
+- Boot-time recovery re-runs an event whose run might in fact have completed
+  in the instant before a crash. That is the at-least-once contract the whole
+  design assumes; set `recover_on_boot: false` if it is wrong for your routes.
 
 ## Development
 

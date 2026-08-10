@@ -64,7 +64,8 @@ replay protection. Dedup is mandatory, not an optimisation.
 
 State per event id: `attempt`, `run_count`, `status`, `updated_at`. Statuses:
 `running`, `succeeded`, `failed`, `exhausted`. Prune terminal rows on a TTL;
-never prune `running`.
+**never prune `running`** — those rows are the input to boot-time recovery
+(§5), so pruning one silently drops the work it represents.
 
 ## 4. Admission control
 
@@ -100,20 +101,33 @@ Exactly two, named identically across plugins:
   and on failure call `POST /events/{id}/retry`. Retry state lives in Hookdeck,
   so it survives a host restart. Stop after `max_agent_retries` and mark the
   event exhausted rather than looping.
-  **Open, and load-bearing for all three plugins:** this asks Hookdeck to retry
-  an event it has already recorded as `SUCCESSFUL`. The spec documents only 200
-  and 404 for that endpoint — no "already successful" error — and manual retries
-  are documented as unlimited, but no one has confirmed it against a live
-  project yet. Until someone does, `sync` is the mode that is definitely sound.
-  If it turns out to be rejected, the fallback is to durably record the rendered
-  prompt before acking and replay from that on boot — a local queue none of us
-  want to own.
 - **`sync`** — hold the response until the run finishes, bounded by
   `sync_timeout_seconds`; 2xx on success, 5xx on failure, so Hookdeck's own
   retry rules apply. On timeout, degrade to 202 — answering 5xx would redeliver
   work that is still running.
 
 "Backpressure" is not a mode. `max_concurrent` applies in both.
+
+### Why `async_retry` works at all
+
+A successful event can be retried manually — confirmed with Hookdeck. That one
+fact is what the whole contract rests on, because it makes the 202 ack
+recoverable in **both** ways it can go wrong:
+
+1. **The run fails.** Call `POST /events/{id}/retry`.
+2. **The host dies mid-run.** At boot, every ledger row still marked `running`
+   is an orphan — the process that owned it is gone, and Hookdeck already
+   recorded that delivery as successful, so nothing will bring it back on its
+   own. Same call, driven from the ledger.
+
+Without it, an early ack would mean durably recording the rendered prompt
+before acking and replaying from that on boot — i.e. every plugin owning a
+local work queue. With it, Hookdeck *is* the work queue and no host needs one.
+That matters most where the host's own durable queue is out of reach: OpenClaw's
+`openChannelIngressQueue` is gated to bundled plugins.
+
+Path 2 is why §3 says never prune `running` rows. That rule is load-bearing,
+not tidiness: pruning one silently drops the work it represents.
 
 ## 6. Connection provisioning
 

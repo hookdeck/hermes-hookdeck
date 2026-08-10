@@ -139,6 +139,7 @@ class HookdeckAdapter(WebhookAdapter):
         self._cancel_retries_on_unparseable = bool(
             extra.get("cancel_retries_on_unparseable", False)
         )
+        self._recover_on_boot = bool(extra.get("recover_on_boot", True))
         self._state_path = Path(
             extra.get("state_path") or _default_state_path()
         ).expanduser()
@@ -267,6 +268,8 @@ class HookdeckAdapter(WebhookAdapter):
                 self._hd_runner = None
                 return False
 
+        await self._recover_orphaned_runs()
+
         self._mark_connected()
         logger.info(
             "[hookdeck] mode=%s listening on %s:%d%s — ack_mode=%s "
@@ -280,6 +283,58 @@ class HookdeckAdapter(WebhookAdapter):
             ", ".join(self._routes.keys()) or "(none)",
         )
         return True
+
+    async def _recover_orphaned_runs(self) -> int:
+        """Ask Hookdeck to redeliver runs the previous process died holding.
+
+        A ledger row still marked ``running`` at startup is an orphan by
+        definition: the process that owned it is gone, and because the adapter
+        acked 202 the moment it admitted the event, Hookdeck considers that
+        delivery successful and will never bring it back on its own.
+
+        This is the second half of what makes Hookdeck the durable work queue
+        and lets the plugin skip owning a local one — the first half being the
+        failed-run retry. It works because a successful event can still be
+        retried manually. It is also why terminal rows are pruned on a TTL but
+        ``running`` rows never are: pruning one would silently drop the work.
+
+        Recovery re-runs an event whose run may in fact have completed just
+        before the crash, which is the at-least-once contract the whole design
+        already assumes. Set ``recover_on_boot: false`` if that is wrong for
+        your routes.
+        """
+        if not self._recover_on_boot or self._ledger is None or self._api is None:
+            return 0
+
+        orphans = self._ledger.all_running()
+        if not orphans:
+            return 0
+
+        recovered = 0
+        for row in orphans:
+            event_id = row["event_id"]
+            attempts = int(row["agent_attempts"])
+            if attempts - 1 >= self._max_agent_retries:
+                self._ledger.mark_exhausted(event_id, "interrupted; retry budget spent")
+                continue
+            self._ledger.mark_failed(event_id, "gateway stopped mid-run")
+            try:
+                await self._api.retry_event(event_id)
+                recovered += 1
+            except HookdeckAPIError as exc:
+                logger.error(
+                    "[hookdeck] Could not recover interrupted event %s: %s",
+                    event_id,
+                    exc,
+                )
+
+        logger.warning(
+            "[hookdeck] Found %d run(s) interrupted by a previous shutdown; "
+            "asked Hookdeck to redeliver %d of them",
+            len(orphans),
+            recovered,
+        )
+        return recovered
 
     async def _stop_tunnels(self) -> None:
         for tunnel in self._tunnels:

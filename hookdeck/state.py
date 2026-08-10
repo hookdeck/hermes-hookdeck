@@ -211,6 +211,18 @@ class DeliveryLedger:
                 (STATUS_FAILED, STATUS_EXHAUSTED, limit),
             ).fetchall()
 
+    def all_running(self) -> list[sqlite3.Row]:
+        """Every delivery still marked running.
+
+        At startup these are orphans by definition — the process that owned
+        them is gone — which is what boot-time recovery reconciles.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM deliveries WHERE status = ? ORDER BY first_seen ASC",
+                (STATUS_RUNNING,),
+            ).fetchall()
+
     def stale_running(self, older_than_seconds: float) -> list[sqlite3.Row]:
         """Runs still marked running past *older_than_seconds*.
 
