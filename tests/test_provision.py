@@ -62,10 +62,13 @@ def test_retry_rule_covers_the_backpressure_response():
     # 503 is the adapter's "at capacity" answer; if it were not retried,
     # admission control would silently drop events instead of deferring them.
     assert "500-599" in retry["response_status_codes"]
-    # 401 from a secret mismatch and 404 from a missing route are not retried:
-    # no retry can fix either, and Hookdeck's default of "any non-2xx" would
-    # spend 50 attempts finding that out.
-    assert uncovered_statuses(retry["response_status_codes"], (401, 404)) == [401, 404]
+    # 401 and 404 ARE retryable, contrary to intuition: Hookdeck computes the
+    # signature at delivery time, so retries of the same event become signed
+    # once the operator fixes the destination auth; and a route added later
+    # matches the same event. Refusing to retry them loses real traffic.
+    assert uncovered_statuses(retry["response_status_codes"], (401, 404, 413)) == []
+    # 400 stays out — an unparseable body is baked into the stored request.
+    assert uncovered_statuses(retry["response_status_codes"], (400,)) == [400]
 
 
 def test_dedupe_rule_is_added_by_default_and_can_be_disabled():
@@ -189,11 +192,36 @@ def test_the_default_retry_rule_covers_every_status_the_adapter_emits():
 
 
 def test_uncovered_statuses_reads_hookdecks_code_expressions():
-    assert uncovered_statuses(None) == []          # absent means "any non-2xx"
-    assert uncovered_statuses([]) == []
-    assert uncovered_statuses(["500-599"]) == []
-    assert uncovered_statuses([">499"]) == []
-    assert uncovered_statuses(["500", "502"]) == [503]
-    assert uncovered_statuses(["400-499"]) == [500, 502, 503]
+    # Explicit `statuses` throughout: the default set is the adapter's emitted
+    # statuses and is expected to grow, which should not silently rewrite what
+    # this test is asserting about expression parsing.
+    five_hundreds = (500, 502, 503)
+    assert uncovered_statuses(None, five_hundreds) == []   # absent = any non-2xx
+    assert uncovered_statuses([], five_hundreds) == []
+    assert uncovered_statuses(["500-599"], five_hundreds) == []
+    assert uncovered_statuses([">499"], five_hundreds) == []
+    assert uncovered_statuses(["500", "502"], five_hundreds) == [503]
+    assert uncovered_statuses(["400-499"], five_hundreds) == [500, 502, 503]
     # An explicit exclusion beats a range that would otherwise match.
-    assert uncovered_statuses(["500-599", "!503"]) == [503]
+    assert uncovered_statuses(["500-599", "!503"], five_hundreds) == [503]
+
+
+def test_the_default_status_set_is_what_the_adapter_actually_emits():
+    from hookdeck.provision import ADAPTER_RETRYABLE_STATUSES
+
+    # 401/404/413 are operator-fixable, so a rule covering only 5xx leaves
+    # recoverable events permanently undelivered.
+    assert set(ADAPTER_RETRYABLE_STATUSES) >= {401, 404, 413, 500, 502, 503}
+    assert 400 not in ADAPTER_RETRYABLE_STATUSES
+    assert uncovered_statuses(["500-599"]) == [401, 404, 413]
+
+
+def test_destination_paths_are_pinned():
+    # path_forwarding_disabled defaults to false, so Hookdeck would append the
+    # provider's own request path to ours.
+    cli = build_connection_payload(name="x", source_name="x", path="/hookdeck/x")
+    assert cli["destination"]["config"]["path_forwarding_disabled"] is True
+    http = build_connection_payload(
+        name="x", source_name="x", mode="push", url="https://example.com/hookdeck/x"
+    )
+    assert http["destination"]["config"]["path_forwarding_disabled"] is True

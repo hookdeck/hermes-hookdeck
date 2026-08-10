@@ -35,6 +35,10 @@ DEFAULT_MAX_CONCURRENT = 2
 DEFAULT_MAX_AGENT_RETRIES = 3
 DEFAULT_MAX_BODY_BYTES = 1_048_576
 DEFAULT_RETRY_AFTER_SECONDS = 30
+# Deferrals of one event before the 503 stops carrying Retry-After. Beyond
+# this the saturation is not transient, and a fixed short interval would
+# spend the automatic-retry budget in minutes instead of days.
+DEFAULT_DEFER_ATTEMPT_LIMIT = 5
 DEFAULT_LEDGER_TTL_SECONDS = 7 * 24 * 3600
 DEFAULT_SYNC_TIMEOUT_SECONDS = 25
 DEFAULT_RUN_TIMEOUT_SECONDS = 900

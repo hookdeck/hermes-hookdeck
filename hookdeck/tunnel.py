@@ -50,6 +50,7 @@ class HookdeckTunnel:
         connection_name: str = "",
         api_key: str = "",
         binary: str = "hookdeck",
+        login: bool = False,
     ):
         if not source:
             raise ValueError(
@@ -62,6 +63,7 @@ class HookdeckTunnel:
         self._source = source
         self._connection_name = connection_name
         self._api_key = api_key or os.getenv("HOOKDECK_API_KEY", "")
+        self._login_enabled = login
         self._binary = binary
         self._process: Optional[asyncio.subprocess.Process] = None
         self._supervisor: Optional[asyncio.Task] = None
@@ -122,19 +124,32 @@ class HookdeckTunnel:
         await self._terminate()
 
     async def _login(self, binary: str) -> None:
-        """Non-interactive auth so an unattended gateway can start.
+        """Non-interactive auth, off by default because it is destructive.
 
-        ``hookdeck ci`` is a no-op when the CLI already holds valid
-        credentials, so this is safe to run on every boot. A failure here is
-        logged rather than raised: an already-logged-in CLI on an older version
-        without the subcommand should still be allowed to listen.
+        ``hookdeck ci --api-key`` is not the no-op it looks like. It rewrites
+        the shared CLI config at ``~/.config/hookdeck/config.toml``: it swaps
+        the stored key for a CLI session key and switches the CLI's *active
+        project*. Anyone using the CLI for other work — another ``hookdeck
+        listen``, a different project — finds their environment silently
+        repointed by starting a gateway.
+
+        So the gateway does not touch it unless asked. The default path relies
+        on the operator's existing ``hookdeck login`` and passes
+        ``HOOKDECK_API_KEY`` through the subprocess environment.
         """
+        if not self._login_enabled:
+            return
         if not self._api_key:
             logger.info(
-                "[hookdeck] No HOOKDECK_API_KEY set — relying on an existing "
-                "`hookdeck login` session for the CLI tunnel"
+                "[hookdeck] cli_login is on but no HOOKDECK_API_KEY is set — "
+                "relying on an existing `hookdeck login` session"
             )
             return
+        logger.warning(
+            "[hookdeck] cli_login is on: running `hookdeck ci`, which rewrites "
+            "~/.config/hookdeck/config.toml and switches the CLI's active "
+            "project. Turn it off if you use the Hookdeck CLI for other work."
+        )
         try:
             process = await asyncio.create_subprocess_exec(
                 binary,

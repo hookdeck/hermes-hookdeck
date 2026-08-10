@@ -28,6 +28,10 @@ gateway:
         max_concurrent: 2
         max_agent_retries: 3
         retry_after_seconds: 30
+        # After this many deferrals of one event, the 503 stops carrying
+        # Retry-After: the saturation is no longer transient, and a fixed
+        # short interval would spend the retry budget in minutes.
+        defer_attempt_limit: 5
 
         # At startup, ask Hookdeck to redeliver any run the previous process
         # died holding. Set false if re-running a possibly-completed event is
@@ -38,6 +42,15 @@ gateway:
         # `hookdeck listen` per route. A single shared source can be set here
         # instead and left off the routes.
         # source: github
+
+        # Pin which hookdeck binary launches the tunnel — an npm global
+        # shadowing a Homebrew install picks the older one silently.
+        # cli_binary: /usr/local/bin/hookdeck
+
+        # Leave false. `hookdeck ci` rewrites ~/.config/hookdeck/config.toml
+        # and switches the CLI's active project — not something starting a
+        # gateway should do to a shared tool. Run `hookdeck login` instead.
+        # cli_login: false
 
         routes:
           # A GitHub PR reviewer. `source` is the Hookdeck source name.

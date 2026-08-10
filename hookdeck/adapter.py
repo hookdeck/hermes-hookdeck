@@ -62,6 +62,7 @@ from .constants import (
     DEFAULT_MAX_CONCURRENT,
     DEFAULT_PATH,
     DEFAULT_PORT,
+    DEFAULT_DEFER_ATTEMPT_LIMIT,
     DEFAULT_RETRY_AFTER_SECONDS,
     DEFAULT_RUN_TIMEOUT_SECONDS,
     DEFAULT_SYNC_TIMEOUT_SECONDS,
@@ -186,6 +187,9 @@ class HookdeckAdapter(WebhookAdapter):
         self._retry_after = int(
             extra.get("retry_after_seconds", DEFAULT_RETRY_AFTER_SECONDS)
         )
+        self._defer_attempt_limit = int(
+            extra.get("defer_attempt_limit", DEFAULT_DEFER_ATTEMPT_LIMIT)
+        )
         self._sync_timeout = float(
             extra.get("sync_timeout_seconds", DEFAULT_SYNC_TIMEOUT_SECONDS)
         )
@@ -204,6 +208,10 @@ class HookdeckAdapter(WebhookAdapter):
         # npm global shim shadowing a Homebrew install is the common case, and
         # it silently picks the older one.
         self._cli_binary = str(extra.get("cli_binary") or "hookdeck")
+        # Off by default: `hookdeck ci` rewrites the shared CLI config and
+        # repoints its active project, which is not a side effect starting
+        # a gateway should have.
+        self._cli_login = bool(extra.get("cli_login", False))
         self._state_path = Path(
             extra.get("state_path") or _default_state_path()
         ).expanduser()
@@ -314,7 +322,11 @@ class HookdeckAdapter(WebhookAdapter):
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get(f"{self._path}/health", self._handle_hookdeck_health)
         app.router.add_post(self._path, self._handle_hookdeck)
-        app.router.add_post(f"{self._path}/{{route_name}}", self._handle_hookdeck)
+        # A tail, not a single segment. Hookdeck's `path_forwarding_disabled`
+        # defaults to false, so it appends the source request's own path to the
+        # destination path: a provider POSTing to <source-url>/events arrives
+        # here as /hookdeck/<route>/events. Matching one segment 404s that.
+        app.router.add_post(f"{self._path}/{{route_tail:.*}}", self._handle_hookdeck)
         return app
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -340,6 +352,7 @@ class HookdeckAdapter(WebhookAdapter):
                         source=source,
                         connection_name=route_name,
                         binary=self._cli_binary,
+                        login=self._cli_login,
                     )
                     await tunnel.start()
                     self._tunnels.append(tunnel)
@@ -507,8 +520,14 @@ class HookdeckAdapter(WebhookAdapter):
         source by name (``source: stripe``), then a route named after the
         source, then a route literally named ``default``, and finally — when
         only one route is configured — that one.
+
+        Only the first segment of the tail is the route name; anything after it
+        is the provider's own path, forwarded by Hookdeck. Taking a segment
+        rather than a string prefix is what stops route ``stripe`` swallowing a
+        delivery meant for ``stripe-test``.
         """
-        explicit = request.match_info.get("route_name", "")
+        tail = request.match_info.get("route_tail", "")
+        explicit = tail.split("/", 1)[0] if tail else ""
         if explicit:
             return explicit, self._routes.get(explicit)
 
@@ -569,11 +588,22 @@ class HookdeckAdapter(WebhookAdapter):
             if now - info["started"] > self._run_timeout:
                 logger.warning(
                     "[hookdeck] Run for %s exceeded %.0fs with no completion "
-                    "signal — releasing its slot",
+                    "signal — releasing its slot and handing the event back",
                     chat_id,
                     self._run_timeout,
                 )
                 self._inflight.pop(chat_id, None)
+                # Leaving the ledger row `running` would strand the event until
+                # the next restart, since boot recovery is the only other thing
+                # that reads those rows. Treat it as a failure now, which also
+                # routes it through the normal retry budget.
+                event_id = info.get("event_id") or ""
+                if event_id:
+                    task = asyncio.create_task(
+                        self._record_outcome(event_id, ProcessingOutcome.FAILURE)
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
         if self._ledger is not None:
             self._ledger.prune(self._ledger_ttl)
 
@@ -745,6 +775,25 @@ class HookdeckAdapter(WebhookAdapter):
                 len(self._inflight),
                 event_id or "(no id)",
             )
+            # Retry-After overrides the connection's retry rule outright, so a
+            # fixed short interval spends the automatic-retry budget at that
+            # interval: 50 attempts at 30s is 25 minutes, and an event lost
+            # while nobody is looking. A short value is right *because*
+            # capacity normally frees in seconds — so it is sent only while
+            # that premise holds. Once an event has been deferred this many
+            # times the saturation is not transient, and the 503 goes bare so
+            # the connection's exponential rule spreads what budget remains.
+            headers = {}
+            if attempt <= self._defer_attempt_limit:
+                headers["Retry-After"] = str(self._retry_after)
+            else:
+                logger.warning(
+                    "[hookdeck] Event %s deferred %s times — capacity is not "
+                    "recovering; dropping Retry-After so Hookdeck backs off "
+                    "exponentially instead of burning its retry budget",
+                    event_id or "(no id)",
+                    attempt,
+                )
             return web.json_response(
                 {
                     "status": "deferred",
@@ -752,11 +801,25 @@ class HookdeckAdapter(WebhookAdapter):
                     "in_flight": len(self._inflight),
                 },
                 status=503,
-                headers={"Retry-After": str(self._retry_after)},
+                headers=headers,
             )
 
         # ── Deduplication ────────────────────────────────────────────
         session_chat_id = f"hookdeck:{route_name}:{event_id or int(time.time() * 1000)}"
+        if not event_id:
+            # No id means no dedup and no outcome reporting: a redelivery would
+            # run the agent twice and a failure could not be handed back. That
+            # is a real loss of guarantees, so say so rather than quietly
+            # degrading. It means the delivery did not come from Hookdeck, or
+            # the project uses a custom header prefix that is not configured.
+            logger.warning(
+                "[hookdeck] Delivery on route %s carries no %s header — "
+                "processing it without deduplication or retry. Check "
+                "platforms.hookdeck.extra.header_prefix if your project "
+                "customised the x-hookdeck prefix.",
+                route_name,
+                header_name(EVENT_ID, self._header_prefix),
+            )
         if event_id and self._ledger is not None:
             admission = self._ledger.admit(
                 event_id,

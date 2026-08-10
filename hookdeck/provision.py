@@ -57,6 +57,8 @@ def _http_destination_config(
 ) -> dict[str, Any]:
     config: dict[str, Any] = {
         "url": url,
+        # See the CLI branch: stop Hookdeck appending the provider's path.
+        "path_forwarding_disabled": True,
         # Hookdeck signs its delivery so the adapter has exactly one signature
         # scheme to verify, whatever the upstream provider used.
         **HOOKDECK_SIGNATURE_AUTH,
@@ -132,7 +134,15 @@ def build_connection_payload(
         destination = {
             "name": destination_name,
             "type": "CLI",
-            "config": {"path": path, **HOOKDECK_SIGNATURE_AUTH},
+            "config": {
+                "path": path,
+                # Hookdeck otherwise appends the source request's own path to
+                # this one, so a provider POSTing to <source-url>/events
+                # arrives at <path>/events. The adapter tolerates that, but
+                # a fixed path is what we actually want.
+                "path_forwarding_disabled": True,
+                **HOOKDECK_SIGNATURE_AUTH,
+            },
         }
     else:
         if not url:
@@ -150,10 +160,23 @@ def build_connection_payload(
             ),
         }
 
-    # Narrowing from Hookdeck's default (retry any non-2xx) so a 401 from a
-    # secret mismatch or a 404 from a missing route fails fast instead of
-    # burning 50 attempts on something no retry can fix.
-    response_status_codes = ["500-599"]
+    # The test for "should this be retried" is whether a retry of THIS EXACT
+    # event could ever succeed, given that Hookdeck replays the stored request
+    # byte-for-byte. Only what is baked into the request fails that test.
+    #
+    # An earlier version narrowed this to 500-599, reasoning that a 401 or a
+    # 404 "cannot be fixed by retrying". That was wrong in both cases, and the
+    # cost was permanent loss of real events:
+    #
+    #   401 — the operator sets the destination's auth to HOOKDECK_SIGNATURE
+    #         and retries of the same event ARE signed, because Hookdeck
+    #         computes the signature at delivery time rather than storing it
+    #   404 — the operator adds or enables the route and the same event matches
+    #   413 — the operator raises max_body_bytes and the same event fits
+    #
+    # 400 stays out: an unparseable body is part of the stored request and no
+    # operator change makes it parse.
+    response_status_codes = ["401", "404", "408", "413", "429", "500-599"]
     still_missing = uncovered_statuses(response_status_codes)
     if still_missing:  # pragma: no cover - guards against editing the list above
         raise ValueError(
@@ -207,11 +230,15 @@ def build_event_filter(
     return None
 
 
-# HTTP statuses the adapter itself emits that must be retried: 503 is admission
-# control, 500 is a failed run in sync mode, 502 is a rejected direct delivery.
-# A retry rule that does not cover these turns backpressure into silent data
-# loss — the event is deferred and then never comes back.
-ADAPTER_RETRYABLE_STATUSES = (500, 502, 503)
+# Statuses the adapter emits that a retry could still resolve. 503 is admission
+# control, 500 a failed run in sync mode, 502 a rejected direct delivery, and
+# 401/404/413 are all operator-fixable — the signature, the route and the size
+# cap are gateway-side config, not properties of the stored request. A retry
+# rule missing any of these turns a recoverable condition into silent loss.
+#
+# 400 is deliberately absent: an unparseable body is part of the stored request
+# and no operator change makes it parse.
+ADAPTER_RETRYABLE_STATUSES = (401, 404, 413, 500, 502, 503)
 
 
 def _code_expression_matches(expression: str, status: int) -> Optional[bool]:

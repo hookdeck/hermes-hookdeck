@@ -800,3 +800,90 @@ def test_unverified_routes_do_not_claim_upstream_authorization(tmp_path):
         }
     )
     assert HookdeckAdapter(config).authorization_is_upstream is False
+
+
+# ----------------------------------------------------------------------
+# Forwarded paths and deferral budget
+# ----------------------------------------------------------------------
+
+
+async def test_a_forwarded_provider_path_still_matches_its_route(client_factory):
+    # Hookdeck appends the source request's path unless path_forwarding_disabled
+    # is set, so a provider POSTing to <source-url>/events arrives here as
+    # /hookdeck/<route>/events. Matching a single segment would 404 it.
+    adapter, client = await client_factory({"stripe": {"source": "s"}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    response = await post(client, {"n": 1}, path="/hookdeck/stripe/events/v2")
+    assert response.status == 202
+    await _settle()
+    assert seen[0].metadata["hookdeck_route"] == "stripe"
+
+
+async def test_a_similar_route_name_is_not_swallowed(client_factory):
+    # Segment matching, not string prefix: `stripe` must not claim traffic for
+    # `stripe-test`.
+    adapter, client = await client_factory(
+        {"stripe": {"source": "a"}, "stripe-test": {"source": "b"}}
+    )
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    await post(client, {"n": 1}, path="/hookdeck/stripe-test/events")
+    await _settle()
+    assert seen[0].metadata["hookdeck_route"] == "stripe-test"
+
+
+async def test_retry_after_is_dropped_once_saturation_stops_being_transient(
+    client_factory,
+):
+    # Retry-After overrides the connection's retry rule, so a fixed short
+    # interval on a persistent condition spends the whole automatic budget in
+    # minutes. It is sent only while "capacity frees in seconds" still holds.
+    adapter, client = await client_factory(
+        {"default": {}}, max_concurrent=1, defer_attempt_limit=2
+    )
+    gate = asyncio.Event()
+
+    async def _slow(_event):
+        await gate.wait()
+        return ProcessingOutcome.SUCCESS
+
+    adapter.run_agent = _slow
+    await post(client, {"n": 1}, event_id="evt_hold")
+    await _settle()
+
+    early = await post(client, {"n": 2}, event_id="evt_b", attempt=1)
+    assert early.status == 503 and "Retry-After" in early.headers
+
+    late = await post(client, {"n": 2}, event_id="evt_b", attempt=9)
+    assert late.status == 503
+    assert "Retry-After" not in late.headers
+
+    gate.set()
+    await _settle()
+
+
+async def test_a_delivery_with_no_event_id_is_processed_but_warned_about(
+    client_factory, caplog
+):
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    raw = json.dumps({"n": 1}).encode()
+    response = await client.post(
+        "/hookdeck",
+        data=raw,
+        headers={
+            "content-type": "application/json",
+            "x-hookdeck-signature": compute_signature(raw, SECRET),
+        },
+    )
+    assert response.status == 202
+    await _settle()
+    assert len(seen) == 1
+    # No id means no dedup and no retry — a real loss of guarantees, so it must
+    # not degrade quietly.
+    assert "without deduplication or retry" in caplog.text

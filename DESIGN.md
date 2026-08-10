@@ -96,6 +96,19 @@ State per event id: `attempt`, `run_count`, `status`, `updated_at`. Statuses:
 Cap concurrent runs with `max_concurrent`. Over the limit, respond **503 with
 `Retry-After`** — not 429, not 200, not a local queue.
 
+**`Retry-After` is a retry-budget hazard.** It overrides the connection's retry
+rule outright, so a fixed short interval spends the whole automatic budget at
+that interval: 50 attempts at 30s is 25 minutes, and then the event is gone.
+The exponential rule would have spread the same 50 attempts over days.
+
+Send it **only where the condition clears in seconds** — at capacity, an
+in-flight duplicate, a process still booting. For anything needing a human (a
+missing secret, a wedged run, an internal error) omit it and let backoff pace
+the retries. And because "capacity frees in seconds" is a premise rather than a
+guarantee, stop sending it once one event has been deferred more than a handful
+of times: past that the saturation is not transient and the header is actively
+burning the budget.
+
 **Admission control and pause are not the same tool, and must not be reached
 for interchangeably.** Admission control is per-event and automatic: Hookdeck
 holds each deferred event and spreads the redelivery itself. Pause is an
@@ -188,6 +201,14 @@ to re-run. Rules attached by default:
   GitHub/GitLab/Shopify, or an explicitly configured body path. Guessing
   discards traffic silently, so when in doubt, filter host-side instead.
 
+Set `path_forwarding_disabled: true`. It defaults to **false**, meaning Hookdeck
+appends the source request's own path to the destination path — a provider
+POSTing to `<source-url>/events` arrives at `<your-path>/events`. A host
+matching its route path exactly will 404 that, and if the 404 is not retried
+(see §10) the event is gone. Handle a forwarded tail on the receiving side too,
+for connections the plugin did not provision; match on the *segment* rather
+than a string prefix, or route `stripe` will swallow `stripe-test`.
+
 Destination auth is always `HOOKDECK_SIGNATURE`, in CLI and HTTP modes alike —
 and `auth_type` must be accompanied by an `auth` object, even though
 HOOKDECK_SIGNATURE's is empty and the OpenAPI schema does not mark it required.
@@ -263,6 +284,24 @@ them, so "which code paths can discard production traffic" is answerable by
 reading one file rather than grepping. With a single trigger the allowlist is
 ceremony and a plain flag is clearer — this is a difference in how much surface
 each host has to police, not a difference in the rule.
+
+**The test for cancelling is sharper than "could a config change fix it":**
+
+> Cancel only when a retry of this **exact event** can never succeed, whatever
+> the operator changes.
+
+Hookdeck replays the stored request byte-for-byte, so that holds only for what
+is baked into that request — method, content type, size, an unparseable body.
+Everything else stays retryable, including two that read as permanent:
+
+- **401** — Hookdeck computes the signature at *delivery* time, so once the
+  operator sets the destination's auth, retries of the same event arrive signed.
+- **404** — the operator adds or enables the route, and the same event matches.
+
+The same test governs a connection's `response_status_codes`, and getting it
+wrong there is the quieter failure: no cancellation to audit, just an event
+that is never retried. A rule narrowed to `500-599` silently discards every
+recoverable 401 and 404.
 
 **Last-attempt detection.** An absent or empty `x-hookdeck-will-retry-after`
 means this is the final automatic attempt — the cleanest dead-letter trigger
