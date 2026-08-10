@@ -140,6 +140,10 @@ class HookdeckAdapter(WebhookAdapter):
             extra.get("cancel_retries_on_unparseable", False)
         )
         self._recover_on_boot = bool(extra.get("recover_on_boot", True))
+        # Explicit binary for setups with more than one hookdeck on PATH — an
+        # npm global shim shadowing a Homebrew install is the common case, and
+        # it silently picks the older one.
+        self._cli_binary = str(extra.get("cli_binary") or "hookdeck")
         self._state_path = Path(
             extra.get("state_path") or _default_state_path()
         ).expanduser()
@@ -235,19 +239,9 @@ class HookdeckAdapter(WebhookAdapter):
         app = self.build_app()
         self._hd_runner = web.AppRunner(app)
         await self._hd_runner.setup()
-        site = web.TCPSite(self._hd_runner, self._host, self._port)
-        try:
-            await site.start()
-        except OSError as exc:
+        if not await self._start_sites():
             await self._hd_runner.cleanup()
             self._hd_runner = None
-            logger.error(
-                "[hookdeck] Could not bind %s:%d: %s. Change "
-                "platforms.hookdeck.extra.port in config.yaml.",
-                self._host or "all interfaces",
-                self._port,
-                exc,
-            )
             return False
 
         if self._mode == "cli":
@@ -258,6 +252,7 @@ class HookdeckAdapter(WebhookAdapter):
                         path=f"{self._path}/{route_name}",
                         source=source,
                         connection_name=route_name,
+                        binary=self._cli_binary,
                     )
                     await tunnel.start()
                     self._tunnels.append(tunnel)
@@ -282,6 +277,47 @@ class HookdeckAdapter(WebhookAdapter):
             self._max_concurrent or "unlimited",
             ", ".join(self._routes.keys()) or "(none)",
         )
+        return True
+
+    def _bind_hosts(self) -> list[Optional[str]]:
+        """Addresses to listen on.
+
+        In cli mode this is both loopback families, not just ``127.0.0.1``.
+        The Hookdeck CLI forwards to ``http://localhost:<port>``, and on a
+        dual-stack machine that resolves to ``::1`` first — against an
+        IPv4-only listener every delivery fails with ECONNREFUSED while the
+        tunnel itself looks perfectly healthy. Binding a wildcard would fix it
+        too, and would also expose an agent-dispatch endpoint to the network,
+        so it binds each loopback address instead.
+        """
+        if self._mode == "cli":
+            return ["127.0.0.1", "::1"]
+        return [self._host]
+
+    async def _start_sites(self) -> bool:
+        """Start a listener per address. One family may be absent; both failing is fatal."""
+        assert self._hd_runner is not None
+        started: list[str] = []
+        last_error: Optional[OSError] = None
+        for host in self._bind_hosts():
+            try:
+                await web.TCPSite(self._hd_runner, host, self._port).start()
+                started.append(host or "*")
+            except OSError as exc:
+                last_error = exc
+                logger.debug(
+                    "[hookdeck] Could not bind %s:%d: %s", host, self._port, exc
+                )
+        if not started:
+            logger.error(
+                "[hookdeck] Could not bind port %d on %s: %s. Change "
+                "platforms.hookdeck.extra.port in config.yaml.",
+                self._port,
+                ", ".join(str(h) for h in self._bind_hosts()),
+                last_error,
+            )
+            return False
+        logger.debug("[hookdeck] Listening on %s", ", ".join(started))
         return True
 
     async def _recover_orphaned_runs(self) -> int:

@@ -59,6 +59,18 @@ def _version_at_least(version: str, minimum: tuple[int, ...]) -> bool:
     return match.group(4) is None
 
 
+def _other_hookdeck_binaries(chosen: str) -> list[str]:
+    """Other `hookdeck` executables on PATH that *chosen* shadows."""
+    found = []
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory) / "hookdeck"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            resolved = str(candidate)
+            if resolved != chosen and resolved not in found:
+                found.append(resolved)
+    return found
+
+
 def _hermes_home() -> Path:
     return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
 
@@ -401,21 +413,32 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         "No routes under platforms.hookdeck.extra.routes",
     )
     if mode == "cli":
-        cli_path = shutil.which("hookdeck")
+        configured = extra.get("cli_binary") or "hookdeck"
+        cli_path = shutil.which(configured)
         check(
             bool(cli_path),
-            "Hookdeck CLI found on PATH",
-            "Hookdeck CLI not found — install it or switch to mode: push",
+            f"Hookdeck CLI found: {cli_path}",
+            f"Hookdeck CLI '{configured}' not found — install it, set "
+            "platforms.hookdeck.extra.cli_binary, or switch to mode: push",
         )
         if cli_path:
             version = _cli_version(cli_path)
             check(
                 _version_at_least(version, MIN_CLI_VERSION),
                 f"Hookdeck CLI {version or 'unknown'} meets the {MIN_CLI_VERSION_TEXT} minimum",
-                f"Hookdeck CLI {version or 'unknown'} is below {MIN_CLI_VERSION_TEXT}. "
-                "Earlier versions stop delivering after a session expires, "
-                "without saying so. Upgrade before relying on cli mode.",
+                f"Hookdeck CLI {version or 'unknown'} at {cli_path} is below "
+                f"{MIN_CLI_VERSION_TEXT}. Earlier versions stop delivering "
+                "after a session expires, without saying so. Upgrade, or point "
+                "platforms.hookdeck.extra.cli_binary at a newer install.",
             )
+            others = _other_hookdeck_binaries(cli_path)
+            if others:
+                # A shadowed install is how you end up version-checking one
+                # binary and launching another.
+                print(
+                    f"  note: {len(others)} other hookdeck binary(ies) on this "
+                    f"system are shadowed by {cli_path}: {', '.join(others)}"
+                )
     else:
         check(
             bool(extra.get("public_url")),

@@ -68,7 +68,17 @@ irrecoverably, as does deleting the connection.
 
 Use a CLI version of at least 2.3.2. Earlier ones stop delivering after a
 listen session expires without saying so, which from the gateway's side looks
-identical to "no events are arriving". `hermes hookdeck doctor` checks this.
+identical to "no events are arriving". `hermes hookdeck doctor` checks the
+version *and* prints which binary it resolved — an npm global shadowing a
+Homebrew install is common, and version-checking one binary while launching
+another is worse than not checking. Set `cli_binary` to pin it explicitly.
+
+Two behaviours worth recognising in the Hookdeck event log when the local
+server is down. With no listen session attached at all, attempts record
+`CLI_UNAVAILABLE` and no response status. With a session attached but the local
+port refusing, the CLI reports a **500** upstream — which is one reason the
+provisioned retry rule covers `500-599`: a gateway that has not finished
+starting produces exactly this, and those events must come back.
 
 Install the [Hookdeck CLI](https://hookdeck.com/docs/cli), add a route to
 `~/.hermes/config.yaml` (see [`examples/config.yaml`](examples/config.yaml)),
@@ -216,6 +226,23 @@ refused unless the listener is bound to loopback.
 - Boot-time recovery re-runs an event whose run might in fact have completed
   in the instant before a crash. That is the at-least-once contract the whole
   design assumes; set `recover_on_boot: false` if it is wrong for your routes.
+
+## Verified against a live project
+
+The reliability claims above are not just unit-tested. Run against a real
+Hookdeck project with the Hookdeck CLI, the event log shows:
+
+```
+evt_jyjuqko…  SUCCESSFUL  attempts=3  [(202,INITIAL), (202,MANUAL), (202,MANUAL)]
+evt_AeqyFZJ…  SUCCESSFUL  attempts=2  [(503,INITIAL), (202,AUTOMATIC)]
+```
+
+The first is the mechanism `async_retry` depends on: every attempt returned
+202, so Hookdeck recorded the event as delivered each time, and it still
+accepted two `MANUAL` retries afterwards. An early ack really is recoverable.
+
+The second is admission control: deferred with 503 while a run was in flight,
+then redelivered automatically and processed. Deferred, not dropped.
 
 ## Development
 

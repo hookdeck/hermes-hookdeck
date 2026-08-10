@@ -23,6 +23,12 @@ DEFAULT_DEDUPE_WINDOW_MS = 60_000
 DEFAULT_GROUP_RATE = 1
 DEFAULT_GROUP_RATE_PERIOD = "minute"
 
+# `auth_type` never travels alone: the API rejects a destination config with
+# `destination.config.auth is required` if it does, even for HOOKDECK_SIGNATURE
+# whose auth object is empty. The OpenAPI schema does not mark it required, so
+# this is only discoverable by making the call.
+HOOKDECK_SIGNATURE_AUTH = {"auth_type": "HOOKDECK_SIGNATURE", "auth": {}}
+
 # Hookdeck source types whose event name arrives in a header rather than the
 # body. Used to turn a route's ``events`` list into a gateway-side filter.
 _EVENT_HEADER_BY_TYPE = {
@@ -53,7 +59,7 @@ def _http_destination_config(
         "url": url,
         # Hookdeck signs its delivery so the adapter has exactly one signature
         # scheme to verify, whatever the upstream provider used.
-        "auth_type": "HOOKDECK_SIGNATURE",
+        **HOOKDECK_SIGNATURE_AUTH,
     }
     if rate_limit:
         if rate_limit_period not in DESTINATION_RATE_PERIODS:
@@ -126,7 +132,7 @@ def build_connection_payload(
         destination = {
             "name": destination_name,
             "type": "CLI",
-            "config": {"path": path, "auth_type": "HOOKDECK_SIGNATURE"},
+            "config": {"path": path, **HOOKDECK_SIGNATURE_AUTH},
         }
     else:
         if not url:

@@ -23,6 +23,10 @@ def test_cli_mode_builds_a_cli_destination():
     assert payload["destination"]["config"]["path"] == "/hookdeck/github-prs"
     # Hookdeck signs CLI deliveries too, so the adapter verifies in both modes.
     assert payload["destination"]["config"]["auth_type"] == "HOOKDECK_SIGNATURE"
+    # The API rejects auth_type without a companion auth object — with
+    # "destination.config.auth is required" — even though HOOKDECK_SIGNATURE's
+    # is empty and the schema does not mark it required.
+    assert payload["destination"]["config"]["auth"] == {}
 
 
 def test_push_mode_sets_rate_limit_and_delivery_groups():
@@ -43,6 +47,7 @@ def test_push_mode_sets_rate_limit_and_delivery_groups():
     assert config["rate_limit"] == 2
     assert config["rate_limit_period"] == "concurrent"
     assert config["delivery_groups"]["key"] == "body.data.object.customer"
+    assert config["auth"] == {}
 
 
 def test_push_mode_without_a_url_is_rejected():

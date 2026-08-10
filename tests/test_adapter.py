@@ -647,3 +647,16 @@ async def test_a_failing_recovery_call_does_not_block_startup(client_factory):
     adapter._api.fail_with = HookdeckAPIError(500, "POST", "/events/x/retry", "nope")
 
     assert await adapter._recover_orphaned_runs() == 0
+
+
+async def test_cli_mode_binds_both_loopback_families(client_factory):
+    # The CLI forwards to http://localhost:<port>, which resolves to ::1 first
+    # on a dual-stack machine. An IPv4-only listener refuses every delivery
+    # while the tunnel itself looks healthy.
+    adapter, _client = await client_factory({"a": {"source": "s"}}, mode="cli")
+    assert adapter._bind_hosts() == ["127.0.0.1", "::1"]
+
+
+async def test_push_mode_binds_only_the_configured_host(client_factory):
+    adapter, _client = await client_factory({"a": {}}, mode="push", host="127.0.0.1")
+    assert adapter._bind_hosts() == ["127.0.0.1"]

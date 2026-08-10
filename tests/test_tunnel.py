@@ -13,6 +13,8 @@ def test_listen_args_match_the_cli_grammar():
         "github",
         "--path",
         "/hookdeck/github-prs",
+        "--output",
+        "compact",
     ]
 
 
@@ -27,6 +29,8 @@ def test_connection_name_is_passed_as_the_third_positional():
         "disputes",
         "--path",
         "/hookdeck/x",
+        "--output",
+        "compact",
     ]
 
 
@@ -48,3 +52,10 @@ def test_a_missing_binary_explains_the_alternative():
     )
     with pytest.raises(HookdeckCLIMissing, match="mode: push"):
         tunnel.resolve_binary()
+
+
+def test_output_mode_is_never_the_interactive_default():
+    # `interactive` renders a full-screen UI and exits immediately when stdout
+    # is a pipe — which it always is here, since the supervisor captures it.
+    args = HookdeckTunnel(port=1, path="/x", source="s").listen_args()
+    assert args[args.index("--output") + 1] == "compact"

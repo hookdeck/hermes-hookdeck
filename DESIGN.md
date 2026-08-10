@@ -110,8 +110,16 @@ Exactly two, named identically across plugins:
 
 ### Why `async_retry` works at all
 
-A successful event can be retried manually — confirmed with Hookdeck. That one
-fact is what the whole contract rests on, because it makes the 202 ack
+A successful event can be retried manually. Confirmed with Hookdeck, and then
+observed directly in the event log of a live project — every attempt below
+returned 202, so Hookdeck had recorded the event as delivered, and it still
+accepted two subsequent `MANUAL` retries:
+
+```
+evt_jyjuqko…  SUCCESSFUL  attempts=3  [(202,INITIAL), (202,MANUAL), (202,MANUAL)]
+```
+
+That one fact is what the whole contract rests on, because it makes the 202 ack
 recoverable in **both** ways it can go wrong:
 
 1. **The run fails.** Call `POST /events/{id}/retry`.
@@ -146,7 +154,11 @@ to re-run. Rules attached by default:
   GitHub/GitLab/Shopify, or an explicitly configured body path. Guessing
   discards traffic silently, so when in doubt, filter host-side instead.
 
-Destination auth is always `HOOKDECK_SIGNATURE`, in CLI and HTTP modes alike.
+Destination auth is always `HOOKDECK_SIGNATURE`, in CLI and HTTP modes alike —
+and `auth_type` must be accompanied by an `auth` object, even though
+HOOKDECK_SIGNATURE's is empty and the OpenAPI schema does not mark it required.
+Omitting it is rejected with `destination.config.auth is required`. Send
+`{"auth_type": "HOOKDECK_SIGNATURE", "auth": {}}`.
 
 Source verification is `config.auth_type` + `config.auth`. The docs page at
 hookdeck.com/docs/sources still shows a legacy top-level

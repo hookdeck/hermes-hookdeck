@@ -94,6 +94,10 @@ class HookdeckTunnel:
             args.append(self._connection_name)
         if self._path:
             args += ["--path", self._path]
+        # The default `interactive` output renders a full-screen UI and exits
+        # immediately when stdout is not a TTY — which it never is here, since
+        # the supervisor pipes it into the gateway log.
+        args += ["--output", "compact"]
         return args
 
     # ------------------------------------------------------------------
