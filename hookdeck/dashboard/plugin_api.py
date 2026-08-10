@@ -30,6 +30,8 @@ if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
 from hookdeck.api import HookdeckAPI, HookdeckAPIError  # noqa: E402
+from hookdeck.cli import _load_hermes_config  # noqa: E402
+from hookdeck.provision import routes_from_config  # noqa: E402
 from hookdeck.state import DeliveryLedger  # noqa: E402
 
 router = APIRouter()
@@ -84,14 +86,36 @@ async def overview() -> dict:
                 for i in _models(issues)
             ]
             connections = await _call(api.list_connections, limit=100)
+            # Only this gateway's connections get pause/resume controls. A
+            # project's other connections are someone else's production
+            # traffic, and a tab that puts a Pause button next to all of them
+            # is one misclick from an outage nobody connects to this plugin.
+            routes = set(routes_from_config(_load_hermes_config()))
+            all_conns = _models(connections)
             hookdeck["connections"] = [
                 {
                     "id": c.get("id"),
                     "name": c.get("name"),
                     "paused": bool(c.get("paused_at")),
                 }
-                for c in _models(connections)
+                for c in all_conns
+                if c.get("name") in routes
             ]
+            hookdeck["other_connection_count"] = len(all_conns) - len(
+                hookdeck["connections"]
+            )
+
+            # Flatten the metrics the tab actually shows. queue-depth returns a
+            # bucketed series wrapped in metadata; rendering that raw is a JSON
+            # dump, not an answer.
+            metrics = {}
+            rows = (hookdeck.get("queue_depth") or {}).get("data") or []
+            if rows:
+                metrics = rows[0].get("metrics") or {}
+            hookdeck["depth"] = {
+                "max_depth": metrics.get("max_depth"),
+                "max_age_minutes": metrics.get("max_age"),
+            }
 
     local: dict[str, Any] = {"path": str(_ledger_path()), "exists": _ledger_path().exists()}
     if local["exists"]:

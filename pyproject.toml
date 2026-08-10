@@ -13,7 +13,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# fastapi is provided by the Hermes web server at runtime, not by this
+# plugin — it is a dev dependency only, so the dashboard routes can be
+# tested without a Hermes checkout.
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "fastapi>=0.110"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

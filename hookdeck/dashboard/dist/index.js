@@ -80,6 +80,8 @@
 
     const failed = hd.failed || [];
     const conns = hd.connections || [];
+    const depth = hd.depth || {};
+    const others = hd.other_connection_count || 0;
     const counts = local.counts || {};
     const stranded = local.stranded || [];
 
@@ -93,12 +95,18 @@
             h(Button, { variant: "outline", onClick: load, disabled: busy }, busy ? "…" : "Refresh"))),
         h(CardContent, { className: "flex flex-col gap-2" },
           h("p", { className: "text-sm text-muted-foreground" },
-            "Events Hookdeck is still holding for this gateway."),
-          h("pre", { className: "overflow-x-auto rounded bg-muted p-3 text-xs" },
-            JSON.stringify(hd.queue_depth, null, 2)),
-          (hd.issues || []).length
-            ? h("p", { className: "text-sm" }, String(hd.issues.length) + " open issue(s)")
-            : null)),
+            "Events Hookdeck is still holding for this gateway, over the last 24h."),
+          h("div", { className: "flex flex-wrap gap-6" },
+            h("div", null,
+              h("div", { className: "text-2xl font-semibold" }, String(depth.max_depth != null ? depth.max_depth : "—")),
+              h("div", { className: "text-xs text-muted-foreground" }, "peak queued")),
+            h("div", null,
+              h("div", { className: "text-2xl font-semibold" },
+                depth.max_age_minutes != null ? (Math.round(depth.max_age_minutes * 10) / 10) + "m" : "—"),
+              h("div", { className: "text-xs text-muted-foreground" }, "longest wait")),
+            h("div", null,
+              h("div", { className: "text-2xl font-semibold" }, String((hd.issues || []).length)),
+              h("div", { className: "text-xs text-muted-foreground" }, "open issues"))))),
 
       // ── Failures Hookdeck knows about, with a way to act ───────────
       h(Card, null,
@@ -160,6 +168,14 @@
           h("p", { className: "mb-2 text-sm text-muted-foreground" },
             "Pause holds events in Hookdeck instead of dropping them — do it " +
             "before stopping the gateway, and resume after."),
+          conns.length === 0
+            ? h("p", { className: "text-sm" }, "No connection matches a configured route yet.")
+            : null,
+          others
+            ? h("p", { className: "mb-2 text-xs text-muted-foreground" },
+                others + " other connection(s) in this project are not shown — they " +
+                "belong to something else, and a Pause button next to them is a misclick away from an outage.")
+            : null,
           conns.map(function (c) {
             return h(Row, { key: c.id },
               h("div", { className: "flex min-w-0 items-center gap-2" },
