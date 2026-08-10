@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 
+import pytest
+
 import hookdeck
 
 
@@ -66,3 +68,21 @@ def test_cli_and_tools_still_register_without_hermes(monkeypatch):
     assert ctx.platforms == []
     assert [c["name"] for c in ctx.cli] == ["hookdeck"]
     assert len(ctx.tools) == 7
+
+
+def test_constructing_the_adapter_before_registration_fails_loudly():
+    # Hermes mints a Platform member only for a name its registry already
+    # knows. Falling back to Platform.WEBHOOK would collide with the built-in
+    # adapter, so this has to be an error rather than a quiet degradation.
+    from hookdeck.adapter import HookdeckAdapter
+    from tests import hermes_stub
+
+    hermes_stub.REGISTERED_PLATFORMS.discard("hookdeck")
+    hermes_stub.Platform._value2member_map_.pop("hookdeck", None)
+    try:
+        with pytest.raises(RuntimeError, match="not registered"):
+            HookdeckAdapter(
+                hermes_stub.PlatformConfig(extra={"secret": "s", "routes": {"a": {}}})
+            )
+    finally:
+        hermes_stub.REGISTERED_PLATFORMS.add("hookdeck")

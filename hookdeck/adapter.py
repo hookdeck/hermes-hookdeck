@@ -30,7 +30,19 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from aiohttp import web
+try:
+    from aiohttp import web
+
+    AIOHTTP_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised by installs without the extra
+    # aiohttp is a Hermes *extra* (`messaging`, `slack`, …), not a core
+    # dependency, and core's own webhook adapter guards it the same way. A bare
+    # module-level import here would raise during plugin discovery, and since
+    # `register()` degrades rather than crashes, the platform would simply
+    # never appear — a silent absence with no error to debug.
+    web = None  # type: ignore[assignment]
+    AIOHTTP_AVAILABLE = False
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
@@ -78,6 +90,39 @@ def _default_state_path() -> Path:
     return Path(home) / "hookdeck" / "state.db"
 
 
+def _has_lone_surrogates(payload: Any) -> bool:
+    """True when any string in *payload* cannot be encoded as UTF-8."""
+    try:
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def _replace_lone_surrogates(value: Any) -> Any:
+    """Swap unpaired surrogates for U+FFFD, leaving everything else intact.
+
+    ``"\\ud800"`` written as a JSON *escape* is pure ASCII on the wire, so the
+    body is valid UTF-8 and RFC 8259 explicitly permits any ``\\uXXXX`` escape
+    including an unpaired surrogate. Rejecting it would mean rejecting
+    conforming JSON. But Python decodes it to a ``str`` that raises
+    ``UnicodeEncodeError`` the moment anything encodes it — which, for a
+    webhook, is somewhere inside the agent run, long after the ack.
+
+    So the character is replaced rather than the event refused, matching what
+    JavaScript runtimes do anyway. Unlike their silent substitution, the caller
+    logs it and records it on the event, because quietly altering payload text
+    is exactly the failure mode this whole area is about.
+    """
+    if isinstance(value, str):
+        return value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    if isinstance(value, dict):
+        return {k: _replace_lone_surrogates(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_replace_lone_surrogates(v) for v in value]
+    return value
+
+
 def _dig(payload: Any, dotted: str) -> Any:
     value = payload
     for part in dotted.split("."):
@@ -99,7 +144,22 @@ class HookdeckAdapter(WebhookAdapter):
         super().__init__(config)
         # WebhookAdapter pins Platform.WEBHOOK; this adapter is registered under
         # its own name so the gateway can run both side by side.
-        self.platform = Platform(PLATFORM_NAME)
+        #
+        # Platform._missing_ only mints a member for a name the registry
+        # already knows, so this depends on register() having run — which it
+        # has on the real path, since the gateway builds adapters through
+        # platform_registry.create_adapter. Constructing the class directly
+        # beforehand fails here, and must: silently staying Platform.WEBHOOK
+        # would collide with the built-in adapter.
+        try:
+            self.platform = Platform(PLATFORM_NAME)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"[hookdeck] Platform({PLATFORM_NAME!r}) is not registered. "
+                "Build the adapter via platform_registry.create_adapter (or "
+                "call hookdeck.register(ctx) first) — Hermes only mints a "
+                "Platform member for names the registry already knows."
+            ) from exc
 
         extra = config.extra or {}
         self._mode = str(extra.get("mode") or os.getenv("HOOKDECK_MODE") or "cli").lower()
@@ -577,6 +637,18 @@ class HookdeckAdapter(WebhookAdapter):
             except Exception:
                 return self._unparseable_response(event_id)
 
+        # A lone surrogate can also arrive as a JSON escape, which is valid
+        # JSON and valid UTF-8 on the wire — so the strict decode above cannot
+        # catch it, and it would detonate later inside the run instead.
+        surrogates_replaced = _has_lone_surrogates(payload)
+        if surrogates_replaced:
+            payload = _replace_lone_surrogates(payload)
+            logger.warning(
+                "[hookdeck] Event %s contains unpaired surrogates; replaced "
+                "them with U+FFFD so the payload can be encoded",
+                event_id or "(no id)",
+            )
+
         event_type = self._event_type(request, route, payload)
         allowed = route.get("events", [])
         if allowed and event_type not in allowed:
@@ -705,6 +777,7 @@ class HookdeckAdapter(WebhookAdapter):
                 "hookdeck_attempt": attempt,
                 "hookdeck_route": route_name,
                 "hookdeck_last_automatic_attempt": is_last_attempt,
+                "hookdeck_surrogates_replaced": surrogates_replaced,
             },
         )
 
@@ -933,13 +1006,14 @@ class HookdeckAdapter(WebhookAdapter):
 def check_requirements() -> bool:
     """Passive dependency probe — must not install anything.
 
-    ``find_spec`` rather than a real import: the registry calls this from status
-    displays, and importing here would drag the HTTP stack into every
-    ``hermes status``.
+    Reports what the module-level guard actually found for aiohttp, so a
+    missing extra surfaces as "platform not ready, here's the install hint"
+    rather than as an absent platform. httpx is probed with ``find_spec``
+    because it is only needed once the adapter runs.
     """
     from importlib.util import find_spec
 
-    return all(find_spec(module) is not None for module in ("aiohttp", "httpx"))
+    return AIOHTTP_AVAILABLE and find_spec("httpx") is not None
 
 
 def validate_config(config: PlatformConfig) -> bool:

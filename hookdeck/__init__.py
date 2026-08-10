@@ -51,7 +51,10 @@ def _register_platform(ctx: Any) -> None:
         is_connected=is_connected,
         env_enablement_fn=env_enablement,
         required_env=["HOOKDECK_WEBHOOK_SECRET"],
-        install_hint="pip install aiohttp httpx   # both are already Hermes dependencies",
+        install_hint=(
+            "pip install 'aiohttp==3.14.3' httpx   # aiohttp is a Hermes extra "
+            "(messaging/slack/…), not a core dependency"
+        ),
         allowed_users_env="HOOKDECK_ALLOWED_USERS",
         allow_all_env="HOOKDECK_ALLOW_ALL_USERS",
         emoji="🪝",

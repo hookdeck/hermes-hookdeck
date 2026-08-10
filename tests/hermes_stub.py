@@ -27,6 +27,13 @@ from enum import Enum
 from typing import Any, Dict, Optional
 
 
+# Names the registry has been told about. Real Hermes mints a Platform member
+# only for a registered plugin name — "arbitrary strings are rejected to
+# prevent enum pollution" — so the stub gates on the same thing. Without this
+# the stub is more permissive than core and hides the ordering constraint.
+REGISTERED_PLATFORMS: set[str] = set()
+
+
 class Platform(Enum):
     WEBHOOK = "webhook"
 
@@ -37,6 +44,8 @@ class Platform(Enum):
         value = value.strip().lower()
         if value in cls._value2member_map_:
             return cls._value2member_map_[value]
+        if value not in REGISTERED_PLATFORMS:
+            return None
         member = object.__new__(cls)
         member._name_ = value.upper()
         member._value_ = value

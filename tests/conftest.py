@@ -9,3 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests import hermes_stub
 
 hermes_stub.install()
+
+# The plugin is always constructed after registration on the real path; mirror
+# that here so Platform("hookdeck") resolves.
+hermes_stub.REGISTERED_PLATFORMS.add("hookdeck")

@@ -727,3 +727,45 @@ async def test_form_encoded_bodies_still_work(client_factory):
     assert response.status == 202
     await _settle()
     assert seen[0].raw_message == {"kind": "ping", "who": "bob"}
+
+
+async def test_an_escaped_lone_surrogate_is_replaced_not_rejected(client_factory):
+    # RFC 8259 permits any \uXXXX escape including an unpaired surrogate, and
+    # the body is pure ASCII on the wire — so it is valid JSON that the strict
+    # decode cannot catch. Python then produces a str that raises
+    # UnicodeEncodeError inside the agent run, after the ack.
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    response = await _post_raw(client, b'{"a": "hi \\ud800 there"}', "evt_escaped")
+    assert response.status == 202
+    await _settle()
+    assert seen[0].raw_message["a"] == "hi � there"
+    # Substituting silently is the failure mode this area is about, so it is
+    # recorded rather than merely done.
+    assert seen[0].metadata["hookdeck_surrogates_replaced"] is True
+    # And the result is actually encodable, which was the whole point.
+    seen[0].raw_message["a"].encode("utf-8")
+
+
+async def test_a_valid_surrogate_pair_is_left_alone(client_factory):
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    response = await _post_raw(client, b'{"a": "\\ud83e\\udd1d"}', "evt_pair")
+    assert response.status == 202
+    await _settle()
+    assert seen[0].raw_message["a"] == "\U0001f91d"
+    assert seen[0].metadata["hookdeck_surrogates_replaced"] is False
+
+
+async def test_nested_and_listed_surrogates_are_reached(client_factory):
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    await _post_raw(client, b'{"a": {"b": ["ok", "x\\ud800"]}}', "evt_nested")
+    await _settle()
+    assert seen[0].raw_message["a"]["b"] == ["ok", "x�"]
