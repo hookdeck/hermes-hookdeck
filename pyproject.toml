@@ -23,4 +23,16 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.setuptools]
-packages = ["hookdeck"]
+# The manifest, the dashboard bundle and the bundled skill are the plugin as
+# much as the Python is — a package that ships only the modules installs
+# something that cannot register.
+packages = ["hookdeck", "hookdeck.dashboard"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+hookdeck = [
+    "plugin.yaml",
+    "skills/**/*",
+    "dashboard/manifest.json",
+    "dashboard/dist/*",
+]

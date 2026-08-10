@@ -1044,3 +1044,100 @@ async def test_a_sync_failure_within_the_timeout_is_left_to_hookdeck(client_fact
     assert (await post(client, {"n": 1}, event_id="evt_sync_fail")).status == 500
     await _settle()
     assert adapter._api.retried == []
+
+
+async def test_an_operator_replay_of_an_exhausted_event_runs_again(client_factory):
+    # The dashboard's Replay button, `hermes hookdeck replay` and the agent's
+    # retry tool all arrive as a MANUAL redelivery. Answering 200 to those
+    # would make every recovery path this code recommends a silent no-op.
+    adapter, client = await client_factory({"default": {}}, max_agent_retries=1)
+
+    async def _fail(_event):
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _fail
+    for attempt in (1, 2):
+        await post(client, {"n": 1}, event_id="evt_dead", attempt=attempt)
+        await _settle()
+    assert adapter._ledger.get("evt_dead")["status"] == "exhausted"
+
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+    replay = await post(
+        client,
+        {"n": 1},
+        event_id="evt_dead",
+        attempt=3,
+        extra_headers={"x-hookdeck-attempt-trigger": "MANUAL"},
+    )
+    assert replay.status == 202
+    await _settle()
+    assert len(seen) == 1
+    assert adapter._ledger.get("evt_dead")["status"] == "succeeded"
+
+
+async def test_hookdecks_own_retry_of_an_exhausted_event_is_still_refused(client_factory):
+    adapter, client = await client_factory({"default": {}}, max_agent_retries=1)
+
+    async def _fail(_event):
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _fail
+    for attempt in (1, 2):
+        await post(client, {"n": 1}, event_id="evt_dead", attempt=attempt)
+        await _settle()
+
+    automatic = await post(
+        client,
+        {"n": 1},
+        event_id="evt_dead",
+        attempt=3,
+        extra_headers={"x-hookdeck-attempt-trigger": "AUTOMATIC"},
+    )
+    body = await automatic.json()
+    assert automatic.status == 200
+    # The body says why, so Hookdeck's event log is not left claiming the
+    # delivery was a duplicate when the budget is what ran out.
+    assert "budget" in body["reason"]
+
+
+async def test_a_successful_run_clears_its_timed_out_sync_marker(client_factory):
+    # Otherwise the id leaks for the life of the gateway and subtly changes how
+    # a later failure of the same id is handled.
+    adapter, client = await client_factory(
+        {"default": {}}, ack_mode="sync", sync_timeout_seconds=0.05
+    )
+    gate = asyncio.Event()
+
+    async def _slow_success(_event):
+        await gate.wait()
+        return ProcessingOutcome.SUCCESS
+
+    adapter.run_agent = _slow_success
+    assert (await post(client, {"n": 1}, event_id="evt_slow_ok")).status == 202
+    assert "evt_slow_ok" in adapter._acked_before_completion
+
+    gate.set()
+    await _settle()
+    assert "evt_slow_ok" not in adapter._acked_before_completion
+
+
+async def test_a_due_pause_is_resumed_at_boot(client_factory):
+    # The agent's pause tool records a deadline rather than holding a timer,
+    # because a restart is one of the main reasons to pause.
+    import time as _time
+
+    adapter, _client = await client_factory({"default": {}})
+    resumed: list[str] = []
+
+    async def _unpause(connection_id: str):
+        resumed.append(connection_id)
+
+    adapter._api.unpause_connection = _unpause
+    adapter._ledger.schedule_resume("web_due", "mine", _time.time() - 1)
+    adapter._ledger.schedule_resume("web_later", "mine", _time.time() + 3600)
+
+    assert await adapter._resume_due_connections() == 1
+    assert resumed == ["web_due"]
+    # Cleared, so it does not fire again against a later pause.
+    assert [r["connection_id"] for r in adapter._ledger.due_resumes()] == []

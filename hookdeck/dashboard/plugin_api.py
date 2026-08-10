@@ -209,8 +209,14 @@ async def _require_own_connection(api: HookdeckAPI, connection_id: str) -> None:
     connection is exactly the outage the filtering exists to prevent. The check
     belongs on the action, not the display.
     """
-    mine, _ = _own_connections(await _call(api.list_connections, limit=100))
-    if not any(c["id"] == connection_id for c in mine):
+    # By name, one request per configured route: filtering a capped page would
+    # falsely refuse an owned connection that happened to fall past it.
+    owned_ids = set()
+    for route_name in routes_from_config(_load_hermes_config()):
+        found = await _call(api.list_connections, name=route_name, limit=10)
+        owned_ids.update(c.get("id") for c in _models(found))
+
+    if connection_id not in owned_ids:
         raise HTTPException(
             status_code=403,
             detail=(

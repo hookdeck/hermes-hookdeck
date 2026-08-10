@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_updated ON deliveries(updated_at);
 CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
+
+CREATE TABLE IF NOT EXISTS pauses (
+    connection_id TEXT PRIMARY KEY,
+    name          TEXT NOT NULL DEFAULT '',
+    resume_at     REAL NOT NULL
+);
 """
 
 
@@ -101,7 +107,9 @@ class DeliveryLedger:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _admits(row: Optional[sqlite3.Row], attempt: int) -> tuple[bool, str]:
+    def _admits(
+        row: Optional[sqlite3.Row], attempt: int, *, operator_initiated: bool = False
+    ) -> tuple[bool, str]:
         """Whether *attempt* is new work, given what is already recorded.
 
         The rule: a delivery is new when its attempt number exceeds the highest
@@ -111,13 +119,19 @@ class DeliveryLedger:
         Two exceptions. With no attempt number on the wire (``0``) the ledger
         falls back to admitting only after a recorded failure, so redelivery
         still works without opening a duplicate-run hole. And an ``exhausted``
-        event is never admitted again: the retry budget is spent, and in sync
-        mode Hookdeck's own retries would otherwise keep re-running it long
-        past ``max_agent_retries``.
+        event is not admitted again *on Hookdeck's own schedule*: the budget is
+        spent, and in sync mode its automatic retries would otherwise keep
+        re-running the event long past ``max_agent_retries``.
+
+        That block explicitly does not apply to an operator-initiated replay.
+        Refusing those would make ``hermes hookdeck replay``, the dashboard's
+        Replay button and the ``hookdeck_retry_event`` tool all answer 200 and
+        do nothing — a green tick over a dead event, and the escape hatch this
+        code recommends by name.
         """
         if row is None:
             return True, ""
-        if row["status"] == STATUS_EXHAUSTED:
+        if row["status"] == STATUS_EXHAUSTED and not operator_initiated:
             return False, "retry budget already spent for this event"
         if attempt > int(row["attempt"]):
             return True, ""
@@ -125,21 +139,23 @@ class DeliveryLedger:
             return True, ""
         return False, f"duplicate delivery (attempt {attempt}, status {row['status']})"
 
-    def is_duplicate(self, event_id: str, attempt: int) -> bool:
-        """Read-only: would :meth:`admit` reject this delivery?
+    def rejection_reason(
+        self, event_id: str, attempt: int, *, operator_initiated: bool = False
+    ) -> Optional[str]:
+        """Read-only: why :meth:`admit` would reject this delivery, if it would.
 
-        Lets a caller recognise a duplicate *without* recording anything —
-        which matters when the answer is "yes, and also we are at capacity",
-        since a deferred event must leave no trace or its redelivery would be
-        mistaken for a duplicate in turn.
+        Lets a caller recognise a repeat *without* recording anything — which
+        matters when the answer is "yes, and we are also at capacity", since a
+        deferred event must leave no trace or its redelivery would be mistaken
+        for a duplicate in turn.
         """
         with self._lock:
             row = self._conn.execute(
                 "SELECT attempt, status FROM deliveries WHERE event_id = ?",
                 (event_id,),
             ).fetchone()
-        admitted, _ = self._admits(row, attempt)
-        return not admitted
+        admitted, reason = self._admits(row, attempt, operator_initiated=operator_initiated)
+        return None if admitted else reason
 
     def admit(
         self,
@@ -148,6 +164,7 @@ class DeliveryLedger:
         route: str,
         attempt: int,
         session_chat_id: str = "",
+        operator_initiated: bool = False,
     ) -> Admission:
         """Claim this delivery for an agent run, if it is new work.
 
@@ -161,9 +178,26 @@ class DeliveryLedger:
                 (event_id,),
             ).fetchone()
 
-            admitted, reason = self._admits(row, attempt)
+            admitted, reason = self._admits(
+                row, attempt, operator_initiated=operator_initiated
+            )
             if not admitted:
                 return Admission(False, int(row["agent_attempts"]), reason=reason)
+
+            # A person choosing to replay an exhausted event is granting it a
+            # fresh budget; otherwise the first failure would exhaust it again
+            # immediately and the replay would buy one attempt, not a retry.
+            spent = row is not None and row["status"] == STATUS_EXHAUSTED
+            if spent and operator_initiated:
+                self._conn.execute(
+                    "UPDATE deliveries SET agent_attempts = 0 WHERE event_id = ?",
+                    (event_id,),
+                )
+                row = self._conn.execute(
+                    "SELECT attempt, agent_attempts, status FROM deliveries"
+                    " WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
 
             if row is None:
                 self._conn.execute(
@@ -195,23 +229,46 @@ class DeliveryLedger:
     # Outcomes
     # ------------------------------------------------------------------
 
-    def _set_status(self, event_id: str, status: str, error: str = "") -> None:
+    def _set_status(
+        self, event_id: str, status: str, error: str = "", *, session_chat_id: str = ""
+    ) -> None:
+        """Record an outcome, unless a newer run has already claimed the row.
+
+        After a sweep timeout the original run can finish while its redelivery
+        is already in flight. Writing its outcome then would mark the row
+        terminal while work is still running, and a crash in that window would
+        hide the live run from boot recovery. The session id identifies which
+        run is reporting, so a late one can be ignored.
+        """
         with self._lock:
-            self._conn.execute(
-                "UPDATE deliveries SET status = ?, error = ?, updated_at = ?"
-                " WHERE event_id = ?",
-                (status, error[:500], time.time(), event_id),
-            )
+            if session_chat_id:
+                self._conn.execute(
+                    "UPDATE deliveries SET status = ?, error = ?, updated_at = ?"
+                    " WHERE event_id = ? AND session_chat_id = ?",
+                    (status, error[:500], time.time(), event_id, session_chat_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE deliveries SET status = ?, error = ?, updated_at = ?"
+                    " WHERE event_id = ?",
+                    (status, error[:500], time.time(), event_id),
+                )
             self._conn.commit()
 
-    def mark_succeeded(self, event_id: str) -> None:
-        self._set_status(event_id, STATUS_SUCCEEDED)
+    def mark_succeeded(self, event_id: str, *, session_chat_id: str = "") -> None:
+        self._set_status(event_id, STATUS_SUCCEEDED, session_chat_id=session_chat_id)
 
-    def mark_failed(self, event_id: str, error: str = "") -> None:
-        self._set_status(event_id, STATUS_FAILED, error)
+    def mark_failed(
+        self, event_id: str, error: str = "", *, session_chat_id: str = ""
+    ) -> None:
+        self._set_status(event_id, STATUS_FAILED, error, session_chat_id=session_chat_id)
 
-    def mark_exhausted(self, event_id: str, error: str = "") -> None:
-        self._set_status(event_id, STATUS_EXHAUSTED, error)
+    def mark_exhausted(
+        self, event_id: str, error: str = "", *, session_chat_id: str = ""
+    ) -> None:
+        self._set_status(
+            event_id, STATUS_EXHAUSTED, error, session_chat_id=session_chat_id
+        )
 
     def record_cancelled(
         self, event_id: str, reason: str, *, cancelled: bool = True
@@ -246,6 +303,41 @@ class DeliveryLedger:
     def agent_attempts(self, event_id: str) -> int:
         row = self.get(event_id)
         return int(row["agent_attempts"]) if row else 0
+
+    # ------------------------------------------------------------------
+    # Scheduled resumes
+    # ------------------------------------------------------------------
+    #
+    # A pause is only safe because it ends. An in-process timer cannot promise
+    # that: it dies with the gateway, and a restart is one of the main reasons
+    # to pause in the first place. Recording the deadline lets whoever is
+    # running next honour it.
+
+    def schedule_resume(self, connection_id: str, name: str, resume_at: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO pauses (connection_id, name, resume_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(connection_id) DO UPDATE SET"
+                " name = excluded.name, resume_at = excluded.resume_at",
+                (connection_id, name, resume_at),
+            )
+            self._conn.commit()
+
+    def cancel_scheduled_resume(self, connection_id: str) -> None:
+        """Forget a deadline — after a manual resume, so a stale timer cannot
+        unpause a *later* pause early."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM pauses WHERE connection_id = ?", (connection_id,)
+            )
+            self._conn.commit()
+
+    def due_resumes(self, now: Optional[float] = None) -> list[sqlite3.Row]:
+        moment = time.time() if now is None else now
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM pauses WHERE resume_at <= ?", (moment,)
+            ).fetchall()
 
     # ------------------------------------------------------------------
     # Reporting and housekeeping

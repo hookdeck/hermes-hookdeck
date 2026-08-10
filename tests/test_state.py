@@ -96,3 +96,58 @@ def test_stale_running_reports_lost_runs(ledger):
         ledger._conn.commit()
 
     assert [row["event_id"] for row in ledger.stale_running(3600)] == ["evt_lost"]
+
+
+def test_an_operator_replay_reaches_an_exhausted_event(ledger):
+    # Every documented recovery path — `hermes hookdeck replay`, the dashboard
+    # button, the agent's retry tool — arrives as a MANUAL redelivery of the
+    # same event id. Refusing those would answer 200 and do nothing: a green
+    # tick over a dead event.
+    ledger.admit("evt_spent", route="a", attempt=1)
+    ledger.mark_exhausted("evt_spent", "failure")
+
+    assert ledger.rejection_reason("evt_spent", 2) is not None
+    assert ledger.rejection_reason("evt_spent", 2, operator_initiated=True) is None
+
+    admitted = ledger.admit("evt_spent", route="a", attempt=2, operator_initiated=True)
+    assert admitted.admitted
+    # Budget reset: otherwise the replay buys one attempt, not a retry.
+    assert admitted.agent_attempts == 1
+
+
+def test_hookdecks_own_retries_still_stop_at_exhausted(ledger):
+    ledger.admit("evt_spent", route="a", attempt=1)
+    ledger.mark_exhausted("evt_spent", "failure")
+    assert "budget" in (ledger.rejection_reason("evt_spent", 5) or "")
+
+
+def test_a_late_completion_cannot_overwrite_a_newer_run(ledger):
+    # After a sweep timeout the original run can finish while its redelivery is
+    # already in flight; marking the row terminal then would hide live work
+    # from boot recovery.
+    ledger.admit("evt_x", route="a", attempt=1, session_chat_id="run-1")
+    ledger.admit("evt_x", route="a", attempt=2, session_chat_id="run-2")
+
+    ledger.mark_succeeded("evt_x", session_chat_id="run-1")
+    assert ledger.get("evt_x")["status"] == "running"
+
+    ledger.mark_succeeded("evt_x", session_chat_id="run-2")
+    assert ledger.get("evt_x")["status"] == "succeeded"
+
+
+def test_scheduled_resumes_survive_the_process_that_set_them(ledger, tmp_path):
+    import time as _time
+
+    ledger.schedule_resume("web_1", "mine", _time.time() - 1)
+    ledger.schedule_resume("web_2", "later", _time.time() + 3600)
+    ledger.close()
+
+    # The restart a pause most often precedes.
+    reopened = DeliveryLedger(tmp_path / "state.db")
+    try:
+        due = [row["connection_id"] for row in reopened.due_resumes()]
+        assert due == ["web_1"]
+        reopened.cancel_scheduled_resume("web_1")
+        assert reopened.due_resumes() == []
+    finally:
+        reopened.close()

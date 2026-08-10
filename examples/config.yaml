@@ -29,9 +29,10 @@ gateway:
         max_agent_retries: 3
         retry_after_seconds: 30
         # After this many deferrals of one event, the 503 stops carrying
-        # Retry-After: the saturation is no longer transient, and a fixed
-        # short interval would spend the retry budget in minutes.
-        defer_attempt_limit: 5
+        # Retry-After and Hookdeck falls back to exponential backoff. Kept well
+        # below the provisioned retry count (10) so there are attempts left for
+        # the backoff to spread.
+        defer_attempt_limit: 2
 
         # At startup, ask Hookdeck to redeliver any run the previous process
         # died holding. Set false if re-running a possibly-completed event is

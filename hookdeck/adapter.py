@@ -50,7 +50,9 @@ from . import routing
 from .api import HookdeckAPI, HookdeckAPIError
 from .constants import (
     ATTEMPT_COUNT,
+    ATTEMPT_TRIGGER,
     EVENT_ID,
+    OPERATOR_TRIGGERS,
     PLATFORM_NAME,
     SOURCE_NAME,
     WILL_RETRY_AFTER,
@@ -84,6 +86,10 @@ class Delivery:
     payload: Any
     event_type: str
     is_last_attempt: bool
+    #: True when a person asked for this delivery — a CLI replay, the
+    #: dashboard's Replay button, or the agent's retry tool — rather than
+    #: Hookdeck's own schedule.
+    operator_initiated: bool = False
     surrogates_replaced: bool = False
     session_chat_id: str = ""
     prompt: str = ""
@@ -102,6 +108,9 @@ class InFlightRun:
     route: str
     started: float
     is_last_attempt: bool = False
+    #: Identifies which run is reporting, so a late completion cannot overwrite
+    #: the status of a redelivery that has since taken over.
+    session_chat_id: str = ""
 
 
 class HookdeckAdapter(WebhookAdapter):
@@ -217,6 +226,7 @@ class HookdeckAdapter(WebhookAdapter):
             return False
 
         await self._recover_orphaned_runs()
+        await self._resume_due_connections()
 
         self._mark_connected()
         logger.info(
@@ -288,6 +298,35 @@ class HookdeckAdapter(WebhookAdapter):
             return False
         return True
 
+    async def _resume_due_connections(self) -> int:
+        """Unpause anything whose scheduled pause has expired.
+
+        The agent's pause tool records a deadline rather than holding a timer,
+        precisely so a restart cannot lose it. This is the other half.
+        """
+        if self._ledger is None or self._api is None:
+            return 0
+
+        resumed = 0
+        for row in self._ledger.due_resumes():
+            try:
+                await self._api.unpause_connection(row["connection_id"])
+                self._ledger.cancel_scheduled_resume(row["connection_id"])
+                resumed += 1
+                logger.info(
+                    "[hookdeck] Auto-resumed %s — its scheduled pause expired",
+                    row["name"] or row["connection_id"],
+                )
+            except HookdeckAPIError as exc:
+                logger.error(
+                    "[hookdeck] Could not auto-resume %s: %s. Resume it with "
+                    "`hermes hookdeck resume %s`.",
+                    row["name"] or row["connection_id"],
+                    exc,
+                    row["name"] or row["connection_id"],
+                )
+        return resumed
+
     async def _stop_tunnels(self) -> None:
         for tunnel in self._tunnels:
             await tunnel.stop()
@@ -349,6 +388,10 @@ class HookdeckAdapter(WebhookAdapter):
                 await self._api.retry_event(event_id)
                 recovered += 1
             except HookdeckAPIError as exc:
+                # Degrade, never abort: the API being briefly unreachable at
+                # boot is no reason to refuse to start, when the tunnel and the
+                # queue are fine. The row stays `failed` and the next restart
+                # tries again.
                 logger.error(
                     "[hookdeck] Could not recover interrupted event %s: %s",
                     event_id,
@@ -413,9 +456,15 @@ class HookdeckAdapter(WebhookAdapter):
         # considered: a duplicate is a duplicate whether or not there is room
         # to run it, and deliver_only posts to a channel where a repeat is
         # visible to a human.
-        if self._is_duplicate(delivery):
+        already_handled = self._already_handled(delivery)
+        if already_handled:
             return self._respond(
-                {"status": "duplicate", "event_id": delivery.event_id}, status=200
+                {
+                    "status": "duplicate",
+                    "reason": already_handled,
+                    "event_id": delivery.event_id,
+                },
+                status=200,
             )
 
         if delivery.route.get("deliver_only"):
@@ -524,6 +573,8 @@ class HookdeckAdapter(WebhookAdapter):
             # Hookdeck omits this header on the final automatic attempt, which
             # is the cleanest dead-letter signal available.
             is_last_attempt=not self._header(request, WILL_RETRY_AFTER).strip(),
+            operator_initiated=self._header(request, ATTEMPT_TRIGGER).strip().upper()
+            in OPERATOR_TRIGGERS,
             surrogates_replaced=surrogates_replaced,
         )
         # Attempt-scoped, not just event-scoped. A redelivery arriving while
@@ -610,24 +661,24 @@ class HookdeckAdapter(WebhookAdapter):
             }
         )
 
-    def _is_duplicate(self, delivery: Delivery) -> bool:
-        """Has this exact delivery already been handled?
+    def _already_handled(self, delivery: Delivery) -> Optional[str]:
+        """Why this delivery needs no run, if it needs none.
 
         Read-only on purpose. Answering this *before* the capacity check is
-        what stops a duplicate arriving at a busy moment being deferred
-        instead: Hookdeck would redeliver it with a higher attempt number,
-        which then reads as new work and runs the agent a second time.
+        what stops a repeat arriving at a busy moment being deferred instead:
+        Hookdeck would redeliver it with a higher attempt number, which then
+        reads as new work and runs the agent a second time.
         """
         if not delivery.event_id or self._ledger is None:
-            return False
-        if not self._ledger.is_duplicate(delivery.event_id, delivery.attempt):
-            return False
-        logger.info(
-            "[hookdeck] Skipping %s: already handled at attempt %s",
+            return None
+        reason = self._ledger.rejection_reason(
             delivery.event_id,
             delivery.attempt,
+            operator_initiated=delivery.operator_initiated,
         )
-        return True
+        if reason:
+            logger.info("[hookdeck] Skipping %s: %s", delivery.event_id, reason)
+        return reason
 
     def _admit(self, delivery: Delivery) -> Optional[web.Response]:
         """Claim a slot and a ledger entry, or defer.
@@ -665,6 +716,7 @@ class HookdeckAdapter(WebhookAdapter):
             route=delivery.route_name,
             attempt=delivery.attempt,
             session_chat_id=delivery.session_chat_id,
+            operator_initiated=delivery.operator_initiated,
         )
         if not admission.admitted:
             logger.info("[hookdeck] Skipping %s: %s", delivery.event_id, admission.reason)
@@ -742,6 +794,7 @@ class HookdeckAdapter(WebhookAdapter):
             route=delivery.route_name,
             started=time.time(),
             is_last_attempt=delivery.is_last_attempt,
+            session_chat_id=delivery.session_chat_id,
         )
         logger.info(
             "[hookdeck] dispatch route=%s event_type=%s event_id=%s attempt=%s "
@@ -837,7 +890,10 @@ class HookdeckAdapter(WebhookAdapter):
         if run and run.event_id and self._ledger is not None:
             try:
                 await self._record_outcome(
-                    run.event_id, outcome, last_attempt=run.is_last_attempt
+                    run.event_id,
+                    outcome,
+                    last_attempt=run.is_last_attempt,
+                    session_chat_id=run.session_chat_id,
                 )
             except Exception:
                 logger.exception(
@@ -850,11 +906,17 @@ class HookdeckAdapter(WebhookAdapter):
             logger.debug("[hookdeck] Base completion hook failed", exc_info=True)
 
     async def _record_outcome(
-        self, event_id: str, outcome: Any, *, last_attempt: bool = False
+        self,
+        event_id: str,
+        outcome: Any,
+        *,
+        last_attempt: bool = False,
+        session_chat_id: str = "",
     ) -> None:
         assert self._ledger is not None
         if outcome == ProcessingOutcome.SUCCESS:
-            self._ledger.mark_succeeded(event_id)
+            self._ledger.mark_succeeded(event_id, session_chat_id=session_chat_id)
+            self._acked_before_completion.discard(event_id)
             return
 
         runs = self._ledger.agent_attempts(event_id)
@@ -863,7 +925,9 @@ class HookdeckAdapter(WebhookAdapter):
         # `runs` counts runs, so retries already requested is one less:
         # max_agent_retries=2 means the first run plus two more.
         if runs - 1 >= self.settings.max_agent_retries:
-            self._ledger.mark_exhausted(event_id, reason)
+            self._ledger.mark_exhausted(
+                event_id, reason, session_chat_id=session_chat_id
+            )
             logger.error(
                 "[hookdeck] Event %s failed %d times — giving up. Inspect it in "
                 "Hookdeck and replay with `hermes hookdeck replay %s`.",
@@ -886,7 +950,7 @@ class HookdeckAdapter(WebhookAdapter):
                 event_id,
             )
 
-        self._ledger.mark_failed(event_id, reason)
+        self._ledger.mark_failed(event_id, reason, session_chat_id=session_chat_id)
         if not self._should_hand_back(event_id):
             return
         if await self._request_redelivery(event_id):
@@ -1090,10 +1154,18 @@ class HookdeckAdapter(WebhookAdapter):
             # next restart, since boot recovery is the only other reader. Treat
             # it as a failure now, which routes it through the retry budget.
             if run.event_id:
-                self._spawn(self._record_outcome(run.event_id, ProcessingOutcome.FAILURE))
+                self._spawn(
+                    self._record_outcome(
+                        run.event_id,
+                        ProcessingOutcome.FAILURE,
+                        session_chat_id=run.session_chat_id,
+                    )
+                )
 
         if self._ledger is not None:
             self._ledger.prune(self.settings.ledger_ttl_seconds)
+            if self._ledger.due_resumes():
+                self._spawn(self._resume_due_connections())
 
     # Kept for tests and callers that predate `settings`.
     def _validate_startup(self) -> None:

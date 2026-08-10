@@ -20,6 +20,12 @@ EVENT_ID = "eventid"
 REQUEST_ID = "requestid"
 ATTEMPT_COUNT = "attempt-count"
 ATTEMPT_TRIGGER = "attempt-trigger"
+# Attempt triggers Hookdeck sends. INITIAL and AUTOMATIC are its own schedule;
+# MANUAL and BULK_RETRY mean a person (or the agent, or the dashboard) asked
+# for this delivery, which is a deliberate decision the adapter should honour
+# even for an event whose automatic budget is spent. UNPAUSE is just a held
+# event finally flowing, so it follows the normal rules.
+OPERATOR_TRIGGERS = frozenset({"MANUAL", "BULK_RETRY"})
 # Absent or empty means this is the final automatic attempt.
 WILL_RETRY_AFTER = "will-retry-after"
 SOURCE_NAME = "source-name"

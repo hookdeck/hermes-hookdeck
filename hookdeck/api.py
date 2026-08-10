@@ -31,6 +31,15 @@ def _httpx():
     return httpx
 
 
+def _httpx_transport_error(exc: BaseException) -> bool:
+    """Whether *exc* is httpx failing to complete a request."""
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is present if a call was made
+        return False
+    return isinstance(exc, (httpx.TransportError, httpx.InvalidURL, httpx.StreamError))
+
+
 def _clean_params(params: Any) -> Any:
     """Drop empty values, preserving a list of pairs so keys can repeat.
 
@@ -45,7 +54,14 @@ def _clean_params(params: Any) -> Any:
 
 
 class HookdeckAPIError(RuntimeError):
-    """Non-2xx response from the Hookdeck API."""
+    """A Hookdeck API call that did not succeed.
+
+    Covers transport failures as well as non-2xx responses, so callers have one
+    thing to catch. A connect timeout and a 503 are the same problem to
+    everything upstream of here — and letting the transport error escape raw
+    was how a "network blip" slipped past a retry loop written for exactly it.
+    ``status`` is 0 when the request never got an HTTP response.
+    """
 
     def __init__(self, status: int, method: str, path: str, body: str):
         self.status = status
@@ -110,16 +126,24 @@ class HookdeckAPI:
                 401, method, path, "HOOKDECK_API_KEY is not set"
             )
         client = self._ensure_client()
-        response = await client.request(
-            method,
-            f"{self.base_url}{path}",
-            json=json,
-            params=_clean_params(params),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-        )
+        try:
+            response = await client.request(
+                method,
+                f"{self.base_url}{path}",
+                json=json,
+                params=_clean_params(params),
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+        except Exception as exc:
+            # Timeouts, DNS failures, connection resets. Raised as the same
+            # error type as a bad status so every caller's single except clause
+            # covers both.
+            if _httpx_transport_error(exc):
+                raise HookdeckAPIError(0, method, path, f"{type(exc).__name__}: {exc}") from exc
+            raise
         if response.status_code >= 400:
             raise HookdeckAPIError(
                 response.status_code, method, path, response.text

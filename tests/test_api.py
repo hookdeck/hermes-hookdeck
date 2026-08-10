@@ -65,3 +65,25 @@ async def test_non_2xx_carries_the_status_and_body():
         await api.list_events()
     assert exc.value.status == 422
     assert "measures is required" in exc.value.body
+
+
+async def test_a_transport_failure_is_raised_as_an_api_error():
+    # Callers catch HookdeckAPIError. A raw httpx.ConnectError would sail past
+    # the bounded retry loop written for exactly this — the "network blip".
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    api = HookdeckAPI("key", client=_client(handler))
+    with pytest.raises(HookdeckAPIError) as exc:
+        await api.list_events()
+    assert exc.value.status == 0
+    assert "ConnectError" in exc.value.body
+
+
+async def test_a_timeout_is_raised_as_an_api_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("too slow", request=request)
+
+    api = HookdeckAPI("key", client=_client(handler))
+    with pytest.raises(HookdeckAPIError):
+        await api.list_events()

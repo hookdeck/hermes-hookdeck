@@ -61,31 +61,44 @@ def _pause_minutes(args: dict) -> int:
 
 
 def _schedule_resume(connection_id: str, name: str, minutes: int) -> None:
-    """Resume *connection_id* later, in a thread that outlives this tool call.
+    """Record when this pause must end.
 
-    A daemon thread rather than a task: the tool's event loop ends with the
-    call, so anything scheduled on it would never run.
+    Written to the ledger rather than held in a timer: the gateway may restart
+    while paused — that being one of the main reasons to pause — and a deadline
+    that dies with the process is not a guarantee. The adapter honours it on
+    its sweep and at boot.
     """
-
-    def _resume_later() -> None:
-        time.sleep(minutes * 60)
-        try:
-            asyncio.run(_unpause(connection_id))
-        except Exception as exc:  # noqa: BLE001 - best effort, logged only
-            logging.getLogger(__name__).error(
-                "[hookdeck] Auto-resume of %s failed: %s. Resume it with "
-                "`hermes hookdeck resume %s`.",
-                name,
-                exc,
-                name,
-            )
-
-    threading.Thread(target=_resume_later, daemon=True).start()
+    _with_ledger(
+        lambda ledger: ledger.schedule_resume(
+            connection_id, name, time.time() + minutes * 60
+        )
+    )
 
 
-async def _unpause(connection_id: str) -> None:
-    async with HookdeckAPI() as api:
-        await api.unpause_connection(connection_id)
+def _cancel_scheduled_resume(connection_id: str) -> None:
+    """Drop the deadline after a manual resume.
+
+    Otherwise a timer from an earlier short pause would unpause a later, longer
+    one before its time.
+    """
+    _with_ledger(lambda ledger: ledger.cancel_scheduled_resume(connection_id))
+
+
+def _with_ledger(action) -> None:
+    from .state import DeliveryLedger, default_state_path
+
+    path = default_state_path()
+    try:
+        ledger = DeliveryLedger(path)
+    except Exception as exc:  # noqa: BLE001 - observability, never fatal
+        logging.getLogger(__name__).error(
+            "[hookdeck] Could not open the ledger at %s: %s", path, exc
+        )
+        return
+    try:
+        action(ledger)
+    finally:
+        ledger.close()
 
 
 def _models(result: Any) -> list[dict]:
@@ -237,11 +250,11 @@ def _connection_action(args: dict, pause: bool) -> str:
                 connection_id = models[0].get("id")
             if not pause:
                 await api.unpause_connection(connection_id)
+                _cancel_scheduled_resume(connection_id)
                 return f"Resumed {name}. Held events will be delivered."
 
             await api.pause_connection(connection_id)
             minutes = _pause_minutes(args)
-            asyncio.get_running_loop()  # we are inside _run's private loop
             _schedule_resume(connection_id, name, minutes)
             return (
                 f"Paused {name}. Events are queued in Hookdeck, and it will "

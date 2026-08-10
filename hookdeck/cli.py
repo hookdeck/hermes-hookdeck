@@ -223,9 +223,14 @@ def _cmd_setup(args: argparse.Namespace) -> int:
         print("No routes configured under platforms.hookdeck.extra.routes")
         return 1
 
-    payloads = {
-        name: _payload_for_route(args, name, route) for name, route in targets.items()
-    }
+    try:
+        payloads = {
+            name: _payload_for_route(args, name, route)
+            for name, route in targets.items()
+        }
+    except ValueError as exc:
+        print(f"✗ {exc}")
+        return 2
 
     if args.dry_run:
         for payload in payloads.values():
