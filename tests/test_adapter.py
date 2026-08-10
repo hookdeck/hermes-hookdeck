@@ -660,3 +660,70 @@ async def test_cli_mode_binds_both_loopback_families(client_factory):
 async def test_push_mode_binds_only_the_configured_host(client_factory):
     adapter, _client = await client_factory({"a": {}}, mode="push", host="127.0.0.1")
     assert adapter._bind_hosts() == ["127.0.0.1"]
+
+
+# ----------------------------------------------------------------------
+# Encoding
+# ----------------------------------------------------------------------
+
+
+async def _post_raw(client, raw: bytes, event_id: str):
+    return await client.post(
+        "/hookdeck",
+        data=raw,
+        headers={
+            "content-type": "application/json",
+            "x-hookdeck-eventid": event_id,
+            "x-hookdeck-signature": compute_signature(raw, SECRET),
+        },
+    )
+
+
+async def test_a_lone_surrogate_body_is_rejected_at_the_door(client_factory):
+    # json.loads decodes with `surrogatepass`, so CESU-8 parses cleanly and
+    # renders into the prompt cleanly, then raises UnicodeEncodeError at the
+    # network boundary inside the agent run — after the ack, in a layer with no
+    # idea why. Reject it here instead.
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    response = await _post_raw(client, b'{"a": "\xed\xa0\x80"}', "evt_surrogate")
+    assert response.status == 400
+    await _settle()
+    assert seen == []
+
+
+async def test_a_utf16_body_is_rejected(client_factory):
+    # RFC 8259 §8.1 requires UTF-8 for JSON exchanged between systems, but
+    # json.loads sniffs the BOM and accepts UTF-16 happily.
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    response = await _post_raw(client, '{"a": "ok"}'.encode("utf-16"), "evt_utf16")
+    assert response.status == 400
+    await _settle()
+    assert seen == []
+
+
+async def test_valid_utf8_multibyte_content_still_works(client_factory):
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    response = await _post_raw(client, '{"a": "café 日本 🪝"}'.encode(), "evt_utf8")
+    assert response.status == 202
+    await _settle()
+    assert seen[0].raw_message["a"] == "café 日本 🪝"
+
+
+async def test_form_encoded_bodies_still_work(client_factory):
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    response = await _post_raw(client, b"kind=ping&who=bob", "evt_form")
+    assert response.status == 202
+    await _settle()
+    assert seen[0].raw_message == {"kind": "ping", "who": "bob"}

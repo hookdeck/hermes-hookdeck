@@ -37,6 +37,30 @@ parsing or logging the payload.
 Provider-specific verification stays at the edge. A plugin that reimplements
 Stripe's or Shopify's scheme has misunderstood the integration.
 
+### Decode strictly, and check what your runtime actually does
+
+RFC 8259 §8.1 requires UTF-8 for JSON exchanged between systems, so a body that
+is not valid UTF-8 is malformed by definition. Reject it at ingress with a 400.
+
+Do not assume your JSON parser does this for you — **every runtime checked so
+far gets it wrong in a different direction**, and the failure is silent in the
+worst cases:
+
+| Runtime | Behaviour |
+|---|---|
+| Node | `Buffer.toString("utf8")` never throws; it substitutes U+FFFD, so invalid bytes *inside* a string value parse successfully into corrupted text |
+| Python | raises on invalid bytes, but decodes with `surrogatepass`, so a CESU-8 lone surrogate parses and renders fine and then raises `UnicodeEncodeError` at the network boundary inside the run; also accepts UTF-16/32 by BOM sniffing |
+
+Both silent paths end with mangled or unencodable text in a prompt, long after
+the ack, in a layer that cannot explain itself. The fix is the same everywhere:
+decode the raw bytes as strict UTF-8 *before* parsing (or re-encode and compare
+against the raw body) and reject on failure. Verify your own runtime with a
+lone-surrogate and a UTF-16 fixture rather than trusting this table.
+
+Note the payload is still *authentic* in these cases — the signature is over
+the raw bytes and it verified. What the agent would see simply is not what the
+sender wrote.
+
 ## 3. Identity and deduplication
 
 `x-hookdeck-eventid` is the identity of a delivery. `x-hookdeck-attempt-count`
@@ -71,6 +95,16 @@ State per event id: `attempt`, `run_count`, `status`, `updated_at`. Statuses:
 
 Cap concurrent runs with `max_concurrent`. Over the limit, respond **503 with
 `Retry-After`** — not 429, not 200, not a local queue.
+
+**Admission control and pause are not the same tool, and must not be reached
+for interchangeably.** Admission control is per-event and automatic: Hookdeck
+holds each deferred event and spreads the redelivery itself. Pause is an
+operator action for a planned restart or a diagnosed outage. Pausing under
+transient load looks like backpressure and is not — it defers the whole problem,
+and unpause then delivers the accumulated backlog in one burst into the same
+overload that caused it. Nothing in the request pipeline should pause
+automatically; a pause tool exposed to an agent wants a bounded auto-resume for
+the same reason.
 
 Two rules follow, and both have bitten implementations that got them wrong:
 
@@ -223,6 +257,12 @@ mode is severe and silent: one over-strict validator discards live traffic,
 unrecoverable once retention lapses. So: never cancel anything a config change
 could fix, record every cancellation where `status` will surface it, and ship it
 off by default. Measure how often it *would* have fired before enabling.
+
+Gate the reasons behind an explicit allowlist once there is more than one of
+them, so "which code paths can discard production traffic" is answerable by
+reading one file rather than grepping. With a single trigger the allowlist is
+ceremony and a plain flag is clearer — this is a difference in how much surface
+each host has to police, not a difference in the rule.
 
 **Last-attempt detection.** An absent or empty `x-hookdeck-will-retry-after`
 means this is the final automatic attempt — the cleanest dead-letter trigger

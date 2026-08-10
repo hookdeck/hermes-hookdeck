@@ -547,16 +547,33 @@ class HookdeckAdapter(WebhookAdapter):
                 {"status": "ignored", "reason": "route disabled", "route": route_name}
             )
 
+        # Decode strictly before parsing, rather than letting json.loads sniff
+        # the encoding. RFC 8259 §8.1 requires UTF-8 for JSON exchanged between
+        # systems, and json.loads is more permissive than that in two ways that
+        # both end badly:
+        #
+        #   * it decodes with `surrogatepass`, so a CESU-8 lone surrogate parses
+        #     cleanly, renders into the prompt cleanly, and then raises
+        #     UnicodeEncodeError at the network boundary inside the agent run —
+        #     long after the event was acked, in a layer with no idea why
+        #   * it accepts UTF-16/32 via BOM sniffing
+        #
+        # A strict decode collapses both into one honest rejection here. (Other
+        # runtimes get this wrong differently: Node's Buffer.toString("utf8")
+        # never throws and substitutes U+FFFD, silently corrupting payload text
+        # rather than failing.)
         try:
-            # Not just JSONDecodeError: json.loads sniffs the encoding and
-            # raises UnicodeDecodeError on a non-UTF-8 body, which would
-            # otherwise escape as a 500 and be retried 50 times.
-            payload = json.loads(raw_body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            body_text = raw_body.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._unparseable_response(event_id)
+
+        try:
+            payload = json.loads(body_text)
+        except json.JSONDecodeError:
             try:
                 import urllib.parse
 
-                payload = dict(urllib.parse.parse_qsl(raw_body.decode("utf-8")))
+                payload = dict(urllib.parse.parse_qsl(body_text))
             except Exception:
                 return self._unparseable_response(event_id)
 
