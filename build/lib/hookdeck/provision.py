@@ -1,0 +1,357 @@
+"""Building and applying Hookdeck configuration for a Hermes route.
+
+``build_connection_payload`` is a pure function so the shape of what gets sent
+to Hookdeck can be tested without a network. Everything else is a thin
+coroutine over :class:`~hookdeck.api.HookdeckAPI`.
+
+The rules attached to the connection are where most of the reliability lives:
+
+* ``retry`` — exponential backoff, so a Hermes restart is survivable
+* ``deduplicate`` — a provider that double-fires within the window costs one
+  agent run, not two
+* ``filter`` — drops uninteresting events before they reach an LLM, which is
+  the one setting here with a directly measurable token cost saving
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping, Optional
+
+from .constants import RETRYABLE_STATUSES
+
+# Comfortably more than DEFAULT_DEFER_ATTEMPT_LIMIT: the first few attempts of
+# a deferred event carry a short Retry-After, and these are the attempts left
+# for exponential backoff to spread once saturation proves persistent.
+DEFAULT_RETRY_COUNT = 10
+DEFAULT_RETRY_INTERVAL_MS = 30_000
+DEFAULT_DEDUPE_WINDOW_MS = 60_000
+DEFAULT_GROUP_RATE = 1
+DEFAULT_GROUP_RATE_PERIOD = "minute"
+
+# `auth_type` never travels alone: the API rejects a destination config with
+# `destination.config.auth is required` if it does, even for HOOKDECK_SIGNATURE
+# whose auth object is empty. The OpenAPI schema does not mark it required, so
+# this is only discoverable by making the call.
+HOOKDECK_SIGNATURE_AUTH = {"auth_type": "HOOKDECK_SIGNATURE", "auth": {}}
+
+# Hookdeck source types whose event name arrives in a header rather than the
+# body. Used to turn a route's ``events`` list into a gateway-side filter.
+_EVENT_HEADER_BY_TYPE = {
+    "GITHUB": "x-github-event",
+    "GITLAB": "x-gitlab-event",
+    "SHOPIFY": "x-shopify-topic",
+}
+
+
+# Destination-level rate limiting accepts `concurrent`; delivery groups do not.
+# DeliveryGroupRateLimitPeriod is second|minute|hour, so per-group *concurrency*
+# — one in-flight run per customer — is not expressible. Groups throttle by
+# rate only. Sending `concurrent` inside delivery_groups is rejected by the API.
+DESTINATION_RATE_PERIODS = ("second", "minute", "hour", "concurrent")
+GROUP_RATE_PERIODS = ("second", "minute", "hour")
+
+
+def _http_destination_config(
+    url: str,
+    *,
+    rate_limit: Optional[int],
+    rate_limit_period: str,
+    delivery_group_key: str,
+    group_rate: int,
+    group_rate_period: str,
+) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "url": url,
+        # See the CLI branch: stop Hookdeck appending the provider's path.
+        "path_forwarding_disabled": True,
+        # Hookdeck signs its delivery so the adapter has exactly one signature
+        # scheme to verify, whatever the upstream provider used.
+        **HOOKDECK_SIGNATURE_AUTH,
+    }
+    if rate_limit:
+        if rate_limit_period not in DESTINATION_RATE_PERIODS:
+            raise ValueError(
+                f"rate_limit_period must be one of {DESTINATION_RATE_PERIODS}"
+            )
+        config["rate_limit"] = rate_limit
+        config["rate_limit_period"] = rate_limit_period
+    if delivery_group_key:
+        if group_rate_period not in GROUP_RATE_PERIODS:
+            raise ValueError(
+                "delivery groups do not support "
+                f"rate_limit_period={group_rate_period!r}; Hookdeck allows "
+                f"{GROUP_RATE_PERIODS}. Cap total concurrency with the "
+                "destination-level rate_limit instead."
+            )
+        config["delivery_groups"] = {
+            "key": delivery_group_key,
+            "rate_limit": group_rate,
+            "rate_limit_period": group_rate_period,
+        }
+    return config
+
+
+def build_connection_payload(
+    *,
+    name: str,
+    source_name: str,
+    source_type: str = "WEBHOOK",
+    destination_name: str = "",
+    mode: str = "cli",
+    path: str = "/hookdeck",
+    url: str = "",
+    events: Optional[list[str]] = None,
+    event_path: str = "",
+    rate_limit: Optional[int] = None,
+    rate_limit_period: str = "concurrent",
+    delivery_group_key: str = "",
+    group_rate: int = DEFAULT_GROUP_RATE,
+    group_rate_period: str = DEFAULT_GROUP_RATE_PERIOD,
+    retry_count: int = DEFAULT_RETRY_COUNT,
+    retry_interval_ms: int = DEFAULT_RETRY_INTERVAL_MS,
+    dedupe_window_ms: Optional[int] = DEFAULT_DEDUPE_WINDOW_MS,
+    source_secret: str = "",
+) -> dict[str, Any]:
+    """Assemble the ``PUT /connections`` body for one Hermes route.
+
+    Upsert-by-name is what makes ``hermes hookdeck setup`` safe to re-run: the
+    same route always maps to the same connection.
+    """
+    source_type = (source_type or "WEBHOOK").upper()
+    return {
+        "name": name,
+        "source": _source_spec(source_name, source_type, source_secret),
+        "destination": _destination_spec(
+            destination_name or f"hermes-{name}",
+            mode=mode,
+            path=path,
+            url=url,
+            rate_limit=rate_limit,
+            rate_limit_period=rate_limit_period,
+            delivery_group_key=delivery_group_key,
+            group_rate=group_rate,
+            group_rate_period=group_rate_period,
+        ),
+        "rules": _rules(
+            events=events or [],
+            source_type=source_type,
+            event_path=event_path,
+            retry_count=retry_count,
+            retry_interval_ms=retry_interval_ms,
+            dedupe_window_ms=dedupe_window_ms,
+        ),
+    }
+
+
+def _source_spec(name: str, source_type: str, secret: str) -> dict[str, Any]:
+    """The inline source. Named platform types carry their own verification."""
+    source: dict[str, Any] = {"name": name, "type": source_type}
+    if secret and source_type in {"WEBHOOK", "HTTP"}:
+        # Only the generic types take a caller-supplied HMAC config. Inventing
+        # one for a named platform would produce a source that rejects the very
+        # traffic it exists to accept.
+        source["config"] = {
+            "auth_type": "HMAC",
+            "auth": {
+                "algorithm": "sha256",
+                "encoding": "hex",
+                "header_key": "x-signature",
+                "webhook_secret_key": secret,
+            },
+        }
+    return source
+
+
+def _destination_spec(
+    name: str,
+    *,
+    mode: str,
+    path: str,
+    url: str,
+    rate_limit: Optional[int],
+    rate_limit_period: str,
+    delivery_group_key: str,
+    group_rate: int,
+    group_rate_period: str,
+) -> dict[str, Any]:
+    """The inline destination: a CLI tunnel target, or a reachable URL."""
+    if mode == "cli":
+        if rate_limit or delivery_group_key:
+            # CLI destinations have no rate_limit field at all, so accepting
+            # these silently would promise throttling that never happens.
+            raise ValueError(
+                "cli mode cannot throttle: Hookdeck CLI destinations have no "
+                "rate limit or delivery groups. Use mode: push for those, or "
+                "cap runs with platforms.hookdeck.extra.max_concurrent."
+            )
+        return {
+            "name": name,
+            "type": "CLI",
+            "config": {
+                "path": path,
+                # Hookdeck otherwise appends the source request's own path to
+                # this one, so a provider POSTing to <source-url>/events would
+                # arrive at <path>/events. The adapter tolerates that; a fixed
+                # path is still what we want.
+                "path_forwarding_disabled": True,
+                **HOOKDECK_SIGNATURE_AUTH,
+            },
+        }
+    if not url:
+        raise ValueError("push mode needs a destination URL")
+    return {
+        "name": name,
+        "type": "HTTP",
+        "config": _http_destination_config(
+            url,
+            rate_limit=rate_limit,
+            rate_limit_period=rate_limit_period,
+            delivery_group_key=delivery_group_key,
+            group_rate=group_rate,
+            group_rate_period=group_rate_period,
+        ),
+    }
+
+
+def _rules(
+    *,
+    events: list[str],
+    source_type: str,
+    event_path: str,
+    retry_count: int,
+    retry_interval_ms: int,
+    dedupe_window_ms: Optional[int],
+) -> list[dict[str, Any]]:
+    """Connection rules — where most of the reliability actually lives."""
+    rules: list[dict[str, Any]] = [
+        {
+            "type": "retry",
+            "strategy": "exponential",
+            "count": retry_count,
+            "interval": retry_interval_ms,
+            "response_status_codes": retryable_status_codes(),
+        }
+    ]
+    if dedupe_window_ms:
+        rules.append({"type": "deduplicate", "window": dedupe_window_ms})
+
+    event_filter = build_event_filter(events, source_type, event_path)
+    if event_filter:
+        rules.append(event_filter)
+    return rules
+
+
+def build_event_filter(
+    events: list[str], source_type: str, event_path: str
+) -> Optional[dict[str, Any]]:
+    """Turn a route's ``events`` list into a Hookdeck filter rule.
+
+    Returns ``None`` when the event name's location is unknown — a wrong filter
+    silently discards traffic, so the adapter's own ``events`` check is left to
+    do the work instead. Set ``event_path`` on the route to enable gateway-side
+    filtering for providers that carry the type in the body.
+    """
+    if not events:
+        return None
+    if event_path:
+        node: Any = {"$in": list(events)}
+        for part in reversed(event_path.split(".")):
+            node = {part: node}
+        return {"type": "filter", "body": node}
+    header = _EVENT_HEADER_BY_TYPE.get(source_type.upper())
+    if header:
+        return {"type": "filter", "headers": {header: {"$in": list(events)}}}
+    return None
+
+
+# Re-exported from the single declaration in constants, which also gates what
+# the adapter is allowed to emit. Do not redefine it here.
+ADAPTER_RETRYABLE_STATUSES = RETRYABLE_STATUSES
+
+
+def retryable_status_codes() -> list[str]:
+    """The connection's ``response_status_codes``, derived from what we emit.
+
+    Never hand-written: the list and the emitting code drifting apart is the
+    defect this is built to make impossible. 5xx collapses to a range so a
+    transient failure from something in front of the adapter — a proxy, the
+    CLI reporting a refused local connection as 500 — is retried too, and the
+    extra transient 4xx are ones we never emit but might receive.
+    """
+    codes = [str(s) for s in RETRYABLE_STATUSES if s < 500]
+    codes += ["408", "429"]  # transient, and emitted by proxies rather than us
+    codes.append("500-599")
+    ordered = sorted(set(codes), key=lambda c: (c.endswith("599"), c))
+    missing = uncovered_statuses(ordered)
+    if missing:  # pragma: no cover - unreachable while the derivation is honest
+        raise AssertionError(
+            f"derived retry codes miss emitted statuses: {missing}"
+        )
+    return ordered
+
+
+def _code_expression_matches(expression: str, status: int) -> Optional[bool]:
+    """Evaluate one Hookdeck retry-rule code expression against *status*.
+
+    Returns True/False for a positive match, or None when the expression is an
+    exclusion that does not apply. Exclusions (``!401``) return False when they
+    do apply, so a caller folding results with ``any`` needs the exclusions
+    checked first — which :func:`uncovered_statuses` does.
+    """
+    expression = str(expression).strip()
+    if expression.startswith("!"):
+        return False if expression[1:] == str(status) else None
+    if "-" in expression:
+        low, _, high = expression.partition("-")
+        return int(low) <= status <= int(high)
+    for operator in (">=", "<=", ">", "<", "="):
+        if expression.startswith(operator):
+            bound = int(expression[len(operator) :])
+            return {
+                ">=": status >= bound,
+                "<=": status <= bound,
+                ">": status > bound,
+                "<": status < bound,
+                "=": status == bound,
+            }[operator]
+    return status == int(expression)
+
+
+def uncovered_statuses(
+    codes: Optional[list[str]], statuses: tuple[int, ...] = ADAPTER_RETRYABLE_STATUSES
+) -> list[int]:
+    """Which of *statuses* a retry rule's ``response_status_codes`` misses.
+
+    An empty or absent list means Hookdeck's default — retry any non-2xx — so
+    nothing is uncovered.
+    """
+    if not codes:
+        return []
+    missing = []
+    for status in statuses:
+        excluded = any(str(c).strip() == f"!{status}" for c in codes)
+        matched = any(_code_expression_matches(c, status) is True for c in codes)
+        if excluded or not matched:
+            missing.append(status)
+    return missing
+
+
+def routes_from_config(config: Mapping[str, Any]) -> dict[str, dict]:
+    """Extract ``platforms.hookdeck.extra.routes`` from a parsed config.yaml."""
+    gateway = config.get("gateway") or {}
+    platforms = gateway.get("platforms") or config.get("platforms") or {}
+    hookdeck = platforms.get("hookdeck") or {}
+    extra = hookdeck.get("extra") or {}
+    return dict(extra.get("routes") or {})
+
+
+def summarise_payload(payload: Mapping[str, Any]) -> str:
+    """One-line human summary of what a setup call is about to create."""
+    source = payload.get("source") or {}
+    destination = payload.get("destination") or {}
+    rules = [r.get("type") for r in payload.get("rules") or []]
+    return (
+        f"{payload.get('name')}: {source.get('type')} source '{source.get('name')}' "
+        f"-> {destination.get('type')} destination '{destination.get('name')}' "
+        f"[rules: {', '.join(str(r) for r in rules) or 'none'}]"
+    )

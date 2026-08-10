@@ -1,0 +1,54 @@
+name: hookdeck
+label: Hookdeck
+kind: platform
+version: 0.1.0
+description: >
+  Hookdeck event gateway adapter for Hermes Agent. Hookdeck sits in front of the
+  agent as a durable, verified inbox: it verifies provider signatures for ~140
+  source types, queues events while the gateway is down, throttles delivery so a
+  burst cannot outrun a slow agent run, and retries failures.
+
+  The adapter receives events either through the Hookdeck CLI (no public URL, no
+  ngrok — the right choice for a laptop or homelab install) or by direct HTTP
+  push to a reachable gateway. Every delivery carries a Hookdeck event id, which
+  the adapter uses for restart-safe deduplication, and every agent run reports
+  its true outcome back — a failed run is handed to Hookdeck for redelivery
+  rather than being silently dropped after the 202.
+author: Hookdeck
+homepage: https://github.com/hookdeck/hermes-hookdeck
+
+requires_env:
+  - name: HOOKDECK_API_KEY
+    description: "Hookdeck project API key (Project Settings → Secrets)"
+    prompt: "Hookdeck API key"
+    password: true
+  - name: HOOKDECK_WEBHOOK_SECRET
+    description: "Hookdeck signing secret, used to verify x-hookdeck-signature"
+    prompt: "Hookdeck signing secret"
+    password: true
+
+optional_env:
+  - name: HOOKDECK_MODE
+    description: "Ingestion transport: cli (Hookdeck CLI tunnel) or push (public HTTP). Default: cli"
+    prompt: "Ingestion mode (cli/push)"
+    password: false
+  - name: HOOKDECK_PORT
+    description: "Port the adapter listens on (default 3579)"
+    prompt: "Listen port"
+    password: false
+  - name: HOOKDECK_PATH
+    description: "Base path the adapter serves (default /hookdeck)"
+    prompt: "Base path"
+    password: false
+  - name: HOOKDECK_SOURCE
+    description: "Hookdeck source to forward in cli mode. Required unless every route sets its own `source`."
+    prompt: "Hookdeck source name"
+    password: false
+  - name: HOOKDECK_ALLOWED_USERS
+    description: "Allowlist, only consulted for INSECURE_NO_AUTH routes. Entries are the sender ids the adapter reports: hookdeck:<route>."
+    prompt: "Allowed route names"
+    password: false
+  - name: HOOKDECK_ALLOW_ALL_USERS
+    description: "Allow every configured route to trigger the agent (true/false)"
+    prompt: "Allow all routes? (true/false)"
+    password: false

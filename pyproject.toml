@@ -12,6 +12,12 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+# Makes `pip install hermes-hookdeck` a working install: Hermes scans this
+# group and calls `register(ctx)` on whatever the value imports to. Without it
+# a pip-installed copy sits on disk and is never discovered.
+[project.entry-points."hermes_agent.plugins"]
+hookdeck = "hookdeck"
+
 [project.optional-dependencies]
 # fastapi is provided by the Hermes web server at runtime, not by this
 # plugin — it is a dev dependency only, so the dashboard routes can be

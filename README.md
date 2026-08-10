@@ -30,12 +30,34 @@ failed run has already been acknowledged, and nothing remembers it happened.
 ## Install
 
 ```bash
-git clone https://github.com/hookdeck/hermes-hookdeck ~/.hermes/plugins/hermes-hookdeck
+hermes plugins install hookdeck/hermes-hookdeck
 ```
+
+Hermes clones it into `~/.hermes/plugins/`, prompts for the two secrets below,
+and installs it disabled. Then:
 
 ```bash
 hermes plugins enable hookdeck
 ```
+
+<details>
+<summary>Other ways in</summary>
+
+**pip**, for a declarative or containerised setup — the package declares a
+`hermes_agent.plugins` entry point, so Hermes discovers it wherever it is
+installed, with no plugin directory involved:
+
+```bash
+pip install hermes-hookdeck && hermes plugins enable hookdeck
+```
+
+**Git clone**, if you want to hack on it — the plugin lives in a subdirectory,
+which Hermes' category layout handles:
+
+```bash
+git clone https://github.com/hookdeck/hermes-hookdeck ~/.hermes/plugins/hermes-hookdeck
+```
+</details>
 
 Set two secrets, both from your Hookdeck project settings:
 
