@@ -1,0 +1,199 @@
+# hermes-hookdeck
+
+A Hookdeck platform plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+It puts a durable, verified queue in front of the agent, so a webhook can
+trigger an agent run without the usual ways that goes wrong.
+
+Hermes already has a good webhook trigger: a POST arrives, a route matches, a
+prompt template renders, the agent runs, the response gets delivered. This
+plugin keeps all of that and replaces the ingest half, because an agent run is
+an awkward thing to hang off a webhook. It takes seconds to minutes, it costs
+money every time it happens, and it should not happen twice for the same event.
+
+## What changes
+
+| | Built-in `webhook` platform | With `hookdeck` |
+|---|---|---|
+| Signature verification | GitHub, GitLab, generic HMAC | ~140 provider schemes verified by Hookdeck at the edge; the adapter verifies one |
+| Ingress | Public HTTP listener | Hookdeck CLI (no public URL) or HTTP push |
+| Gateway offline | POST is lost | Events queue in Hookdeck and drain on reconnect |
+| Burst | 30/min per route, excess dropped | Queued and throttled; over the limit gets 503 + `Retry-After` |
+| Duplicate delivery | In-memory 1h cache, lost on restart | SQLite ledger keyed on the Hookdeck event id |
+| Run fails | 202 was already sent; the event is gone | Handed back to Hookdeck for redelivery |
+| Replay | — | Per-event and bulk replay, from the CLI or by the agent itself |
+
+The last two rows are the ones that matter most. The built-in adapter answers
+202 as soon as it dispatches, which is the right thing to do — but it means a
+failed run has already been acknowledged, and nothing remembers it happened.
+
+## Install
+
+```bash
+git clone https://github.com/hookdeck/hermes-hookdeck ~/.hermes/plugins/hermes-hookdeck
+```
+
+```bash
+hermes plugins enable hookdeck
+```
+
+Set two secrets, both from your Hookdeck project settings:
+
+```bash
+export HOOKDECK_API_KEY=...        # Project Settings → Secrets
+export HOOKDECK_WEBHOOK_SECRET=... # the signing secret
+```
+
+## Quickstart — CLI mode (no public URL)
+
+The default. The Hookdeck CLI holds an outbound connection and forwards events
+to a loopback listener, so a laptop or a homelab box behind NAT works without
+ngrok or a VPS. Unlike a plain tunnel, events that arrive while the machine is
+asleep are queued and delivered when it comes back.
+
+Install the [Hookdeck CLI](https://hookdeck.com/docs/cli), add a route to
+`~/.hermes/config.yaml` (see [`examples/config.yaml`](examples/config.yaml)),
+then:
+
+```bash
+hermes hookdeck setup github-prs --source github --source-type GITHUB
+```
+
+That creates a source with GitHub's verification already configured, a CLI
+destination, and a connection carrying exponential retries and a dedup window.
+
+Start the gateway and the adapter launches `hookdeck listen` for you — one
+process per route, since the CLI forwards a single source each, given
+`--path /hookdeck/<route>` so the adapter resolves the route from the path.
+Every route therefore needs a `source`, or a shared
+`platforms.hookdeck.extra.source`.
+
+Point GitHub at the source URL Hookdeck gives you and open a pull request.
+
+`hookdeck listen` creates the source itself if it does not exist, so it will
+work without `setup` — but you get a bare connection with none of the retry,
+dedup or filter rules, which is most of the point.
+
+## Quickstart — push mode
+
+For a gateway with a reachable URL. Push mode unlocks the settings CLI
+destinations do not support: delivery rate limits, delivery groups, issue
+triggers and alerting.
+
+Set `mode: push` and `public_url` in the config, then:
+
+```bash
+hermes hookdeck setup --all --mode push --rate-limit 2 --rate-limit-period concurrent
+```
+
+## How the reliability works
+
+**One verifier.** Hookdeck verifies Stripe's signature, Shopify's HMAC,
+Twilio's, and so on, then signs its own delivery with
+`base64(HMAC-SHA256(body, secret))` in `x-hookdeck-signature`. The adapter
+checks that one scheme, in constant time, before touching the payload.
+`x-hookdeck-signature-2` is also accepted so a secret roll does not drop live
+traffic.
+
+**Dedup that survives a restart.** Every delivery carries an event id and an
+attempt number. The ledger at `~/.hermes/hookdeck/state.db` admits a delivery
+when its attempt number is higher than the highest already seen for that event,
+and rejects it otherwise. Genuine duplicates repeat an attempt number; real
+retries increment it — which is what lets dedup and retry coexist instead of
+cancelling each other out.
+
+**Backpressure instead of dropping.** `max_concurrent` caps agent runs in
+flight. An event that arrives over the limit gets 503 and a `Retry-After`, so
+Hookdeck keeps it queued and comes back. Nothing is recorded in the ledger for
+a deferred event, so the redelivery is not mistaken for a duplicate. In push
+mode you can push the same limit down into Hookdeck with `--rate-limit N
+--rate-limit-period concurrent`, and `delivery_group_key` goes further: one
+in-flight run per repository, customer or conversation, so two runs never
+interleave on the same subject.
+
+**Outcomes reported, not assumed.** `ack_mode` decides how:
+
+- `async_retry` (default) — ack 202 immediately, run the agent in the
+  background, and call `POST /events/{id}/retry` if the run fails. Retry state
+  lives in Hookdeck, so it survives a gateway restart. Stops after
+  `max_agent_retries` and marks the event exhausted rather than looping.
+- `sync` — hold the HTTP response until the run finishes, bounded by
+  `sync_timeout_seconds`, so the event's status in Hookdeck is the agent's real
+  outcome and Hookdeck's own retry rules apply. A run that outlasts the timeout
+  degrades to 202; answering 5xx there would redeliver work still in progress.
+
+## Operator commands
+
+```bash
+hermes hookdeck setup <route> [--all] [--dry-run]   # create/update connections
+hermes hookdeck status                              # queue depth, failures, issues
+hermes hookdeck pause <connection>                  # hold events server-side
+hermes hookdeck resume <connection>                 # drain them
+hermes hookdeck replay <event_id> | --failed        # redeliver
+hermes hookdeck doctor                              # check the whole setup
+```
+
+`pause` before an upgrade and `resume` afterwards is a zero-loss restart:
+events accumulate in Hookdeck rather than hitting a dead port.
+
+## Agent tools
+
+The `hookdeck` toolset lets the agent inspect and repair its own inbox —
+`hookdeck_queue_status`, `hookdeck_list_failed_events`,
+`hookdeck_get_event_body`, `hookdeck_retry_event`, `hookdeck_bulk_retry`,
+`hookdeck_pause_connection`, `hookdeck_resume_connection`.
+
+The bundled `triage-webhook-failures` skill drives them: group failures by
+error code, retry what a retry will actually fix, and report the rest instead of
+retrying hopefully.
+
+## Trust boundary
+
+A valid signature proves Hookdeck sent the request. It says nothing about the
+contents. PR titles, commit messages, issue bodies and customer names are
+written by third parties, and they end up in the prompt.
+
+Hermes' own guidance applies and is worth following: run webhook-triggered
+routes against a sandboxed terminal backend (Docker or SSH), scope the toolset
+on those routes, require approval for destructive tools, and prefer a specific
+prompt template over dumping `{__raw__}`. The adapter sets a platform hint
+telling the model that payload text is data, never instructions addressed to it.
+
+For local testing only, `secret: INSECURE_NO_AUTH` skips verification. It is
+refused unless the listener is bound to loopback.
+
+## Limitations
+
+- CLI destinations do not support delivery rate limits or issue triggers — a
+  Hookdeck restriction, not a plugin one. `max_concurrent` still applies, since
+  it is enforced adapter-side. Use push mode if you need gateway-side throttling
+  or alerting.
+- CLI mode runs one `hookdeck listen` process per route. That is fine for a
+  handful; a gateway with dozens of routes wants push mode.
+- `setup` only pushes an `events` filter down into Hookdeck when it knows where
+  the event name lives: a header for GitHub, GitLab and Shopify, or a body path
+  you set with `event_path`. Otherwise the filter stays adapter-side, because a
+  wrong filter discards traffic silently.
+- Named source types (`STRIPE`, `SHOPIFY`, …) still need the provider's own
+  signing secret entered on the source in the Hookdeck dashboard. `setup`
+  creates the source with the right verification shape but cannot invent the
+  secret.
+- The plugin does not poll. If you cannot run the CLI and cannot expose a URL,
+  it will not help you.
+
+## Development
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+```
+
+```bash
+.venv/bin/python -m pytest
+```
+
+The tests stub the Hermes internals the adapter imports (`tests/hermes_stub.py`)
+so the ingest path — verification, dedup, admission control, ack modes, outcome
+reporting — is exercised without a Hermes checkout.
+
+## License
+
+MIT.

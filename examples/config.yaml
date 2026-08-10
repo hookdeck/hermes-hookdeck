@@ -1,0 +1,76 @@
+# Example Hermes config for the Hookdeck platform.
+# Merge the `gateway.platforms.hookdeck` block into your ~/.hermes/config.yaml.
+
+gateway:
+  platforms:
+    hookdeck:
+      enabled: true
+      extra:
+        # cli  — the Hookdeck CLI holds the connection; no public URL needed.
+        # push — Hookdeck delivers over the internet to `public_url`.
+        mode: cli
+        port: 3579
+        path: /hookdeck
+
+        # Only needed in push mode; `hermes hookdeck setup` builds each
+        # destination URL from it.
+        # public_url: https://agent.example.com
+
+        # Verified against x-hookdeck-signature. Prefer the env var.
+        # secret: ${HOOKDECK_WEBHOOK_SECRET}
+
+        # async_retry — ack 202 now, ask Hookdeck to redeliver if the run fails.
+        # sync        — hold the response until the run finishes (or times out).
+        ack_mode: async_retry
+
+        # Agent runs allowed in parallel. Events that arrive over the limit get
+        # 503 + Retry-After and stay queued in Hookdeck.
+        max_concurrent: 2
+        max_agent_retries: 3
+        retry_after_seconds: 30
+
+        # Each route needs a `source` in cli mode — the adapter runs one
+        # `hookdeck listen` per route. A single shared source can be set here
+        # instead and left off the routes.
+        # source: github
+
+        routes:
+          # A GitHub PR reviewer. `source` is the Hookdeck source name.
+          github-prs:
+            source: github
+            source_type: GITHUB
+            events: [pull_request]
+            prompt: |
+              Review pull request #{pull_request.number} in {repository.full_name}:
+              "{pull_request.title}"
+
+              {pull_request.body}
+            deliver: github_comment
+            deliver_extra:
+              repo: "{repository.full_name}"
+              pr_number: "{pull_request.number}"
+            # Serialise runs per repository so two reviews never interleave.
+            delivery_group_key: body.repository.full_name
+
+          # A Stripe dispute handler. Stripe puts the event name in the body, so
+          # event_path lets `setup` push the filter down into Hookdeck and stop
+          # irrelevant events before they cost tokens.
+          stripe-disputes:
+            source: stripe
+            source_type: STRIPE
+            event_path: type
+            events: [charge.dispute.created]
+            prompt: |
+              A dispute was opened on charge {data.object.charge} for
+              {data.object.amount} {data.object.currency}. Summarise the
+              customer's history and draft a response.
+            deliver: slack
+
+          # No agent, no tokens: render the template and push it straight to a
+          # channel. Same verification, dedup and queueing as an agent route.
+          deploy-notifications:
+            source: vercel
+            source_type: VERCEL
+            deliver_only: true
+            deliver: telegram
+            prompt: "Deployment {deployment.state} for {deployment.name}"
