@@ -15,31 +15,62 @@ Two shapes of state are on show, and they answer different questions:
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import os
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
-# The plugin package sits two levels up (``hookdeck/dashboard/plugin_api.py``)
-# and the web server imports this file by path, not as part of the package, so
-# it is not importable by name without help.
-_PLUGIN_ROOT = Path(__file__).resolve().parents[2]
-if str(_PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PLUGIN_ROOT))
+# The web server imports this file by path rather than as part of its package,
+# so the sibling modules are not importable by name without help.
+#
+# The obvious help — inserting the repo root on sys.path — is wrong, and badly:
+# this runs inside the host's web-server process, the repo root also holds
+# `tests/` and `examples/`, and Hermes has its own top-level `tests` package.
+# Prepending would shadow it process-wide. A plugin has no business rearranging
+# the host's import path.
+#
+# So the package is loaded from its own directory under its own name, touching
+# nothing else. If the process already imported it (the gateway does), that one
+# is reused.
+_PKG_DIR = Path(__file__).resolve().parents[1]
+
+
+def _load_plugin_package():
+    if "hookdeck" in sys.modules:
+        return sys.modules["hookdeck"]
+    spec = importlib.util.spec_from_file_location(
+        "hookdeck",
+        _PKG_DIR / "__init__.py",
+        submodule_search_locations=[str(_PKG_DIR)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    # Registered before exec so the package's own relative imports resolve.
+    sys.modules["hookdeck"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_load_plugin_package()
 
 from hookdeck.api import HookdeckAPI, HookdeckAPIError  # noqa: E402
 from hookdeck.cli import _load_hermes_config  # noqa: E402
 from hookdeck.provision import routes_from_config  # noqa: E402
-from hookdeck.state import DeliveryLedger  # noqa: E402
+from hookdeck.state import DeliveryLedger, default_state_path  # noqa: E402
 
 router = APIRouter()
 
 
 def _ledger_path() -> Path:
-    home = os.getenv("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
-    return Path(home) / "hookdeck" / "state.db"
+    """Honour an explicit state_path in config, else the shared default."""
+    extra = ((_load_hermes_config().get("gateway") or {}).get("platforms") or {}).get(
+        "hookdeck"
+    ) or {}
+    configured = (extra.get("extra") or {}).get("state_path")
+    return Path(configured) if configured else default_state_path()
 
 
 def _models(result: Any) -> list[dict]:
@@ -64,8 +95,14 @@ async def overview() -> dict:
 
     if hookdeck["configured"]:
         async with HookdeckAPI() as api:
-            hookdeck["queue_depth"] = await _call(api.queue_depth)
-            failed = await _call(api.list_events, status="FAILED", limit=25)
+            # Four independent reads: gather rather than serialise, so the tab
+            # costs one round trip's latency instead of four.
+            depth_raw, failed, issues, connections = await asyncio.gather(
+                _call(api.queue_depth),
+                _call(api.list_events, status="FAILED", limit=25),
+                _call(api.list_issues, status="OPENED", limit=25),
+                _call(api.list_connections, limit=100),
+            )
             hookdeck["failed"] = [
                 {
                     "id": e.get("id"),
@@ -76,7 +113,6 @@ async def overview() -> dict:
                 }
                 for e in _models(failed)
             ]
-            issues = await _call(api.list_issues, status="OPENED", limit=25)
             hookdeck["issues"] = [
                 {
                     "id": i.get("id"),
@@ -85,7 +121,6 @@ async def overview() -> dict:
                 }
                 for i in _models(issues)
             ]
-            connections = await _call(api.list_connections, limit=100)
             # Only this gateway's connections get pause/resume controls. A
             # project's other connections are someone else's production
             # traffic, and a tab that puts a Pause button next to all of them
@@ -105,17 +140,21 @@ async def overview() -> dict:
                 hookdeck["connections"]
             )
 
-            # Flatten the metrics the tab actually shows. queue-depth returns a
+            # Flatten the one metric worth showing. queue-depth returns a
             # bucketed series wrapped in metadata; rendering that raw is a JSON
             # dump, not an answer.
+            #
+            # `max_age` is deliberately not surfaced. Its unit is undocumented
+            # — neither the OpenAPI spec nor the metrics docs say whether it is
+            # seconds, minutes or hours — and it did not move over two minutes
+            # of observation, so it is a window maximum rather than a live age
+            # and cannot be inferred from a delta either. A number whose
+            # meaning cannot be stated is worse on a dashboard than no number.
             metrics = {}
-            rows = (hookdeck.get("queue_depth") or {}).get("data") or []
+            rows = (depth_raw or {}).get("data") or []
             if rows:
                 metrics = rows[0].get("metrics") or {}
-            hookdeck["depth"] = {
-                "max_depth": metrics.get("max_depth"),
-                "max_age_minutes": metrics.get("max_age"),
-            }
+            hookdeck["depth"] = {"max_depth": metrics.get("max_depth")}
 
     local: dict[str, Any] = {"path": str(_ledger_path()), "exists": _ledger_path().exists()}
     if local["exists"]:
@@ -161,10 +200,3 @@ async def resume(connection_id: str) -> dict:
     async with HookdeckAPI() as api:
         await _call(api.unpause_connection, connection_id)
     return {"status": "resumed", "connection_id": connection_id}
-
-
-@router.get("/events/{event_id}/body")
-async def event_body(event_id: str) -> dict:
-    async with HookdeckAPI() as api:
-        body: Optional[Any] = await _call(api.get_event_raw_body, event_id)
-    return {"event_id": event_id, "body": body}

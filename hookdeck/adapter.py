@@ -74,7 +74,7 @@ from .constants import (
     WILL_RETRY_AFTER,
     header_name,
 )
-from .state import DeliveryLedger
+from .state import DeliveryLedger, default_state_path
 from .tunnel import HookdeckCLIMissing, HookdeckTunnel
 from .verify import verify_signature
 
@@ -85,11 +85,6 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 def _is_loopback(host: Optional[str]) -> bool:
     return bool(host) and host in _LOOPBACK_HOSTS
-
-
-def _default_state_path() -> Path:
-    home = os.getenv("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
-    return Path(home) / "hookdeck" / "state.db"
 
 
 def _has_lone_surrogates(payload: Any) -> bool:
@@ -214,7 +209,7 @@ class HookdeckAdapter(WebhookAdapter):
         # a gateway should have.
         self._cli_login = bool(extra.get("cli_login", False))
         self._state_path = Path(
-            extra.get("state_path") or _default_state_path()
+            extra.get("state_path") or default_state_path()
         ).expanduser()
 
         self._ledger: Optional[DeliveryLedger] = None

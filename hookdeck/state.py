@@ -17,6 +17,7 @@ it.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -31,6 +32,18 @@ STATUS_FAILED = "failed"
 STATUS_EXHAUSTED = "exhausted"
 # Retries were cancelled with Retry-After: -1 rather than left to expire.
 STATUS_CANCELLED = "cancelled"
+
+def default_state_path() -> Path:
+    """Where the ledger lives, honouring HERMES_HOME.
+
+    Defined here rather than in each caller: the adapter writes this file, and
+    the CLI and dashboard read it. Three copies of the same expression is three
+    chances for one of them to look at the wrong database and report an empty
+    queue.
+    """
+    home = os.getenv("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+    return Path(home) / "hookdeck" / "state.db"
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS deliveries (

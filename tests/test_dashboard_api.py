@@ -24,10 +24,11 @@ def plugin_api():
 
 def test_it_loads_the_way_the_web_server_loads_it(plugin_api):
     paths = {r.path for r in plugin_api.router.routes}
+    # Exactly the routes the tab calls — no unused surface. An endpoint the
+    # UI never hits still accepts requests.
     assert paths == {
         "/overview",
         "/events/{event_id}/retry",
-        "/events/{event_id}/body",
         "/connections/{connection_id}/pause",
         "/connections/{connection_id}/resume",
     }
@@ -67,7 +68,7 @@ async def test_only_this_gateways_connections_get_controls(plugin_api, monkeypat
     assert result["hookdeck"]["other_connection_count"] == 2
 
 
-async def test_queue_metrics_are_flattened_for_display(plugin_api, monkeypatch):
+async def test_the_age_metric_is_not_surfaced(plugin_api, monkeypatch):
     monkeypatch.setenv("HOOKDECK_API_KEY", "key")
     monkeypatch.setattr(plugin_api, "_load_hermes_config", lambda: {})
 
@@ -82,7 +83,10 @@ async def test_queue_metrics_are_flattened_for_display(plugin_api, monkeypatch):
 
     monkeypatch.setattr(plugin_api, "HookdeckAPI", lambda *a, **k: FakeAPI())
     depth = (await plugin_api.overview())["hookdeck"]["depth"]
-    assert depth == {"max_depth": 6, "max_age_minutes": 0.25}
+    # max_age has no documented unit and is a window maximum rather than a live
+    # age, so it cannot be labelled honestly. A number whose meaning cannot be
+    # stated is worse on a dashboard than no number.
+    assert depth == {"max_depth": 6}
 
 
 async def test_a_missing_api_key_is_reported_not_raised(plugin_api, monkeypatch):
@@ -91,3 +95,32 @@ async def test_a_missing_api_key_is_reported_not_raised(plugin_api, monkeypatch)
     assert result["hookdeck"]["configured"] is False
     # The adapter runs regardless; the tab is observability, not a dependency.
     assert "local" in result
+
+
+def test_loading_it_does_not_touch_the_hosts_import_path():
+    # This module is imported into the Hermes web-server process. Prepending
+    # the repo root would put `tests/` and `examples/` on the host's path —
+    # and Hermes has its own top-level `tests` package, which would then be
+    # shadowed process-wide. A plugin does not get to rearrange the host's
+    # imports to reach its own siblings.
+    import sys
+
+    before = list(sys.path)
+    spec = importlib.util.spec_from_file_location("hookdeck_dash_api_pathcheck", MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert [p for p in sys.path if p not in before] == []
+
+
+def test_it_reuses_an_already_imported_package():
+    # The gateway process has already imported `hookdeck`; re-executing the
+    # package under the same name would give the dashboard a second copy with
+    # its own module-level state.
+    import sys
+
+    import hookdeck
+
+    spec = importlib.util.spec_from_file_location("hookdeck_dash_api_reuse", MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert sys.modules["hookdeck"] is hookdeck

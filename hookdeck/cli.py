@@ -24,7 +24,7 @@ from .provision import (
     summarise_payload,
     uncovered_statuses,
 )
-from .state import DeliveryLedger
+from .state import DeliveryLedger, default_state_path
 
 # ----------------------------------------------------------------------
 # Config helpers
@@ -100,7 +100,7 @@ def _platform_extra() -> dict:
 
 def _ledger_path() -> Path:
     extra = _platform_extra()
-    return Path(extra.get("state_path") or _hermes_home() / "hookdeck" / "state.db")
+    return Path(extra.get("state_path") or default_state_path())
 
 
 # ----------------------------------------------------------------------

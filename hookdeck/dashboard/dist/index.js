@@ -101,10 +101,6 @@
               h("div", { className: "text-2xl font-semibold" }, String(depth.max_depth != null ? depth.max_depth : "—")),
               h("div", { className: "text-xs text-muted-foreground" }, "peak queued")),
             h("div", null,
-              h("div", { className: "text-2xl font-semibold" },
-                depth.max_age_minutes != null ? (Math.round(depth.max_age_minutes * 10) / 10) + "m" : "—"),
-              h("div", { className: "text-xs text-muted-foreground" }, "longest wait")),
-            h("div", null,
               h("div", { className: "text-2xl font-semibold" }, String((hd.issues || []).length)),
               h("div", { className: "text-xs text-muted-foreground" }, "open issues"))))),
 
