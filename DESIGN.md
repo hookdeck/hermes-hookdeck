@@ -52,6 +52,16 @@ When the attempt header is absent, admit only if the previous run for that event
 is recorded as failed. Storage is the host's business (SQLite, the host's own
 store, a workflow static data slot); the rule is not.
 
+Two properties of the identity worth knowing. `Idempotency-Key` equals the event
+id and is stable across every retry attempt, so it is an equally valid key.
+A *replay*, though, creates a **new** event with a new id — so replayed traffic
+will not dedupe against the original, which is usually what you want, since a
+replay is a deliberate request to run it again. If you need cross-replay dedup,
+key on `x-hookdeck-requestid` or a provider-native event id instead.
+
+Note also that Hookdeck's signature covers no timestamp, so there is no built-in
+replay protection. Dedup is mandatory, not an optimisation.
+
 State per event id: `attempt`, `run_count`, `status`, `updated_at`. Statuses:
 `running`, `succeeded`, `failed`, `exhausted`. Prune terminal rows on a TTL;
 never prune `running`.
@@ -69,8 +79,18 @@ Two rules follow, and both have bitten implementations that got them wrong:
    control turns into silent data loss.
 
 Where the host supports it, the same limit should also be pushed into Hookdeck
-(`rate_limit` with `rate_limit_period: concurrent`), and `delivery_groups` used
-to serialise runs per subject key.
+as a destination-level `rate_limit` with `rate_limit_period: concurrent`.
+
+Two limits on that, both verified against the OpenAPI spec:
+
+- `concurrent` is valid on HTTP and Mock API destinations only.
+  `DeliveryGroupRateLimitPeriod` is `second|minute|hour`, so `delivery_groups`
+  can throttle per subject **by rate but not by concurrency**. Per-customer
+  serialisation is not expressible; sending `concurrent` inside
+  `delivery_groups` is rejected.
+- CLI destinations have no `rate_limit` field at all. In CLI transport there is
+  nothing to push down, and the host-side `max_concurrent` is the only
+  admission control there is.
 
 ## 5. Acknowledgement modes
 
@@ -80,6 +100,14 @@ Exactly two, named identically across plugins:
   and on failure call `POST /events/{id}/retry`. Retry state lives in Hookdeck,
   so it survives a host restart. Stop after `max_agent_retries` and mark the
   event exhausted rather than looping.
+  **Open, and load-bearing for all three plugins:** this asks Hookdeck to retry
+  an event it has already recorded as `SUCCESSFUL`. The spec documents only 200
+  and 404 for that endpoint — no "already successful" error — and manual retries
+  are documented as unlimited, but no one has confirmed it against a live
+  project yet. Until someone does, `sync` is the mode that is definitely sound.
+  If it turns out to be rejected, the fallback is to durably record the rendered
+  prompt before acking and replay from that on boot — a local queue none of us
+  want to own.
 - **`sync`** — hold the response until the run finishes, bounded by
   `sync_timeout_seconds`; 2xx on success, 5xx on failure, so Hookdeck's own
   retry rules apply. On timeout, degrade to 202 — answering 5xx would redeliver
@@ -92,13 +120,30 @@ Exactly two, named identically across plugins:
 Setup is an upsert keyed on the route name (`PUT /connections`), so it is safe
 to re-run. Rules attached by default:
 
-- `retry`: `strategy: exponential`, `response_status_codes: ["500-599", "429"]`
+- `retry`: `strategy: exponential`, `response_status_codes: ["500-599"]`.
+  Narrowing from Hookdeck's default of "any non-2xx" is deliberate — a 401 from
+  a secret mismatch or a 404 from a missing route cannot be fixed by retrying,
+  and the default would spend 50 attempts finding that out. Assert at
+  provision time *and* in `doctor` that the rule covers every status the host
+  actually emits; a rule that drifts narrower than the emitted set is silent
+  data loss nothing else would surface.
 - `deduplicate`: a short window, so a double-firing provider costs one run
 - `filter`: **only** when the event name's location is known — a header for
   GitHub/GitLab/Shopify, or an explicitly configured body path. Guessing
   discards traffic silently, so when in doubt, filter host-side instead.
 
 Destination auth is always `HOOKDECK_SIGNATURE`, in CLI and HTTP modes alike.
+
+Source verification is `config.auth_type` + `config.auth`. The docs page at
+hookdeck.com/docs/sources still shows a legacy top-level
+`verification: {type, configs}` object — that shape is stale and is not in the
+current spec. Prefer a thin REST client generated against
+`https://api.hookdeck.com/2025-07-01/openapi` over `@hookdeck/sdk`, which is at
+0.4.0 with an archived repo and lags the current API.
+
+**Every recovery path is capped by retention** — 3 days on Developer, 7 on Team,
+30 on Growth. Say so in the README; an outage longer than the plan's retention
+is not replayable by any of this.
 
 ## 7. Operator surface
 
@@ -108,7 +153,7 @@ Same five verbs, whatever the host calls its CLI:
 |---|---|
 | `setup` | upsert the connection(s) for configured routes; `--dry-run` prints the payload |
 | `status` | queue depth, failed events, open issues, local ledger state |
-| `pause` / `resume` | `PUT /connections/{id}/pause` / `unpause` — zero-loss restarts |
+| `pause` / `resume` | `PUT /connections/{id}/pause` / `unpause` — zero-loss restarts. **Never `disable` or delete instead: both cancel pending events irrecoverably.** For a CLI transport, pause *before* stopping the listener — a CLI destination with nothing attached discards events rather than queueing them |
 | `replay` | `POST /events/{id}/retry`, or bulk retry scoped by time and connection |
 | `doctor` | check credentials, transport, config and stale local state, and say what is wrong |
 
@@ -129,7 +174,36 @@ hint, sets one telling the model that payload text is data and never an
 instruction addressed to it. Recommend sandboxed execution, scoped tools and
 approval gates on webhook-triggered paths.
 
-## 10. What each host may legitimately differ on
+It bites hardest in a host that renders payloads into prompts for a model with
+tools — a webhook body is then an injection surface. Three rules follow:
+
+- Interpolate payload values as quoted data blocks, not as bare prose.
+- **A webhook-triggered route must not send anything outbound by default.** An
+  injected payload should not be able to make the agent message someone. The
+  host's own inert default is fine where it has one (Hermes routes default to
+  `deliver: log`); otherwise default the outbound channel off and make enabling
+  it explicit per route.
+- Keep injection-shaped fixtures in the template tests.
+
+## 10. Optional extensions
+
+Both default **off**, so default behaviour stays identical across the three
+plugins. Adopted from the OpenClaw session.
+
+**`Retry-After: -1` on permanently-invalid input.** Hookdeck honours a handler's
+`Retry-After` over the connection's retry rules, and reads `-1` as "cancel all
+further automatic retries" — turning 50 doomed attempts into one. The failure
+mode is severe and silent: one over-strict validator discards live traffic,
+unrecoverable once retention lapses. So: never cancel anything a config change
+could fix, record every cancellation where `status` will surface it, and ship it
+off by default. Measure how often it *would* have fired before enabling.
+
+**Last-attempt detection.** An absent or empty `x-hookdeck-will-retry-after`
+means this is the final automatic attempt — the cleanest dead-letter trigger
+available. No downside; surface it in logs and in whatever the host uses for
+run metadata.
+
+## 11. What each host may legitimately differ on
 
 - **Transport.** CLI tunnel, HTTP push, or whatever the host natively offers.
 - **Storage.** Any durable store that can express the section 3 rule.

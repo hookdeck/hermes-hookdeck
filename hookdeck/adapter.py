@@ -57,6 +57,7 @@ from .constants import (
     INSECURE_NO_AUTH,
     PLATFORM_NAME,
     SOURCE_NAME,
+    WILL_RETRY_AFTER,
     header_name,
 )
 from .state import DeliveryLedger
@@ -135,6 +136,9 @@ class HookdeckAdapter(WebhookAdapter):
             extra.get("ledger_ttl_seconds", DEFAULT_LEDGER_TTL_SECONDS)
         )
         self._source = str(extra.get("source") or os.getenv("HOOKDECK_SOURCE") or "")
+        self._cancel_retries_on_unparseable = bool(
+            extra.get("cancel_retries_on_unparseable", False)
+        )
         self._state_path = Path(
             extra.get("state_path") or _default_state_path()
         ).expanduser()
@@ -433,6 +437,9 @@ class HookdeckAdapter(WebhookAdapter):
             attempt = int(self._header(request, ATTEMPT_COUNT) or 0)
         except ValueError:
             attempt = 0
+        # Hookdeck omits (or empties) this header on the final automatic
+        # attempt, which is the cleanest dead-letter signal available.
+        is_last_attempt = not self._header(request, WILL_RETRY_AFTER).strip()
 
         route_name, route = self._resolve_route(request, source_name)
         if route is None:
@@ -450,14 +457,17 @@ class HookdeckAdapter(WebhookAdapter):
             )
 
         try:
+            # Not just JSONDecodeError: json.loads sniffs the encoding and
+            # raises UnicodeDecodeError on a non-UTF-8 body, which would
+            # otherwise escape as a 500 and be retried 50 times.
             payload = json.loads(raw_body)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             try:
                 import urllib.parse
 
                 payload = dict(urllib.parse.parse_qsl(raw_body.decode("utf-8")))
             except Exception:
-                return web.json_response({"error": "Cannot parse body"}, status=400)
+                return self._unparseable_response(event_id)
 
         event_type = self._event_type(request, route, payload)
         allowed = route.get("events", [])
@@ -586,6 +596,7 @@ class HookdeckAdapter(WebhookAdapter):
                 "hookdeck_source": source_name,
                 "hookdeck_attempt": attempt,
                 "hookdeck_route": route_name,
+                "hookdeck_last_automatic_attempt": is_last_attempt,
             },
         )
 
@@ -593,6 +604,7 @@ class HookdeckAdapter(WebhookAdapter):
             "event_id": event_id,
             "route": route_name,
             "started": now,
+            "last_attempt": is_last_attempt,
         }
         logger.info(
             "[hookdeck] dispatch route=%s event_type=%s event_id=%s attempt=%s "
@@ -618,6 +630,35 @@ class HookdeckAdapter(WebhookAdapter):
                 "event_id": event_id,
             },
             status=202,
+        )
+
+    def _unparseable_response(self, event_id: str) -> web.Response:
+        """400 for a body that is neither JSON nor form-encoded.
+
+        Hookdeck honours ``Retry-After: -1`` as "cancel all further automatic
+        retries", which turns 50 doomed attempts into one for a payload no
+        retry can fix. It is off by default because the failure mode is
+        severe and silent: an over-strict parser would discard live traffic,
+        unrecoverable once retention lapses. Turn it on only once you have
+        watched the counter in ``hermes hookdeck status`` and are satisfied
+        nothing legitimate is landing here.
+        """
+        headers = {}
+        if self._cancel_retries_on_unparseable:
+            headers["Retry-After"] = "-1"
+            logger.warning(
+                "[hookdeck] Event %s has an unparseable body — cancelling its "
+                "automatic retries (cancel_retries_on_unparseable is on)",
+                event_id or "(no id)",
+            )
+            if self._ledger is not None and event_id:
+                self._ledger.record_cancelled(event_id, "unparseable body")
+        else:
+            logger.warning(
+                "[hookdeck] Event %s has an unparseable body", event_id or "(no id)"
+            )
+        return web.json_response(
+            {"error": "Cannot parse body"}, status=400, headers=headers
         )
 
     def _apply_skills(self, route: dict, prompt: str) -> str:
@@ -711,7 +752,9 @@ class HookdeckAdapter(WebhookAdapter):
         event_id = (info or {}).get("event_id") or ""
         if event_id and self._ledger is not None:
             try:
-                await self._record_outcome(event_id, outcome)
+                await self._record_outcome(
+                    event_id, outcome, last_attempt=(info or {}).get("last_attempt", False)
+                )
             except Exception:
                 logger.exception(
                     "[hookdeck] Failed to record outcome for event %s", event_id
@@ -722,7 +765,9 @@ class HookdeckAdapter(WebhookAdapter):
         except Exception:
             logger.debug("[hookdeck] Base completion hook failed", exc_info=True)
 
-    async def _record_outcome(self, event_id: str, outcome: Any) -> None:
+    async def _record_outcome(
+        self, event_id: str, outcome: Any, *, last_attempt: bool = False
+    ) -> None:
         assert self._ledger is not None
         if outcome == ProcessingOutcome.SUCCESS:
             self._ledger.mark_succeeded(event_id)
@@ -742,6 +787,19 @@ class HookdeckAdapter(WebhookAdapter):
                 event_id,
             )
             return
+
+        if last_attempt:
+            # Hookdeck's own automatic retries are done for this event, so
+            # nothing else will bring it back on its own. Manual retries are
+            # unlimited, which is what the request below is — but say so
+            # loudly, because this is the dead-letter moment.
+            logger.warning(
+                "[hookdeck] Event %s failed on its last automatic attempt — "
+                "requesting a manual redelivery; if that fails too, only "
+                "`hermes hookdeck replay %s` will bring it back",
+                event_id,
+                event_id,
+            )
 
         self._ledger.mark_failed(event_id, reason)
         if self._ack_mode != "async_retry" or self._api is None:

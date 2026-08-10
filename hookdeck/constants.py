@@ -20,6 +20,8 @@ EVENT_ID = "eventid"
 REQUEST_ID = "requestid"
 ATTEMPT_COUNT = "attempt-count"
 ATTEMPT_TRIGGER = "attempt-trigger"
+# Absent or empty means this is the final automatic attempt.
+WILL_RETRY_AFTER = "will-retry-after"
 SOURCE_NAME = "source-name"
 CONNECTION_NAME = "connection-name"
 DESTINATION_NAME = "destination-name"

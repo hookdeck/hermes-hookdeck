@@ -16,7 +16,7 @@ money every time it happens, and it should not happen twice for the same event.
 |---|---|---|
 | Signature verification | GitHub, GitLab, generic HMAC | ~140 provider schemes verified by Hookdeck at the edge; the adapter verifies one |
 | Ingress | Public HTTP listener | Hookdeck CLI (no public URL) or HTTP push |
-| Gateway offline | POST is lost | Events queue in Hookdeck and drain on reconnect |
+| Gateway offline | POST is lost | Pause the connection and events are held at `HOLD`, then drain on resume (see the CLI caveat below) |
 | Burst | 30/min per route, excess dropped | Queued and throttled; over the limit gets 503 + `Retry-After` |
 | Duplicate delivery | In-memory 1h cache, lost on restart | SQLite ledger keyed on the Hookdeck event id |
 | Run fails | 202 was already sent; the event is gone | Handed back to Hookdeck for redelivery |
@@ -47,8 +47,27 @@ export HOOKDECK_WEBHOOK_SECRET=... # the signing secret
 
 The default. The Hookdeck CLI holds an outbound connection and forwards events
 to a loopback listener, so a laptop or a homelab box behind NAT works without
-ngrok or a VPS. Unlike a plain tunnel, events that arrive while the machine is
-asleep are queued and delivered when it comes back.
+ngrok or a VPS.
+
+**A CLI destination is not a durable buffer.** With no listener attached,
+events become `CLI_DISCONNECTED` ignored events and the request is discarded —
+not queued, not retried. An *abnormal* disconnect gets a short server-side
+grace window in which events are still created and fail as `CLI_UNAVAILABLE`,
+which keeps them in the normal retry pipeline; a clean Ctrl+C forfeits even
+that. So on a planned shutdown, **pause the connection before you stop the
+gateway**:
+
+```bash
+hermes hookdeck pause github-prs
+```
+
+That is the durable path — paused events are held at `HOLD` and delivered on
+resume. Never reach for `disable` instead: it cancels pending events
+irrecoverably, as does deleting the connection.
+
+Use a CLI version of at least 2.3.2. Earlier ones stop delivering after a
+listen session expires without saying so, which from the gateway's side looks
+identical to "no events are arriving". `hermes hookdeck doctor` checks this.
 
 Install the [Hookdeck CLI](https://hookdeck.com/docs/cli), add a route to
 `~/.hermes/config.yaml` (see [`examples/config.yaml`](examples/config.yaml)),
@@ -106,9 +125,10 @@ flight. An event that arrives over the limit gets 503 and a `Retry-After`, so
 Hookdeck keeps it queued and comes back. Nothing is recorded in the ledger for
 a deferred event, so the redelivery is not mistaken for a duplicate. In push
 mode you can push the same limit down into Hookdeck with `--rate-limit N
---rate-limit-period concurrent`, and `delivery_group_key` goes further: one
-in-flight run per repository, customer or conversation, so two runs never
-interleave on the same subject.
+--rate-limit-period concurrent`. `--group-key` adds a *rate* limit per subject
+(`--group-rate 1 --group-period minute`) — note that delivery groups accept
+only `second|minute|hour`, so per-subject **concurrency** is not expressible;
+`concurrent` works at destination level only.
 
 **Outcomes reported, not assumed.** `ack_mode` decides how:
 
@@ -177,8 +197,20 @@ refused unless the listener is bound to loopback.
   signing secret entered on the source in the Hookdeck dashboard. `setup`
   creates the source with the right verification shape but cannot invent the
   secret.
-- The plugin does not poll. If you cannot run the CLI and cannot expose a URL,
-  it will not help you.
+- The plugin does not poll. Hookdeck has no pull/consumer API — the Events API
+  is inspection-only, with no ack, lease or consumer group — so if you cannot
+  run the CLI and cannot expose a URL, it will not help you.
+- Delivery groups throttle per subject by rate, not by concurrency, because
+  Hookdeck's group-level period is `second|minute|hour`.
+- Every recovery path is bounded by your plan's retention: 3 days on
+  Developer, 7 on Team, 30 on Growth. An outage longer than that is not
+  replayable.
+- `ack_mode: async_retry` calls `POST /events/{id}/retry` for an event Hookdeck
+  has already recorded as delivered. The spec documents only 200 and 404 for
+  that endpoint, with no "already successful" error, and manual retries are
+  documented as unlimited — but this has not yet been confirmed against a live
+  project. If it turns out to be rejected, use `ack_mode: sync`, where the
+  event's status is the run's real outcome and Hookdeck's own retry rules apply.
 
 ## Development
 

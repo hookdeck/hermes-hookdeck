@@ -510,3 +510,83 @@ def test_cli_mode_forces_a_loopback_bind(tmp_path):
     )
     adapter = HookdeckAdapter(config)
     assert adapter._host == "127.0.0.1"
+
+
+# ----------------------------------------------------------------------
+# Unparseable payloads and last-attempt detection
+# ----------------------------------------------------------------------
+
+
+async def test_an_unparseable_body_is_rejected_without_cancelling_retries(client_factory):
+    adapter, client = await client_factory({"default": {}})
+    raw = b"\xff\xfe not json, not form"
+    headers = {
+        "content-type": "application/json",
+        "x-hookdeck-eventid": "evt_bad_body",
+        "x-hookdeck-signature": compute_signature(raw, SECRET),
+    }
+    response = await client.post("/hookdeck", data=raw, headers=headers)
+    assert response.status == 400
+    # Default is off: cancelling retries on a parser's say-so is unrecoverable
+    # once retention lapses, so it must be opted into.
+    assert "Retry-After" not in response.headers
+    assert adapter._ledger.get("evt_bad_body") is None
+
+
+async def test_cancel_on_unparseable_emits_retry_after_minus_one(client_factory):
+    adapter, client = await client_factory(
+        {"default": {}}, cancel_retries_on_unparseable=True
+    )
+    raw = b"\xff\xfe not json, not form"
+    headers = {
+        "content-type": "application/json",
+        "x-hookdeck-eventid": "evt_bad_body",
+        "x-hookdeck-signature": compute_signature(raw, SECRET),
+    }
+    response = await client.post("/hookdeck", data=raw, headers=headers)
+    assert response.status == 400
+    # Hookdeck reads -1 as "cancel all further automatic retries".
+    assert response.headers["Retry-After"] == "-1"
+    # Recorded so `status` can surface how often this fires.
+    assert adapter._ledger.get("evt_bad_body")["status"] == "cancelled"
+
+
+async def test_a_present_will_retry_after_header_means_more_attempts_are_coming(
+    client_factory,
+):
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    await post(
+        client,
+        {"n": 1},
+        event_id="evt_more",
+        extra_headers={"x-hookdeck-will-retry-after": "2026-08-10T12:00:00Z"},
+    )
+    await _settle()
+    assert seen[0].metadata["hookdeck_last_automatic_attempt"] is False
+
+
+async def test_an_absent_will_retry_after_header_flags_the_last_attempt(client_factory):
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    await post(client, {"n": 1}, event_id="evt_last")
+    await _settle()
+    assert seen[0].metadata["hookdeck_last_automatic_attempt"] is True
+
+
+async def test_a_failure_on_the_last_attempt_still_requests_redelivery(client_factory):
+    # Automatic retries are exhausted, but manual retries are unlimited — so
+    # the request is still worth making, just noisily.
+    adapter, client = await client_factory({"default": {}})
+
+    async def _fail(_event):
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _fail
+    await post(client, {"n": 1}, event_id="evt_last_fail")
+    await _settle()
+    assert adapter._api.retried == ["evt_last_fail"]

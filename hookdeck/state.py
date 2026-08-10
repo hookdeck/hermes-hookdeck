@@ -29,6 +29,8 @@ STATUS_RUNNING = "running"
 STATUS_SUCCEEDED = "succeeded"
 STATUS_FAILED = "failed"
 STATUS_EXHAUSTED = "exhausted"
+# Retries were cancelled with Retry-After: -1 rather than left to expire.
+STATUS_CANCELLED = "cancelled"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -160,6 +162,25 @@ class DeliveryLedger:
 
     def mark_exhausted(self, event_id: str, error: str = "") -> None:
         self._set_status(event_id, STATUS_EXHAUSTED, error)
+
+    def record_cancelled(self, event_id: str, reason: str) -> None:
+        """Note that automatic retries were cancelled for an event.
+
+        Cancelling is deliberately visible: ``hermes hookdeck status`` counts
+        these so an over-strict rejection cannot quietly eat live traffic.
+        The row is inserted if the event never got as far as being admitted.
+        """
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO deliveries (event_id, route, attempt, agent_attempts,"
+                " status, session_chat_id, error, first_seen, updated_at)"
+                " VALUES (?, '', 0, 0, ?, '', ?, ?, ?)"
+                " ON CONFLICT(event_id) DO UPDATE SET status = excluded.status,"
+                " error = excluded.error, updated_at = excluded.updated_at",
+                (event_id, STATUS_CANCELLED, reason[:500], now, now),
+            )
+            self._conn.commit()
 
     def get(self, event_id: str) -> Optional[sqlite3.Row]:
         with self._lock:

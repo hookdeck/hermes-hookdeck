@@ -85,3 +85,25 @@ def test_setup_can_target_a_route_that_is_not_in_config_yet(monkeypatch, capsys)
     monkeypatch.setattr(cli, "_load_hermes_config", lambda: {})
     assert cli.hookdeck_command(_args(route="brand-new", source="stripe")) == 0
     assert '"name": "stripe"' in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------
+# CLI version gate
+# ----------------------------------------------------------------------
+
+
+def test_version_comparison_treats_a_prerelease_as_older():
+    assert cli._version_at_least("2.3.2", cli.MIN_CLI_VERSION)
+    assert cli._version_at_least("2.4.0", cli.MIN_CLI_VERSION)
+    assert cli._version_at_least("3.0.0", cli.MIN_CLI_VERSION)
+    assert not cli._version_at_least("2.3.1", cli.MIN_CLI_VERSION)
+    assert not cli._version_at_least("2.2.9", cli.MIN_CLI_VERSION)
+    # 2.3.2-beta.1 precedes 2.3.2, and the bug this gate exists for is fixed
+    # in the release, not the pre-release.
+    assert not cli._version_at_least("2.3.2-beta.1", cli.MIN_CLI_VERSION)
+    assert not cli._version_at_least("", cli.MIN_CLI_VERSION)
+    assert not cli._version_at_least("garbage", cli.MIN_CLI_VERSION)
+
+
+def test_a_newer_prerelease_still_counts_as_newer():
+    assert cli._version_at_least("2.4.0-beta.1", cli.MIN_CLI_VERSION)

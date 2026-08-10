@@ -20,6 +20,8 @@ from typing import Any, Mapping, Optional
 DEFAULT_RETRY_COUNT = 5
 DEFAULT_RETRY_INTERVAL_MS = 30_000
 DEFAULT_DEDUPE_WINDOW_MS = 60_000
+DEFAULT_GROUP_RATE = 1
+DEFAULT_GROUP_RATE_PERIOD = "minute"
 
 # Hookdeck source types whose event name arrives in a header rather than the
 # body. Used to turn a route's ``events`` list into a gateway-side filter.
@@ -30,12 +32,22 @@ _EVENT_HEADER_BY_TYPE = {
 }
 
 
+# Destination-level rate limiting accepts `concurrent`; delivery groups do not.
+# DeliveryGroupRateLimitPeriod is second|minute|hour, so per-group *concurrency*
+# — one in-flight run per customer — is not expressible. Groups throttle by
+# rate only. Sending `concurrent` inside delivery_groups is rejected by the API.
+DESTINATION_RATE_PERIODS = ("second", "minute", "hour", "concurrent")
+GROUP_RATE_PERIODS = ("second", "minute", "hour")
+
+
 def _http_destination_config(
     url: str,
     *,
     rate_limit: Optional[int],
     rate_limit_period: str,
     delivery_group_key: str,
+    group_rate: int,
+    group_rate_period: str,
 ) -> dict[str, Any]:
     config: dict[str, Any] = {
         "url": url,
@@ -44,15 +56,24 @@ def _http_destination_config(
         "auth_type": "HOOKDECK_SIGNATURE",
     }
     if rate_limit:
+        if rate_limit_period not in DESTINATION_RATE_PERIODS:
+            raise ValueError(
+                f"rate_limit_period must be one of {DESTINATION_RATE_PERIODS}"
+            )
         config["rate_limit"] = rate_limit
         config["rate_limit_period"] = rate_limit_period
     if delivery_group_key:
-        # One in-flight delivery per group means two agent runs never interleave
-        # on the same repo / customer / conversation.
+        if group_rate_period not in GROUP_RATE_PERIODS:
+            raise ValueError(
+                "delivery groups do not support "
+                f"rate_limit_period={group_rate_period!r}; Hookdeck allows "
+                f"{GROUP_RATE_PERIODS}. Cap total concurrency with the "
+                "destination-level rate_limit instead."
+            )
         config["delivery_groups"] = {
             "key": delivery_group_key,
-            "rate_limit": 1,
-            "rate_limit_period": "concurrent",
+            "rate_limit": group_rate,
+            "rate_limit_period": group_rate_period,
         }
     return config
 
@@ -71,6 +92,8 @@ def build_connection_payload(
     rate_limit: Optional[int] = None,
     rate_limit_period: str = "concurrent",
     delivery_group_key: str = "",
+    group_rate: int = DEFAULT_GROUP_RATE,
+    group_rate_period: str = DEFAULT_GROUP_RATE_PERIOD,
     retry_count: int = DEFAULT_RETRY_COUNT,
     retry_interval_ms: int = DEFAULT_RETRY_INTERVAL_MS,
     dedupe_window_ms: Optional[int] = DEFAULT_DEDUPE_WINDOW_MS,
@@ -116,8 +139,20 @@ def build_connection_payload(
                 rate_limit=rate_limit,
                 rate_limit_period=rate_limit_period,
                 delivery_group_key=delivery_group_key,
+                group_rate=group_rate,
+                group_rate_period=group_rate_period,
             ),
         }
+
+    # Narrowing from Hookdeck's default (retry any non-2xx) so a 401 from a
+    # secret mismatch or a 404 from a missing route fails fast instead of
+    # burning 50 attempts on something no retry can fix.
+    response_status_codes = ["500-599"]
+    still_missing = uncovered_statuses(response_status_codes)
+    if still_missing:  # pragma: no cover - guards against editing the list above
+        raise ValueError(
+            f"retry rule would not cover statuses the adapter emits: {still_missing}"
+        )
 
     rules: list[dict[str, Any]] = [
         {
@@ -125,10 +160,7 @@ def build_connection_payload(
             "strategy": "exponential",
             "count": retry_count,
             "interval": retry_interval_ms,
-            # 503 is the adapter's "at capacity, come back later" answer, so it
-            # must be retried; 4xx other than 429 means the delivery will never
-            # succeed and retrying only burns quota.
-            "response_status_codes": ["500-599", "429"],
+            "response_status_codes": response_status_codes,
         }
     ]
     if dedupe_window_ms:
@@ -167,6 +199,59 @@ def build_event_filter(
     if header:
         return {"type": "filter", "headers": {header: {"$in": list(events)}}}
     return None
+
+
+# HTTP statuses the adapter itself emits that must be retried: 503 is admission
+# control, 500 is a failed run in sync mode, 502 is a rejected direct delivery.
+# A retry rule that does not cover these turns backpressure into silent data
+# loss — the event is deferred and then never comes back.
+ADAPTER_RETRYABLE_STATUSES = (500, 502, 503)
+
+
+def _code_expression_matches(expression: str, status: int) -> Optional[bool]:
+    """Evaluate one Hookdeck retry-rule code expression against *status*.
+
+    Returns True/False for a positive match, or None when the expression is an
+    exclusion that does not apply. Exclusions (``!401``) return False when they
+    do apply, so a caller folding results with ``any`` needs the exclusions
+    checked first — which :func:`uncovered_statuses` does.
+    """
+    expression = str(expression).strip()
+    if expression.startswith("!"):
+        return False if expression[1:] == str(status) else None
+    if "-" in expression:
+        low, _, high = expression.partition("-")
+        return int(low) <= status <= int(high)
+    for operator in (">=", "<=", ">", "<", "="):
+        if expression.startswith(operator):
+            bound = int(expression[len(operator) :])
+            return {
+                ">=": status >= bound,
+                "<=": status <= bound,
+                ">": status > bound,
+                "<": status < bound,
+                "=": status == bound,
+            }[operator]
+    return status == int(expression)
+
+
+def uncovered_statuses(
+    codes: Optional[list[str]], statuses: tuple[int, ...] = ADAPTER_RETRYABLE_STATUSES
+) -> list[int]:
+    """Which of *statuses* a retry rule's ``response_status_codes`` misses.
+
+    An empty or absent list means Hookdeck's default — retry any non-2xx — so
+    nothing is uncovered.
+    """
+    if not codes:
+        return []
+    missing = []
+    for status in statuses:
+        excluded = any(str(c).strip() == f"!{status}" for c in codes)
+        matched = any(_code_expression_matches(c, status) is True for c in codes)
+        if excluded or not matched:
+            missing.append(status)
+    return missing
 
 
 def routes_from_config(config: Mapping[str, Any]) -> dict[str, dict]:

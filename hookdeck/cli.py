@@ -10,18 +10,53 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
 from .api import HookdeckAPI, HookdeckAPIError, run_sync
 from .constants import DEFAULT_PATH, DEFAULT_PORT
-from .provision import build_connection_payload, routes_from_config, summarise_payload
+from .provision import (
+    build_connection_payload,
+    routes_from_config,
+    summarise_payload,
+    uncovered_statuses,
+)
 from .state import DeliveryLedger
 
 # ----------------------------------------------------------------------
 # Config helpers
 # ----------------------------------------------------------------------
+
+
+# Below this, the CLI silently stops delivering once a listen session expires,
+# which looks exactly like "no events are arriving" from the gateway's side.
+MIN_CLI_VERSION = (2, 3, 2)
+MIN_CLI_VERSION_TEXT = ".".join(str(part) for part in MIN_CLI_VERSION)
+
+
+def _cli_version(binary: str) -> str:
+    try:
+        out = subprocess.run(
+            [binary, "version"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:
+        return ""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", out)
+    return match.group(0) if match else ""
+
+
+def _version_at_least(version: str, minimum: tuple[int, ...]) -> bool:
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)(?:-(.+))?", version or "")
+    if not match:
+        return False
+    numbers = tuple(int(match.group(i)) for i in (1, 2, 3))
+    if numbers != minimum:
+        return numbers > minimum
+    # Same numbers, but a pre-release of X.Y.Z precedes the release itself.
+    return match.group(4) is None
 
 
 def _hermes_home() -> Path:
@@ -89,7 +124,15 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     setup.add_argument(
         "--group-key",
         default="",
-        help="Payload path to serialise runs on, e.g. body.repository.full_name",
+        help="Payload path to throttle per, e.g. body.repository.full_name",
+    )
+    setup.add_argument("--group-rate", type=int, default=1, help="Deliveries per group period")
+    setup.add_argument(
+        "--group-period",
+        default="minute",
+        # Hookdeck's delivery groups take no `concurrent` period, so per-group
+        # serialisation is not available — only per-group rate.
+        choices=["second", "minute", "hour"],
     )
     setup.add_argument("--dry-run", action="store_true", help="Print the payload, send nothing")
 
@@ -141,6 +184,8 @@ def _payload_for_route(args: argparse.Namespace, name: str, route: dict) -> dict
         rate_limit=args.rate_limit if args.rate_limit is not None else route.get("rate_limit"),
         rate_limit_period=args.rate_limit_period,
         delivery_group_key=args.group_key or str(route.get("delivery_group_key") or ""),
+        group_rate=getattr(args, "group_rate", 1),
+        group_rate_period=getattr(args, "group_period", "minute"),
     )
 
 
@@ -356,11 +401,21 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         "No routes under platforms.hookdeck.extra.routes",
     )
     if mode == "cli":
+        cli_path = shutil.which("hookdeck")
         check(
-            bool(shutil.which("hookdeck")),
+            bool(cli_path),
             "Hookdeck CLI found on PATH",
             "Hookdeck CLI not found — install it or switch to mode: push",
         )
+        if cli_path:
+            version = _cli_version(cli_path)
+            check(
+                _version_at_least(version, MIN_CLI_VERSION),
+                f"Hookdeck CLI {version or 'unknown'} meets the {MIN_CLI_VERSION_TEXT} minimum",
+                f"Hookdeck CLI {version or 'unknown'} is below {MIN_CLI_VERSION_TEXT}. "
+                "Earlier versions stop delivering after a session expires, "
+                "without saying so. Upgrade before relying on cli mode.",
+            )
     else:
         check(
             bool(extra.get("public_url")),
@@ -387,12 +442,32 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             ledger.close()
 
     if os.getenv("HOOKDECK_API_KEY"):
-        async def _ping() -> None:
+        async def _inspect() -> list[str]:
+            """Reachability, plus whether each retry rule covers what we emit."""
+            warnings: list[str] = []
             async with _api() as api:
-                await api.list_connections(limit=1)
+                result = await api.list_connections(limit=100)
+                models = (result or {}).get("models") or (result or {}).get("data") or []
+                for connection in models:
+                    if connection.get("name") not in routes:
+                        continue
+                    for rule in connection.get("rules") or []:
+                        if rule.get("type") != "retry":
+                            continue
+                        missing = uncovered_statuses(rule.get("response_status_codes"))
+                        if missing:
+                            warnings.append(
+                                f"connection '{connection.get('name')}' has a retry "
+                                f"rule that does not cover {missing} — the adapter "
+                                "emits those, so deferred and failed events would "
+                                "never come back. Re-run `hermes hookdeck setup`."
+                            )
+            return warnings
 
         try:
-            run_sync(_ping())
+            for warning in run_sync(_inspect()):
+                problems += 1
+                print(f"✗ {warning}")
             print("\n✓ Hookdeck API reachable and the key is accepted")
         except HookdeckAPIError as exc:
             problems += 1
