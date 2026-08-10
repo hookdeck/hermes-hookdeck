@@ -5,3 +5,7 @@ __pycache__/
 *.egg-info/
 .DS_Store
 *.db
+# Secrets never belong in the repo — the API key and signing secret go in a
+# file outside it (see README).
+*.env
+.env*
