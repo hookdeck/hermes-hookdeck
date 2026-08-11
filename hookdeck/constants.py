@@ -43,23 +43,6 @@ API_KEY_ENV = f"{ENV_PREFIX}API_KEY"
 #: always given, whichever of the two the value came from.
 CLI_API_KEY_ENV = "HOOKDECK_API_KEY"
 
-# Which Hookdeck project the API key should act on.
-#
-# Optional today and load-bearing soon. A Hookdeck API key is currently scoped
-# to one project, so the key implies the project and nothing has to say it.
-# Organisation-level keys are coming, and one of those can reach several
-# projects — at which point "the project" is no longer implied by the
-# credential and has to be stated.
-#
-# Setting it now is also a safety improvement rather than only future-proofing:
-# the dashboard decides which connections this gateway may pause by matching
-# *names* against the configured routes, and an unscoped org key would let a
-# same-named connection in an unrelated project match.
-PROJECT_ID_ENV = f"{ENV_PREFIX}PROJECT_ID"
-#: Header that selects the project, sent by the Hookdeck CLI too. Hookdeck's
-#: API still calls a project a "team" on the wire; the operator-facing name has
-#: been "project" for a while, so the config says project and this says team.
-PROJECT_HEADER = "X-Team-Id"
 
 def api_key() -> str:
     """The Hookdeck API key, namespaced name first, CLI convention second."""

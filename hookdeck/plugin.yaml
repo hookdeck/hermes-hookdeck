@@ -44,10 +44,6 @@ optional_env:
     description: "Hookdeck source to forward in cli mode. Required unless every route sets its own `source`."
     prompt: "Hookdeck source name"
     password: false
-  - name: HOOKDECK_EG_PROJECT_ID
-    description: "Which Hookdeck project the API key acts on. Optional while every key is project-scoped; required once an organisation-level key can reach several."
-    prompt: "Hookdeck project id"
-    password: false
   - name: HOOKDECK_EG_ALLOWED_USERS
     description: "Allowlist, only consulted for INSECURE_NO_AUTH routes. Entries are the sender ids the adapter reports: hookdeck:<route>."
     prompt: "Allowed route names"

@@ -64,8 +64,8 @@ from .constants import (
     assert_declared_status,
     header_name,
 )
-from .settings import AdapterSettings
 from .ledger import RunLedger
+from .settings import AdapterSettings
 from .tunnel import HookdeckCLIMissing, HookdeckTunnel
 
 logger = logging.getLogger(__name__)
@@ -290,9 +290,16 @@ class HookdeckAdapter(WebhookAdapter):
         return True
 
     async def _start_tunnels(self) -> bool:
+        """One CLI session for the gateway, then one `listen` per route.
+
+        Authentication happens once, before any tunnel starts. Doing it per
+        tunnel would have several `hookdeck ci` processes writing the same
+        config file while the first `hookdeck listen` is already reading it,
+        and would mint a session per route for one gateway.
+        """
         try:
-            for route_name, source in self.settings.tunnels.items():
-                tunnel = HookdeckTunnel(
+            tunnels = [
+                HookdeckTunnel(
                     port=self._port,
                     path=f"{self._path}/{route_name}",
                     source=source,
@@ -300,6 +307,16 @@ class HookdeckAdapter(WebhookAdapter):
                     binary=self.settings.cli_binary,
                     config_path=self.settings.cli_config_path,
                 )
+                for route_name, source in self.settings.tunnels.items()
+            ]
+            if tunnels and not await tunnels[0].authenticate():
+                logger.error(
+                    "[hookdeck] Refusing to start: the gateway's CLI session "
+                    "could not be authenticated, so `hookdeck listen` would "
+                    "restart-loop against an unusable config."
+                )
+                return False
+            for tunnel in tunnels:
                 await tunnel.start()
                 self._tunnels.append(tunnel)
         except HookdeckCLIMissing as exc:

@@ -34,12 +34,11 @@ from .constants import (
     MODE_ENV,
     PATH_ENV,
     PORT_ENV,
-    PROJECT_ID_ENV,
     SOURCE_ENV,
     WEBHOOK_SECRET_ENV,
 )
-from .routing import tunnel_plan
 from .ledger import default_state_path
+from .routing import tunnel_plan
 
 MODES = ("cli", "push")
 
@@ -89,6 +88,20 @@ def configured_state_path() -> Path:
     return Path(configured).expanduser() if configured else default_state_path()
 
 
+def _cli_config_path(extra: Mapping[str, Any]) -> str:
+    """Resolve `cli_config_path`, expanding `~` and treating None as unset.
+
+    `~` matters: the Hookdeck CLI does not expand it either, so an unexpanded
+    path makes the CLI create a directory literally named `~` in the working
+    directory — and `doctor` would inspect a different file than the adapter
+    writes.
+    """
+    if "cli_config_path" not in extra or extra["cli_config_path"] is None:
+        return str(default_cli_config_path())
+    configured = str(extra["cli_config_path"])
+    return str(Path(configured).expanduser()) if configured else ""
+
+
 def default_cli_config_path() -> Path:
     """Where the gateway keeps its own Hookdeck CLI session."""
     return default_state_path().parent / "cli-config.toml"
@@ -117,10 +130,6 @@ class AdapterSettings:
     # ── Verification ───────────────────────────────────────────────
     signing_secret: str = ""
     header_prefix: str = DEFAULT_HEADER_PREFIX
-    #: Which Hookdeck project the API key acts on. Optional while every key is
-    #: project-scoped; required once an organisation-level key can reach more
-    #: than one.
-    project_id: str = ""
 
     # ── Run semantics ──────────────────────────────────────────────
     ack_mode: str = DEFAULT_ACK_MODE
@@ -173,7 +182,6 @@ class AdapterSettings:
             path="/" + text("path", PATH_ENV, DEFAULT_PATH).strip("/"),
             source=text("source", SOURCE_ENV),
             signing_secret=text("secret", WEBHOOK_SECRET_ENV),
-            project_id=text("project_id", PROJECT_ID_ENV),
             header_prefix=text("header_prefix", default=DEFAULT_HEADER_PREFIX),
             ack_mode=text("ack_mode", default=DEFAULT_ACK_MODE).lower(),
             max_concurrent=int(extra.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
@@ -210,11 +218,11 @@ class AdapterSettings:
             # `hookdeck ci` at the shared file switches its active project,
             # which is not something starting a gateway should do to a tool
             # used for other work.
-            cli_config_path=str(
-                extra["cli_config_path"]
-                if "cli_config_path" in extra
-                else default_cli_config_path()
-            ),
+            # `cli_config_path:` with no value parses as None, which `str()`
+            # would turn into the literal "None" and write a file by that name
+            # into the gateway's cwd. An explicit empty string is different and
+            # must survive: it means "use my own ambient session".
+            cli_config_path=_cli_config_path(extra),
         )
 
     # ------------------------------------------------------------------

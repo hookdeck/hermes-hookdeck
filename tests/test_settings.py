@@ -5,11 +5,10 @@ import pytest
 from hookdeck.constants import (
     MODE_ENV,
     PATH_ENV,
-    PROJECT_ID_ENV,
     SOURCE_ENV,
     WEBHOOK_SECRET_ENV,
 )
-from hookdeck.settings import AdapterSettings
+from hookdeck.settings import AdapterSettings, default_cli_config_path
 
 MINIMAL = {"secret": "whsec_x", "routes": {"a": {"source": "s"}}}
 
@@ -23,7 +22,7 @@ def test_defaults_are_the_conservative_ones(monkeypatch):
     # Off by default: cancelling retries discards traffic, and `hookdeck ci`
     # rewrites the operator's shared CLI config.
     assert settings.cancel_retries_on_unparseable is False
-    assert settings.cli_config_path.endswith("cli-config.toml")
+    assert settings.cli_config_path == str(default_cli_config_path())
 
 
 def test_config_wins_over_the_environment(monkeypatch):
@@ -114,8 +113,8 @@ def test_every_caller_resolves_the_same_ledger(tmp_path, monkeypatch):
 
 
 def test_the_default_is_used_when_nothing_is_configured(monkeypatch):
-    from hookdeck.settings import configured_state_path
     from hookdeck.ledger import default_state_path
+    from hookdeck.settings import configured_state_path
 
     monkeypatch.setattr("hookdeck.settings.load_hermes_config", dict)
     assert configured_state_path() == default_state_path()
@@ -126,7 +125,30 @@ def test_config_still_outranks_both(monkeypatch):
     assert AdapterSettings.from_extra({"secret": "from_yaml"}).signing_secret == "from_yaml"
 
 
-def test_the_project_can_be_pinned_for_an_org_level_key(monkeypatch):
-    monkeypatch.setenv(PROJECT_ID_ENV, "tm_from_env")
-    assert AdapterSettings.from_extra({}).project_id == "tm_from_env"
-    assert AdapterSettings.from_extra({"project_id": "tm_yaml"}).project_id == "tm_yaml"
+
+
+def test_a_bare_cli_config_path_key_is_not_the_string_None():
+    """`cli_config_path:` with no value parses as None in YAML.
+
+    `str(None)` is "None", which would have the adapter pass
+    `--hookdeck-config None` and write a file by that name into its working
+    directory — while doctor inspected the default path instead.
+    """
+    assert AdapterSettings.from_extra({"cli_config_path": None}).cli_config_path == str(
+        default_cli_config_path()
+    )
+
+
+def test_an_explicit_empty_cli_config_path_survives():
+    # Distinct from absent: it means "use my own ambient `hookdeck login`".
+    assert AdapterSettings.from_extra({"cli_config_path": ""}).cli_config_path == ""
+
+
+def test_a_tilde_in_cli_config_path_is_expanded():
+    # The Hookdeck CLI does not expand `~` either, so an unexpanded path makes
+    # it create a directory literally named `~` in the working directory.
+    resolved = AdapterSettings.from_extra(
+        {"cli_config_path": "~/somewhere/cli.toml"}
+    ).cli_config_path
+    assert not resolved.startswith("~")
+    assert resolved.endswith("/somewhere/cli.toml")

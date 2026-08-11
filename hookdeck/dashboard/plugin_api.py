@@ -57,10 +57,10 @@ _load_plugin_package()
 
 from hookdeck.api import HookdeckAPI, HookdeckAPIError  # noqa: E402
 from hookdeck.constants import api_key  # noqa: E402
+from hookdeck.ledger import RunLedger  # noqa: E402
 from hookdeck.provision import routes_from_config  # noqa: E402
 from hookdeck.settings import configured_state_path  # noqa: E402
 from hookdeck.settings import load_hermes_config as _load_hermes_config  # noqa: E402
-from hookdeck.ledger import RunLedger  # noqa: E402
 
 router = APIRouter()
 

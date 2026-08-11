@@ -135,7 +135,6 @@ class HookdeckTunnel:
 
     async def start(self) -> None:
         binary = self.resolve_binary()
-        await self._login(binary)
         self._stopping = False
         self._supervisor = asyncio.create_task(self._supervise(binary))
 
@@ -150,7 +149,7 @@ class HookdeckTunnel:
             self._supervisor = None
         await self._terminate()
 
-    async def _login(self, binary: str) -> None:
+    async def authenticate(self) -> bool:
         """Point the CLI at the same project the API key manages.
 
         These are two independent settings, and nothing reconciles them: the
@@ -178,7 +177,8 @@ class HookdeckTunnel:
         ``hermes hookdeck doctor`` reports it.
         """
         if not self._config_path:
-            return
+            return True
+        binary = self.resolve_binary()
         if not self._api_key:
             logger.warning(
                 "[hookdeck] No API key, so the CLI session cannot be pinned to "
@@ -187,7 +187,7 @@ class HookdeckTunnel:
                 "the two agree."
             )
             self._config_path = ""
-            return
+            return True
         try:
             process = await asyncio.create_subprocess_exec(
                 binary,
@@ -211,10 +211,14 @@ class HookdeckTunnel:
                     self._config_path,
                     (stdout or b"").decode("utf-8", "replace").strip()[:300],
                 )
+                return False
         except asyncio.TimeoutError:
-            logger.warning("[hookdeck] `hookdeck ci` timed out after 30s")
+            logger.error("[hookdeck] `hookdeck ci` timed out after 30s")
+            return False
         except Exception as exc:  # noqa: BLE001  # pragma: no cover - environment dependent
-            logger.warning("[hookdeck] `hookdeck ci` failed: %s", exc)
+            logger.error("[hookdeck] `hookdeck ci` failed: %s", exc)
+            return False
+        return True
 
     async def _supervise(self, binary: str) -> None:
         backoff = _BACKOFF_INITIAL

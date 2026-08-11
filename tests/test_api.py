@@ -7,8 +7,6 @@ from hookdeck.api import HookdeckAPI, HookdeckAPIError, _clean_params
 from hookdeck.constants import (
     API_KEY_ENV,
     CLI_API_KEY_ENV,
-    PROJECT_HEADER,
-    PROJECT_ID_ENV,
 )
 
 
@@ -79,32 +77,6 @@ async def test_the_namespaced_api_key_wins(monkeypatch):
     monkeypatch.setenv(API_KEY_ENV, "key_namespaced")
     monkeypatch.setenv(CLI_API_KEY_ENV, "key_shared")
     assert HookdeckAPI().api_key == "key_namespaced"
-
-
-async def test_the_project_is_sent_as_a_header_when_pinned():
-    """An org-level key can reach several projects; this says which."""
-    seen: dict = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["headers"] = request.headers
-        return httpx.Response(200, json={})
-
-    api = HookdeckAPI("k", project_id="tm_abc", client=_client(handler))
-    await api.list_events()
-    assert seen["headers"][PROJECT_HEADER] == "tm_abc"
-
-
-async def test_no_project_header_when_nothing_is_pinned(monkeypatch):
-    monkeypatch.delenv(PROJECT_ID_ENV, raising=False)
-    seen: dict = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["headers"] = request.headers
-        return httpx.Response(200, json={})
-
-    api = HookdeckAPI("k", client=_client(handler))
-    await api.list_events()
-    assert PROJECT_HEADER.lower() not in seen["headers"]
 
 
 async def test_non_2xx_carries_the_status_and_body():

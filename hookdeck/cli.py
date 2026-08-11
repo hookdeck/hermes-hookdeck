@@ -24,17 +24,16 @@ from .constants import (
     DEFAULT_PATH,
     DEFAULT_PORT,
     MODE_ENV,
-    PROJECT_ID_ENV,
     WEBHOOK_SECRET_ENV,
     api_key,
 )
+from .ledger import RunLedger
 from .provision import (
     build_connection_payload,
     routes_from_config,
     summarise_payload,
     uncovered_statuses,
 )
-from .ledger import RunLedger
 from .settings import (
     configured_state_path,
     default_cli_config_path,
@@ -432,7 +431,6 @@ class Check:
 def _check_credentials(extra: dict) -> list[Check]:
     key = api_key()
     secret = extra.get("secret") or os.getenv(WEBHOOK_SECRET_ENV)
-    project = extra.get("project_id") or os.getenv(PROJECT_ID_ENV)
     return [
         Check(
             bool(key),
@@ -449,22 +447,6 @@ def _check_credentials(extra: dict) -> list[Check]:
             else "No signing secret — the adapter will refuse to start. Set "
             f"{WEBHOOK_SECRET_ENV} to your project's signing secret.",
         ),
-        # Not a failure: a project-scoped key implies its project, and that is
-        # every key today. It stops being implied once an organisation-level
-        # key can reach several projects, and an unscoped key would then let
-        # this gateway act on a same-named connection in the wrong one.
-        Check(
-            True,
-            f"Project pinned to {project}"
-            if project
-            else "Project not pinned — fine for a project-scoped API key, "
-            f"which is every key today. Set {PROJECT_ID_ENV} before moving to "
-            "an organisation-level key.",
-            note=""
-            if project
-            else "An org-level key reaches several projects, and nothing here "
-            "would say which one to act on.",
-        ),
     ]
 
 
@@ -477,14 +459,30 @@ def _check_routes(routes: dict) -> Check:
     )
 
 
-def _cli_config_project(path: Path) -> str:
-    """The project id recorded in a Hookdeck CLI config, if it has one."""
+def _cli_config_project(path: Path) -> tuple[str, bool]:
+    """The active profile's project id, and whether the file could be read.
+
+    A Hookdeck CLI config is multi-section with a top-level ``profile`` key
+    selecting the active one, so the first ``project_id`` in the file is not
+    necessarily the one the CLI will use. Reading the wrong section reports a
+    mismatch that is not real, which is worse than not checking at all.
+
+    The bool distinguishes "no such file" from "file present, no project in
+    it" — the caller says something different about each.
+    """
     try:
         text = path.read_text()
     except OSError:
-        return ""
-    match = re.search(r"^\s*project_id\s*=\s*['\"]?([^'\"\s]+)", text, re.M)
-    return match.group(1) if match else ""
+        return "", False
+
+    named = re.search(r"^\s*profile\s*=\s*['\"]?([^'\"\s]+)", text, re.M)
+    profile = named.group(1) if named else "default"
+    section = re.search(
+        rf"^\[{re.escape(profile)}\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S
+    )
+    body = section.group(1) if section else text
+    found = re.search(r"^\s*project_id\s*=\s*['\"]?([^'\"\s]+)", body, re.M)
+    return (found.group(1) if found else ""), True
 
 
 def _api_key_project() -> str:
@@ -519,21 +517,26 @@ def _check_cli_project(extra: dict) -> Check:
     CLI_DISCONNECTED ignored events.
     """
     configured = extra.get("cli_config_path")
-    owned = Path(configured).expanduser() if configured else default_cli_config_path()
     if configured == "":
-        ambient = Path.home() / ".config" / "hookdeck" / "config.toml"
-        cli_project = _cli_config_project(ambient)
-        source = f"your own session ({ambient})"
+        path = Path.home() / ".config" / "hookdeck" / "config.toml"
+        source = f"your own session ({path})"
     else:
-        cli_project = _cli_config_project(owned)
-        source = f"the gateway's own session ({owned})"
-        if not cli_project:
-            return Check(
-                True,
-                "The gateway will authenticate its own CLI session on start",
-                note=f"{owned} does not exist yet; it is created from the API "
-                "key, so it cannot point at the wrong project.",
-            )
+        # Matches AdapterSettings: absent or None means the gateway's own.
+        path = (
+            Path(str(configured)).expanduser()
+            if configured
+            else default_cli_config_path()
+        )
+        source = f"the gateway's own session ({path})"
+
+    cli_project, readable = _cli_config_project(path)
+    if configured != "" and not readable:
+        return Check(
+            True,
+            "The gateway will authenticate its own CLI session on start",
+            note=f"{path} does not exist yet; it is created from the API key, "
+            "so it cannot point at the wrong project.",
+        )
 
     key_project = _api_key_project()
     if not key_project:
@@ -543,18 +546,29 @@ def _check_cli_project(extra: dict) -> Check:
             note="Re-run doctor after `hermes hookdeck setup`.",
         )
     if not cli_project:
-        return Check(False, f"Could not read a project from {source}")
+        return Check(
+            False,
+            f"No project recorded in {source}",
+            note="The file exists but names no project for its active profile. "
+            "Re-authenticate the CLI, or delete the file and let the gateway "
+            "create it.",
+        )
     if cli_project == key_project:
         return Check(True, f"CLI and API key agree on project {key_project}")
+
+    fix = (
+        "Remove platforms.hookdeck.extra.cli_config_path so the gateway pins "
+        "its own CLI session from the API key."
+        if configured == ""
+        else "Delete the file and let the gateway re-create it from the API key."
+    )
     return Check(
         False,
         f"Project mismatch: the API key manages {key_project} but the CLI "
         f"forwards from {cli_project}",
         note="setup provisions one project while `hookdeck listen` forwards "
-        "from the other. The gateway will look healthy and every event will "
-        "become a CLI_DISCONNECTED ignored event. Remove "
-        "platforms.hookdeck.extra.cli_config_path to let the gateway pin its "
-        "own CLI session from the API key.",
+        f"from the other. The gateway will look healthy and every event will "
+        f"become a CLI_DISCONNECTED ignored event. {fix}",
     )
 
 
