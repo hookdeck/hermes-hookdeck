@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import pytest
 
-from hookdeck import constants
-from hookdeck.constants import MODE_ENV, PROJECT_ID_ENV, WEBHOOK_SECRET_ENV
+from hookdeck.constants import (
+    MODE_ENV,
+    PATH_ENV,
+    PROJECT_ID_ENV,
+    SOURCE_ENV,
+    WEBHOOK_SECRET_ENV,
+)
 from hookdeck.settings import AdapterSettings
 
 MINIMAL = {"secret": "whsec_x", "routes": {"a": {"source": "s"}}}
 
 
 def test_defaults_are_the_conservative_ones(monkeypatch):
-    monkeypatch.delenv("HOOKDECK_MODE", raising=False)
+    monkeypatch.delenv(MODE_ENV, raising=False)
     settings = AdapterSettings.from_extra(MINIMAL)
     assert settings.mode == "cli"
     assert settings.ack_mode == "async_retry"
@@ -24,7 +29,7 @@ def test_defaults_are_the_conservative_ones(monkeypatch):
 def test_config_wins_over_the_environment(monkeypatch):
     # The other way round would let a stray shell export silently outrank the
     # file the operator is looking at.
-    monkeypatch.setenv("HOOKDECK_PATH", "/from-env")
+    monkeypatch.setenv(PATH_ENV, "/from-env")
     assert AdapterSettings.from_extra({**MINIMAL, "path": "/from-config"}).path == (
         "/from-config"
     )
@@ -75,14 +80,14 @@ def test_verification_is_off_only_for_the_local_testing_escape_hatch():
     ],
 )
 def test_a_configuration_that_cannot_run_is_refused_at_startup(extra, message, monkeypatch):
-    monkeypatch.delenv("HOOKDECK_WEBHOOK_SECRET", raising=False)
-    monkeypatch.delenv("HOOKDECK_SOURCE", raising=False)
+    monkeypatch.delenv(WEBHOOK_SECRET_ENV, raising=False)
+    monkeypatch.delenv(SOURCE_ENV, raising=False)
     with pytest.raises(ValueError, match=message):
         AdapterSettings.from_extra(extra).validate()
 
 
 def test_a_valid_configuration_passes(monkeypatch):
-    monkeypatch.delenv("HOOKDECK_MODE", raising=False)
+    monkeypatch.delenv(MODE_ENV, raising=False)
     AdapterSettings.from_extra(MINIMAL).validate()
 
 
@@ -114,31 +119,6 @@ def test_the_default_is_used_when_nothing_is_configured(monkeypatch):
 
     monkeypatch.setattr("hookdeck.settings.load_hermes_config", dict)
     assert configured_state_path() == default_state_path()
-
-
-def test_the_pre_namespace_env_vars_still_work(monkeypatch, caplog):
-    """A rename must not be the reason someone's gateway stops booting.
-
-    These names were documented before the plugin was ever published, so a
-    git-installed gateway may well have them exported. They keep working and
-    say so once.
-    """
-    monkeypatch.delenv(WEBHOOK_SECRET_ENV, raising=False)
-    monkeypatch.delenv(MODE_ENV, raising=False)
-    monkeypatch.setenv("HOOKDECK_WEBHOOK_SECRET", "legacy_secret")
-    monkeypatch.setenv("HOOKDECK_MODE", "push")
-    constants._WARNED.clear()
-
-    settings = AdapterSettings.from_extra({})
-    assert settings.signing_secret == "legacy_secret"
-    assert settings.mode == "push"
-    assert "HOOKDECK_WEBHOOK_SECRET is deprecated" in caplog.text
-
-
-def test_the_namespaced_env_var_wins_over_the_old_one(monkeypatch):
-    monkeypatch.setenv("HOOKDECK_WEBHOOK_SECRET", "old")
-    monkeypatch.setenv(WEBHOOK_SECRET_ENV, "new")
-    assert AdapterSettings.from_extra({}).signing_secret == "new"
 
 
 def test_config_still_outranks_both(monkeypatch):

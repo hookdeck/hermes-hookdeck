@@ -10,6 +10,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from hookdeck.adapter import HookdeckAdapter
+from hookdeck.constants import WEBHOOK_SECRET_ENV
 from hookdeck.state import DeliveryLedger
 from hookdeck.verify import compute_signature
 from tests.hermes_stub import PlatformConfig, ProcessingOutcome, SendResult
@@ -461,7 +462,7 @@ def test_startup_refuses_an_unknown_ack_mode(tmp_path):
 
 
 def test_startup_refuses_a_missing_secret(tmp_path, monkeypatch):
-    monkeypatch.delenv("HOOKDECK_WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv(WEBHOOK_SECRET_ENV, raising=False)
     config = PlatformConfig(
         extra={"mode": "push", "host": "0.0.0.0", "secret": "", "routes": {"a": {}}}
     )

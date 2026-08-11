@@ -1,8 +1,10 @@
 # Tag-driven release to PyPI.
 #
 #   1. bump `__version__` in hookdeck/__init__.py (pyproject reads it from there)
-#   2. update CHANGELOG.md
-#   3. git tag v0.2.0 && git push --tags
+#   2. git tag v0.2.0 && git push --tags
+#
+# Release notes are generated from the commits in the range, so the commit
+# messages are the changelog.
 #
 # Publishing uses PyPI Trusted Publishing (OIDC), so there is no API token in
 # the repository to leak or rotate. It needs a one-time setup on PyPI:
@@ -87,4 +89,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" \
-            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md)."
+            --generate-notes

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from hookdeck.constants import API_KEY_ENV, CLI_API_KEY_ENV
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / "hookdeck" / "dashboard" / "plugin_api.py"
 
 
@@ -38,7 +40,7 @@ async def test_only_this_gateways_connections_get_controls(plugin_api, monkeypat
     # The tab renders a Pause button next to every connection it is given. A
     # project's other connections are unrelated production traffic, so showing
     # them puts an outage one misclick away.
-    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    monkeypatch.setenv(API_KEY_ENV, "key")
     monkeypatch.setattr(
         plugin_api,
         "_load_hermes_config",
@@ -69,7 +71,7 @@ async def test_only_this_gateways_connections_get_controls(plugin_api, monkeypat
 
 
 async def test_the_age_metric_is_not_surfaced(plugin_api, monkeypatch):
-    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    monkeypatch.setenv(API_KEY_ENV, "key")
     monkeypatch.setattr(plugin_api, "_load_hermes_config", lambda: {})
 
     class FakeAPI:
@@ -90,7 +92,8 @@ async def test_the_age_metric_is_not_surfaced(plugin_api, monkeypatch):
 
 
 async def test_a_missing_api_key_is_reported_not_raised(plugin_api, monkeypatch):
-    monkeypatch.delenv("HOOKDECK_API_KEY", raising=False)
+    monkeypatch.delenv(API_KEY_ENV, raising=False)
+    monkeypatch.delenv(CLI_API_KEY_ENV, raising=False)
     result = await plugin_api.overview()
     assert result["hookdeck"]["configured"] is False
     # The adapter runs regardless; the tab is observability, not a dependency.

@@ -212,10 +212,6 @@ happened to get there first.
 | `HOOKDECK_EG_SOURCE` | Shared source for routes that do not name their own. |
 | `HOOKDECK_EG_ALLOWED_USERS`, `HOOKDECK_EG_ALLOW_ALL_USERS` | Only consulted for `INSECURE_NO_AUTH` routes. |
 
-Anything set under the old bare `HOOKDECK_` name still works and logs a
-deprecation warning naming its replacement. That fallback exists because these
-names were documented before the plugin was published; it will go at 1.0.
-
 **The API key is the deliberate exception.** `HOOKDECK_API_KEY` is what the
 Hookdeck CLI itself reads, and this adapter passes it straight through to the
 `hookdeck listen` subprocess it spawns. Insisting on a second name for one
