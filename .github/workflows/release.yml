@@ -87,6 +87,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # v0.1.0rc1 and friends are pre-releases. Saying so keeps them off
+          # the repository's "latest release", which otherwise points people at
+          # a release candidate.
+          prerelease=""
+          case "$GITHUB_REF_NAME" in
+            *a[0-9]*|*b[0-9]*|*rc[0-9]*) prerelease="--prerelease" ;;
+          esac
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes
+            --generate-notes $prerelease
