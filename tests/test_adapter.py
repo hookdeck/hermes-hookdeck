@@ -1082,6 +1082,59 @@ async def test_a_timed_out_sync_run_still_hands_its_failure_back(client_factory,
     assert adapter._api.retried == ["evt_slow_fail"]
 
 
+async def test_an_abandoned_hand_back_still_clears_its_sync_marker(
+    client_factory, monkeypatch
+):
+    """The marker goes once the hand-back decision is made, not once it works.
+
+    Keeping it on the failure path grows the set for the life of the process,
+    and a later sync-mode run of the same id would be treated as having been
+    acked early when it was not.
+    """
+    from hookdeck.api import HookdeckAPIError
+
+    monkeypatch.setattr("hookdeck.adapter._REDELIVERY_RETRY_INITIAL_SECONDS", 0.0)
+    adapter, client = await client_factory(
+        {"default": {}}, ack_mode="sync", sync_timeout_seconds=0.05
+    )
+    adapter._api.fail_with = HookdeckAPIError(0, "POST", "/events/x/retry", "no route")
+    gate = asyncio.Event()
+
+    async def _slow_failure(_event):
+        await gate.wait()
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _slow_failure
+    assert (await post(client, {"n": 1}, event_id="evt_abandoned")).status == 202
+    assert "evt_abandoned" in adapter._acked_before_completion
+
+    gate.set()
+    await _settle()
+    assert adapter._api.retried == []
+    assert adapter._acked_before_completion == set()
+
+
+async def test_an_exhausted_event_clears_its_sync_marker_too(client_factory):
+    adapter, client = await client_factory(
+        {"default": {}},
+        ack_mode="sync",
+        sync_timeout_seconds=0.05,
+        max_agent_retries=0,
+    )
+    gate = asyncio.Event()
+
+    async def _slow_failure(_event):
+        await gate.wait()
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _slow_failure
+    assert (await post(client, {"n": 1}, event_id="evt_spent")).status == 202
+
+    gate.set()
+    await _settle()
+    assert adapter._acked_before_completion == set()
+
+
 async def test_a_sync_failure_within_the_timeout_is_left_to_hookdeck(client_factory):
     # The 5xx response *is* the retry request there; asking again would double
     # the redeliveries.
