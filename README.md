@@ -398,9 +398,14 @@ than core's exemption, which covers built-in webhook routes even unverified.
   signing secret entered on the source in the Hookdeck dashboard. `setup`
   creates the source with the right verification shape but cannot invent the
   secret.
-- The plugin does not poll. Hookdeck has no pull/consumer API — the Events API
-  is inspection-only, with no ack, lease or consumer group — so if you cannot
-  run the CLI and cannot expose a URL, it will not help you.
+- Delivery is push-only, in both directions. Hookdeck pushes to the adapter and
+  the adapter pushes retry requests back; there is no lease-and-ack loop, and no
+  pull API to build one from — the Events API is for inspection, with no ack,
+  lease or consumer group. Two consequences worth being explicit about. If you
+  can neither run the CLI nor expose a URL, this plugin cannot help you. And
+  "the event is safe in Hookdeck" holds because a delivered-but-failed event
+  stays retryable, not because anything is holding a lock on it — which is why
+  boot recovery has to reconcile `running` ledger rows itself.
 - Delivery groups throttle per subject by rate, not by concurrency, because
   Hookdeck's group-level period is `second|minute|hour`.
 - Every recovery path is bounded by your plan's retention: 3 days on
@@ -413,6 +418,62 @@ than core's exemption, which covers built-in webhook routes even unverified.
 - Boot-time recovery re-runs an event whose run might in fact have completed
   in the instant before a crash. That is the at-least-once contract the whole
   design assumes; set `recover_on_boot: false` if it is wrong for your routes.
+
+## Hookdeck can do more than this plugin asks it to
+
+The list above is what *cannot* be done. This is the other kind of boundary:
+things Hookdeck offers that the plugin simply does not wire up yet, so nobody
+mistakes the edge of `hookdeck/api.py` for the edge of the product. Each is a
+candidate, not a promise — [issues and PRs welcome](https://github.com/hookdeck/hermes-hookdeck/issues).
+
+**Getting events in.** The
+[Publish API](https://hookdeck.com/docs/api/publish.md) —
+`POST https://hkdk.events/v1/publish` with an `X-Hookdeck-Source-Name` header —
+sends a request to any source, authenticated with the same API key everything
+else here uses. Nothing in the plugin calls it, and two uses stand out: a
+`hermes hookdeck test <route>` that puts a real event through the real
+connection without waiting for a provider to fire one, and a way for Hermes to
+enqueue durable work for itself — the queue, ledger, retry and replay machinery
+all apply to a published event exactly as to a provider's.
+
+**Recovering what the queue calls "ignored".** The CLI-mode caveat above — that
+events arriving with no listener attached become `CLI_DISCONNECTED` ignored
+events and are discarded — is stated against what the plugin currently does with
+them, which is nothing. Hookdeck has
+[`POST /bulk/ignored-events/retry`](https://hookdeck.com/docs/api/bulk.md#bulk-retry-ignored-events),
+which retries ignored events matching a `cause`. Whether `CLI_DISCONNECTED` is
+among the causes it accepts needs confirming against a live project — the docs
+show `FILTERED` and `TRANSFORMATION_FAILED` — but if it is, the sharpest edge in
+CLI mode has a recovery path and `hermes hookdeck doctor` should be pointing at
+it.
+
+**Bulk operations with the safety catch on.** `hookdeck_bulk_retry` is an
+*agent-callable* tool that fires `POST /bulk/events/retry` immediately. Hookdeck
+estimates a bulk operation before running it (`GET /bulk/events/retry/plan`),
+and can cancel one in flight (`POST /bulk/events/retry/{id}/cancel`). An agent
+that could see "this would re-run 4,000 events" before committing is a
+materially safer agent. `POST /bulk/events/cancel` is the other half — a way to
+stop a flood rather than grind through it.
+
+**Requests, not just events.** A Hookdeck *request* is what the provider sent; an
+*event* is one connection's copy of it. `/bulk/requests/retry` and
+`/bulk/requests/replay` re-run the request, producing fresh events for every
+matching connection. That is the right instrument after fixing a connection that
+was misconfigured when the traffic arrived, and the plugin only knows about
+events.
+
+**Alerting and shaping.** [Issue triggers and
+notifications](https://hookdeck.com/docs/api) can tell you a connection is
+failing without anyone watching `hermes hookdeck status`; `setup` provisions
+none. [Transformations](https://hookdeck.com/docs/api) run JavaScript on an
+event before delivery — the documented workaround for the XML limitation above
+is to add one by hand, and `setup` could manage it. Destinations can also carry
+their own auth (bearer, basic, API key); the plugin pins
+`HOOKDECK_SIGNATURE`, which is the right default and currently the only option.
+
+**Metrics beyond queue depth.** The dashboard tab reads
+`GET /metrics/queue-depth`. Hookdeck also exposes request, event, attempt and
+events-by-issue metrics, which would turn that panel from a number into a trend.
 
 ## Verified end to end
 
