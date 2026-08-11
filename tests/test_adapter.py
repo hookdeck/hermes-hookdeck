@@ -123,6 +123,24 @@ async def test_delivery_signed_with_the_wrong_secret_is_rejected(client_factory)
     assert response.status == 401
 
 
+async def test_a_malformed_signature_is_refused_not_a_server_error(client_factory):
+    """A junk signature must answer 401, like any other forged one.
+
+    A non-ASCII byte in the header used to raise out of the verification path
+    and become a 500 — which skips ``assert_declared_status`` entirely and,
+    because the provisioned retry rule covers ``500-599``, had Hookdeck retry
+    an unauthenticated request instead of dropping it.
+    """
+    _adapter, client = await client_factory({"default": {}})
+    response = await post(
+        client,
+        {"hello": "world"},
+        sign=False,
+        extra_headers={"x-hookdeck-signature": "not-base64-é"},
+    )
+    assert response.status == 401
+
+
 async def test_unmatched_source_returns_404(client_factory):
     _adapter, client = await client_factory(
         {"github": {"source": "github"}, "stripe": {"source": "stripe"}}
