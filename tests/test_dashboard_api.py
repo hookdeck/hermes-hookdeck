@@ -127,3 +127,107 @@ def test_it_reuses_an_already_imported_package():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert sys.modules["hookdeck"] is hookdeck
+
+
+# ----------------------------------------------------------------------
+# Acting on a connection, not just displaying it
+# ----------------------------------------------------------------------
+
+
+class _ActionAPI:
+    """Records mutations and answers name lookups from `owned`."""
+
+    def __init__(self, owned: dict[str, str]):
+        self.owned = owned
+        self.paused: list[str] = []
+        self.unpaused: list[str] = []
+        self.retried: list[str] = []
+        self.lookups: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    async def list_connections(self, **params):
+        name = params.get("name", "")
+        self.lookups.append(name)
+        found = [{"id": cid} for cid, n in self.owned.items() if n == name]
+        return {"models": found}
+
+    async def pause_connection(self, connection_id):
+        self.paused.append(connection_id)
+
+    async def unpause_connection(self, connection_id):
+        self.unpaused.append(connection_id)
+
+    async def retry_event(self, event_id):
+        self.retried.append(event_id)
+
+
+@pytest.fixture()
+def acting(plugin_api, monkeypatch):
+    """Configure two routes, and hand every endpoint one recording client."""
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    monkeypatch.setattr(
+        plugin_api,
+        "_load_hermes_config",
+        lambda: {
+            "gateway": {
+                "platforms": {
+                    "hookdeck": {"extra": {"routes": {"mine": {}, "also-mine": {}}}}
+                }
+            }
+        },
+    )
+    api = _ActionAPI({"c1": "mine", "c2": "also-mine"})
+    monkeypatch.setattr(plugin_api, "HookdeckAPI", lambda *a, **k: api)
+    return api
+
+
+async def test_a_connection_named_by_a_route_can_be_paused(plugin_api, acting):
+    assert await plugin_api.pause("c1") == {"status": "paused", "connection_id": "c1"}
+    assert acting.paused == ["c1"]
+
+
+async def test_every_configured_route_is_checked_not_just_the_first(
+    plugin_api, acting
+):
+    # Stopping at the first route would refuse a legitimate second connection.
+    await plugin_api.pause("c2")
+    assert acting.lookups == ["mine", "also-mine"]
+    assert acting.paused == ["c2"]
+
+
+@pytest.mark.parametrize("action", ["pause", "resume"])
+async def test_a_connection_this_gateway_does_not_own_is_refused(
+    plugin_api, acting, action
+):
+    # The endpoint is reachable whether or not the tab renders a button for
+    # it, and the connection on the other end is somebody's production
+    # traffic. Filtering the list is presentation; this is the control.
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as raised:
+        await getattr(plugin_api, action)("c_someone_elses")
+
+    assert raised.value.status_code == 403
+    assert "does not belong to a configured route" in raised.value.detail
+    assert acting.paused == [] and acting.unpaused == []
+
+
+async def test_an_owned_connection_can_be_resumed(plugin_api, acting):
+    assert await plugin_api.resume("c1") == {"status": "resumed", "connection_id": "c1"}
+    assert acting.unpaused == ["c1"]
+
+
+async def test_retrying_an_event_needs_no_ownership_check(plugin_api, acting):
+    # Retry is scoped by the event id itself, and an id from another project
+    # simply 404s at Hookdeck — there is no connection to mistake.
+    assert await plugin_api.retry_event("evt_1") == {
+        "status": "queued",
+        "event_id": "evt_1",
+    }
+    assert acting.retried == ["evt_1"]
+    assert acting.lookups == []
