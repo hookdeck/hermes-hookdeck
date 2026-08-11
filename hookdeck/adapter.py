@@ -555,9 +555,14 @@ class HookdeckAdapter(WebhookAdapter):
     ) -> tuple[Delivery, Optional[web.Response]]:
         """Build a :class:`Delivery` from a verified request."""
         source_name = self._header(request, SOURCE_NAME)
-        event_id = self._header(request, EVENT_ID) or request.headers.get(
-            "X-Request-ID", ""
-        )
+        # No fallback. An id that did not come from Hookdeck is worse than
+        # none: `_admit` has a deliberate branch for a delivery with no event
+        # id, which warns loudly and names `header_prefix` as the likely cause,
+        # and a substitute id silences exactly that warning while breaking both
+        # things the id is for. Dedup keyed on a value Hookdeck did not mint is
+        # dedup on the wrong thing, and `POST /events/{id}/retry` with it 404s,
+        # so the failed run is never handed back.
+        event_id = self._header(request, EVENT_ID)
         try:
             attempt = int(self._header(request, ATTEMPT_COUNT) or 0)
         except ValueError:
