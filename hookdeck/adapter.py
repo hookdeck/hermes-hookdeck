@@ -968,6 +968,7 @@ class HookdeckAdapter(WebhookAdapter):
             self._ledger.mark_exhausted(
                 event_id, reason, session_chat_id=session_chat_id
             )
+            self._acked_before_completion.discard(event_id)
             logger.error(
                 "[hookdeck] Event %s failed %d times — giving up. Inspect it in "
                 "Hookdeck and replay with `hermes hookdeck replay %s`.",
@@ -991,7 +992,14 @@ class HookdeckAdapter(WebhookAdapter):
             )
 
         self._ledger.mark_failed(event_id, reason, session_chat_id=session_chat_id)
-        if not self._should_hand_back(event_id):
+        hand_back = self._should_hand_back(event_id)
+        # The marker has done its job the moment that decision is made, whether
+        # or not the hand-back then succeeds. Leaving it behind on the failure
+        # path would grow the set for the lifetime of the process, and a later
+        # sync-mode run of the same event would be treated as having been acked
+        # early when it was not.
+        self._acked_before_completion.discard(event_id)
+        if not hand_back:
             return
         if await self._request_redelivery(event_id):
             logger.info(
@@ -1029,7 +1037,6 @@ class HookdeckAdapter(WebhookAdapter):
         for attempt in range(1, _REDELIVERY_ATTEMPTS + 1):
             try:
                 await self._api.retry_event(event_id)
-                self._acked_before_completion.discard(event_id)
                 return True
             except HookdeckAPIError as exc:
                 last = exc
