@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: ruff check --output-format=github .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor is `requires-python`; the ceiling is whatever is current.
+        # Hermes decides which of these a real install runs on, so the plugin
+        # should not be the thing that narrows it.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e '.[dev]'
+      - run: python -m pytest -q
+
+  package:
+    # A plugin that installs without its manifest, dashboard bundle or skill
+    # registers nothing, and the failure is silent — the platform simply never
+    # appears. Building the artifact and looking inside it is the only way that
+    # gets caught before a release.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - name: The wheel must carry the non-Python half of the plugin
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/*.whl)
+          echo "inspecting $wheel"
+          contents=$(python -m zipfile --list "$wheel")
+          for required in \
+            hookdeck/plugin.yaml \
+            hookdeck/dashboard/manifest.json \
+            hookdeck/dashboard/dist/index.js \
+            hookdeck/skills/triage-webhook-failures/SKILL.md
+          do
+            if ! grep -qF "$required" <<<"$contents"; then
+              echo "::error::$required is missing from the wheel"
+              exit 1
+            fi
+            echo "  ✓ $required"
+          done
+      - name: The entry point Hermes discovers the plugin by must be declared
+        run: |
+          set -euo pipefail
+          pip install dist/*.whl
+          python - <<'PY'
+          from importlib.metadata import entry_points
+          found = entry_points(group="hermes_agent.plugins")
+          names = {e.name: e.value for e in found}
+          assert names.get("hookdeck") == "hookdeck", names
+          print("✓ hermes_agent.plugins entry point:", names)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

@@ -1,0 +1,37 @@
+# The test suite runs against tests/hermes_stub.py, because the plugin lives
+# outside the Hermes tree and there is no other way to exercise the ingest path
+# without a Hermes checkout. The blind spot that buys is real: the stub cannot
+# notice when the thing it stands in for changes.
+#
+# So this asks upstream directly, on a schedule rather than on every PR — the
+# answer changes when Hermes changes, not when this repo does. A failure here
+# is a heads-up, not a broken build.
+name: Upstream contract
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+  push:
+    paths:
+      - "scripts/check_upstream_contract.py"
+      - "tests/hermes_stub.py"
+      - ".github/workflows/upstream-contract.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch the parts of Hermes this plugin borrows from
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/NousResearch/hermes-agent.git upstream
+          git -C upstream sparse-checkout set gateway agent
+      - run: python scripts/check_upstream_contract.py upstream

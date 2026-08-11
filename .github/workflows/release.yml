@@ -1,0 +1,90 @@
+# Tag-driven release to PyPI.
+#
+#   1. bump `__version__` in hookdeck/__init__.py (pyproject reads it from there)
+#   2. update CHANGELOG.md
+#   3. git tag v0.2.0 && git push --tags
+#
+# Publishing uses PyPI Trusted Publishing (OIDC), so there is no API token in
+# the repository to leak or rotate. It needs a one-time setup on PyPI:
+# Project → Publishing → add a GitHub publisher for hookdeck/hermes-hookdeck,
+# workflow `release.yml`, environment `pypi`.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]' build twine
+
+      - name: The tag and the package version must agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tagged="${GITHUB_REF_NAME#v}"
+          declared=$(python -c 'import hookdeck; print(hookdeck.__version__)')
+          if [ "$tagged" != "$declared" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match hookdeck.__version__ ($declared)"
+            exit 1
+          fi
+          echo "✓ releasing $declared"
+
+      # A release that cannot pass its own test suite is not a release.
+      - run: ruff check .
+      - run: python -m pytest -q
+
+      - run: python -m build
+      - run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hermes-hookdeck
+    permissions:
+      # The OIDC token pypa/gh-action-pypi-publish exchanges for an upload
+      # token. Nothing else in this workflow needs it, which is why it is
+      # scoped to this job rather than the file.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md)."

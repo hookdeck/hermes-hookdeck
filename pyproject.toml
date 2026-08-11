@@ -1,6 +1,9 @@
 [project]
 name = "hermes-hookdeck"
-version = "0.1.0"
+# Read from `hookdeck.__version__` rather than repeated here. Two copies drift,
+# and the one that drifts is always the one nobody looks at — `hermes plugins`
+# reports the module's, PyPI reports this one.
+dynamic = ["version"]
 description = "Hookdeck event gateway plugin for Hermes Agent — verified, queued, retryable webhook triggers"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -79,6 +82,9 @@ ignore = [
 # something that cannot register.
 packages = ["hookdeck", "hookdeck.dashboard"]
 include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "hookdeck.__version__" }
 
 [tool.setuptools.package-data]
 hookdeck = [
