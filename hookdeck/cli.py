@@ -34,8 +34,13 @@ from .provision import (
     summarise_payload,
     uncovered_statuses,
 )
-from .settings import configured_state_path, load_hermes_config, platform_extra
 from .ledger import RunLedger
+from .settings import (
+    configured_state_path,
+    default_cli_config_path,
+    load_hermes_config,
+    platform_extra,
+)
 
 # ----------------------------------------------------------------------
 # Config helpers
@@ -472,6 +477,87 @@ def _check_routes(routes: dict) -> Check:
     )
 
 
+def _cli_config_project(path: Path) -> str:
+    """The project id recorded in a Hookdeck CLI config, if it has one."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return ""
+    match = re.search(r"^\s*project_id\s*=\s*['\"]?([^'\"\s]+)", text, re.M)
+    return match.group(1) if match else ""
+
+
+def _api_key_project() -> str:
+    """Which project the API key belongs to, read off anything it can see."""
+    async def _go() -> str:
+        async with HookdeckAPI() as api:
+            for fetch in (api.list_connections, api.list_sources):
+                try:
+                    result = await fetch(limit=1)
+                except (HookdeckAPIError, AttributeError):
+                    continue
+                models = (result or {}).get("models") or []
+                if models and models[0].get("team_id"):
+                    return str(models[0]["team_id"])
+        return ""
+
+    try:
+        return run_sync(_go())
+    except Exception:  # noqa: BLE001 - a diagnostic must not raise
+        return ""
+
+
+def _check_cli_project(extra: dict) -> Check:
+    """The two projects in play must be the same one.
+
+    An API key decides which project `setup`, `status` and the retry hand-back
+    act on. The Hookdeck CLI's own config decides which project `hookdeck
+    listen` forwards from. Nothing reconciles them, and when they differ every
+    visible signal says the gateway is fine: `setup` succeeds, the adapter logs
+    that it is listening, and only the tunnel's restart loop — "no connection
+    found matching filter" — says otherwise, while events accumulate as
+    CLI_DISCONNECTED ignored events.
+    """
+    configured = extra.get("cli_config_path")
+    owned = Path(configured).expanduser() if configured else default_cli_config_path()
+    if configured == "":
+        ambient = Path.home() / ".config" / "hookdeck" / "config.toml"
+        cli_project = _cli_config_project(ambient)
+        source = f"your own session ({ambient})"
+    else:
+        cli_project = _cli_config_project(owned)
+        source = f"the gateway's own session ({owned})"
+        if not cli_project:
+            return Check(
+                True,
+                "The gateway will authenticate its own CLI session on start",
+                note=f"{owned} does not exist yet; it is created from the API "
+                "key, so it cannot point at the wrong project.",
+            )
+
+    key_project = _api_key_project()
+    if not key_project:
+        return Check(
+            True,
+            "Could not determine the API key's project — nothing provisioned yet",
+            note="Re-run doctor after `hermes hookdeck setup`.",
+        )
+    if not cli_project:
+        return Check(False, f"Could not read a project from {source}")
+    if cli_project == key_project:
+        return Check(True, f"CLI and API key agree on project {key_project}")
+    return Check(
+        False,
+        f"Project mismatch: the API key manages {key_project} but the CLI "
+        f"forwards from {cli_project}",
+        note="setup provisions one project while `hookdeck listen` forwards "
+        "from the other. The gateway will look healthy and every event will "
+        "become a CLI_DISCONNECTED ignored event. Remove "
+        "platforms.hookdeck.extra.cli_config_path to let the gateway pin its "
+        "own CLI session from the API key.",
+    )
+
+
 def _check_cli(extra: dict) -> list[Check]:
     """The CLI is only reachable in cli mode, and only the resolved one matters."""
     configured = extra.get("cli_binary") or "hookdeck"
@@ -582,6 +668,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     checks = [*_check_credentials(extra), _check_routes(routes)]
     if mode == "cli":
         checks += _check_cli(extra)
+        checks.append(_check_cli_project(extra))
     else:
         checks.append(
             Check(

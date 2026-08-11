@@ -23,7 +23,7 @@ def test_defaults_are_the_conservative_ones(monkeypatch):
     # Off by default: cancelling retries discards traffic, and `hookdeck ci`
     # rewrites the operator's shared CLI config.
     assert settings.cancel_retries_on_unparseable is False
-    assert settings.cli_login is False
+    assert settings.cli_config_path.endswith("cli-config.toml")
 
 
 def test_config_wins_over_the_environment(monkeypatch):

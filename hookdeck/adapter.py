@@ -298,7 +298,7 @@ class HookdeckAdapter(WebhookAdapter):
                     source=source,
                     connection_name=route_name,
                     binary=self.settings.cli_binary,
-                    login=self.settings.cli_login,
+                    config_path=self.settings.cli_config_path,
                 )
                 await tunnel.start()
                 self._tunnels.append(tunnel)

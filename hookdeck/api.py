@@ -182,6 +182,9 @@ class HookdeckAPI:
     async def list_connections(self, **params: Any) -> Any:
         return await self.request("GET", "/connections", params=params)
 
+    async def list_sources(self, **params: Any) -> Any:
+        return await self.request("GET", "/sources", params=params)
+
     async def pause_connection(self, connection_id: str) -> Any:
         return await self.request("PUT", f"/connections/{connection_id}/pause")
 

@@ -89,6 +89,11 @@ def configured_state_path() -> Path:
     return Path(configured).expanduser() if configured else default_state_path()
 
 
+def default_cli_config_path() -> Path:
+    """Where the gateway keeps its own Hookdeck CLI session."""
+    return default_state_path().parent / "cli-config.toml"
+
+
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
@@ -133,7 +138,10 @@ class AdapterSettings:
     ledger_ttl_seconds: float = DEFAULT_LEDGER_TTL_SECONDS
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     cli_binary: str = "hookdeck"
-    cli_login: bool = False
+    #: A CLI config the gateway owns, so `hookdeck listen` forwards from the
+    #: same project the API key manages. Set to "" to use your own ambient
+    #: `hookdeck login` session instead, and accept that the two can diverge.
+    cli_config_path: str = ""
 
     # ------------------------------------------------------------------
     # Construction
@@ -198,10 +206,15 @@ class AdapterSettings:
             # An npm global shadowing a Homebrew install is the common case,
             # and PATH silently picks the older one.
             cli_binary=text("cli_binary", default="hookdeck"),
-            # Off by default: `hookdeck ci` rewrites the shared CLI config and
-            # repoints its active project — not something starting a gateway
-            # should do to a tool the operator uses for other work.
-            cli_login=bool(extra.get("cli_login", False)),
+            # Beside the ledger, and never the operator's own config: pointing
+            # `hookdeck ci` at the shared file switches its active project,
+            # which is not something starting a gateway should do to a tool
+            # used for other work.
+            cli_config_path=str(
+                extra["cli_config_path"]
+                if "cli_config_path" in extra
+                else default_cli_config_path()
+            ),
         )
 
     # ------------------------------------------------------------------
