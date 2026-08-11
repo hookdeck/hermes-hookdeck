@@ -107,3 +107,53 @@ def test_version_comparison_treats_a_prerelease_as_older():
 
 def test_a_newer_prerelease_still_counts_as_newer():
     assert cli._version_at_least("2.4.0-beta.1", cli.MIN_CLI_VERSION)
+
+
+def test_setup_warns_that_a_concurrency_cap_is_inert_under_an_early_ack(
+    monkeypatch, capsys
+):
+    # Hookdeck counts deliveries open to the destination; async_retry closes
+    # them at the 202. The setting is accepted and never engages, so the moment
+    # someone types the flag is the moment to say so.
+    monkeypatch.setattr(
+        cli,
+        "_load_hermes_config",
+        lambda: {
+            "gateway": {
+                "platforms": {
+                    "hookdeck": {
+                        "extra": {
+                            "ack_mode": "async_retry",
+                            "routes": {"r": {"source": "s"}},
+                        }
+                    }
+                }
+            }
+        },
+    )
+    cli.hookdeck_command(
+        _args(route="r", rate_limit=2, rate_limit_period="concurrent", mode="push",
+              url="https://example.com/hookdeck/r")
+    )
+    assert "has no effect with ack_mode: async_retry" in capsys.readouterr().out
+
+
+def test_no_warning_in_sync_mode_where_the_cap_does_work(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "_load_hermes_config",
+        lambda: {
+            "gateway": {
+                "platforms": {
+                    "hookdeck": {
+                        "extra": {"ack_mode": "sync", "routes": {"r": {"source": "s"}}}
+                    }
+                }
+            }
+        },
+    )
+    cli.hookdeck_command(
+        _args(route="r", rate_limit=2, rate_limit_period="concurrent", mode="push",
+              url="https://example.com/hookdeck/r")
+    )
+    assert "has no effect" not in capsys.readouterr().out

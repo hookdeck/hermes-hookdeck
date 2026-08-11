@@ -175,15 +175,31 @@ In `sync` mode most of this is moot: there the response *is* the outcome and
 Hookdeck drives the retries, leaving only boot recovery for runs that outlasted
 the timeout.
 
-**Backpressure instead of dropping.** `max_concurrent` caps agent runs in
-flight. An event that arrives over the limit gets 503 and a `Retry-After`, so
-Hookdeck keeps it queued and comes back. Nothing is recorded in the ledger for
-a deferred event, so the redelivery is not mistaken for a duplicate. In push
-mode you can push the same limit down into Hookdeck with `--rate-limit N
---rate-limit-period concurrent`. `--group-key` adds a *rate* limit per subject
-(`--group-rate 1 --group-period minute`) — note that delivery groups accept
-only `second|minute|hour`, so per-subject **concurrency** is not expressible;
-`concurrent` works at destination level only.
+**Backpressure that queues in Hookdeck, not here.** `max_concurrent` caps
+agent runs in flight. An event over the limit gets a 503 and a `Retry-After`,
+and that is the whole mechanism — nothing is written down, no local queue
+exists, the event simply stays in Hookdeck and comes back. (Nothing is recorded
+for a deferred event on purpose: a ledger entry would make the redelivery look
+like a duplicate.)
+
+The *count* is local because Hookdeck cannot take it. Its destination rate
+limit with `rate_limit_period: concurrent` caps "simultaneous delivery attempts
+open to the destination", which ends when the connection closes — and in
+`async_retry` that is the 202, milliseconds in, while the run continues for
+seconds or minutes. Set it to 1 and it would still never engage. Hookdeck can
+limit deliveries; only the adapter can see runs. CLI destinations have no
+`rate_limit` field at all, so in the default transport it is not on the table
+either way.
+
+In `sync` mode this inverts: the delivery stays open for the run's duration, so
+a destination-level `--rate-limit N --rate-limit-period concurrent` genuinely
+does cap concurrent runs, and does it better — Hookdeck holds the event without
+a 503 round trip or a dent in its retry budget. Worth preferring there, with
+`max_concurrent` left as the backstop for runs that outlast the sync timeout.
+
+`--group-key` throttles per subject (`--group-rate 1 --group-period minute`).
+Delivery groups accept only `second|minute|hour`, so per-subject *concurrency*
+is not expressible — `concurrent` is destination-level only.
 
 **Outcomes reported, not assumed.** `ack_mode` decides how:
 

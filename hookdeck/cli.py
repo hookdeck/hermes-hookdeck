@@ -185,8 +185,35 @@ def _payload_for_route(args: argparse.Namespace, name: str, route: dict) -> dict
     )
 
 
+def _warn_inert_concurrency(args: argparse.Namespace, config: dict) -> None:
+    """A destination concurrency cap does nothing under an early ack.
+
+    Hookdeck counts delivery attempts open to the destination, and in
+    async_retry the delivery ends at the 202 — milliseconds in, while the run
+    continues. The setting is accepted and simply never engages, which is worth
+    saying at the moment someone types the flag.
+    """
+    if args.rate_limit is None or args.rate_limit_period != "concurrent":
+        return
+    ack_mode = platform_extra(config).get("ack_mode") or "async_retry"
+    if ack_mode != "async_retry":
+        return
+    print(
+        "! --rate-limit-period concurrent has no effect with "
+        "ack_mode: async_retry. Hookdeck counts deliveries still open to the "
+        "destination, and this adapter answers 202 in milliseconds, so the "
+        "limit never engages. Cap runs with "
+        "platforms.hookdeck.extra.max_concurrent, or switch to ack_mode: sync "
+        "where the delivery stays open for the run.\n"
+    )
+
+
 def _cmd_setup(args: argparse.Namespace) -> int:
-    routes = routes_from_config(_load_hermes_config())
+    # Read once and pass it down: `_platform_extra()` with no argument re-reads
+    # the file, and two reads in one command can disagree.
+    config = _load_hermes_config()
+    routes = routes_from_config(config)
+    _warn_inert_concurrency(args, config)
     if args.all:
         targets = routes
     elif args.route:
