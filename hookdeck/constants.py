@@ -8,10 +8,7 @@ the documented defaults.
 
 from __future__ import annotations
 
-import logging
 import os
-
-logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "hookdeck"
 
@@ -26,8 +23,6 @@ DEFAULT_HEADER_PREFIX = "x-hookdeck"
 # prefix claims the whole namespace for whichever integration got there first.
 # `HOOKDECK_EG_` says which product the value configures.
 ENV_PREFIX = "HOOKDECK_EG_"
-#: What these were called before the rename. Still honoured, with a warning.
-LEGACY_ENV_PREFIX = "HOOKDECK_"
 
 WEBHOOK_SECRET_ENV = f"{ENV_PREFIX}WEBHOOK_SECRET"
 MODE_ENV = f"{ENV_PREFIX}MODE"
@@ -65,40 +60,6 @@ PROJECT_ID_ENV = f"{ENV_PREFIX}PROJECT_ID"
 #: API still calls a project a "team" on the wire; the operator-facing name has
 #: been "project" for a while, so the config says project and this says team.
 PROJECT_HEADER = "X-Team-Id"
-
-#: Legacy names already warned about, so a long-running gateway says it once.
-_WARNED: set[str] = set()
-
-
-def env(name: str, default: str = "") -> str:
-    """Read a namespaced adapter variable, honouring its pre-rename name.
-
-    ``HOOKDECK_EG_MODE`` wins; ``HOOKDECK_MODE`` still works and says so once.
-    The fallback exists because the plugin documented the old names before it
-    was ever published, and a gateway that refuses to start over a rename is a
-    worse outcome than a warning.
-    """
-    value = os.getenv(name)
-    if value:
-        return value
-
-    if name.startswith(ENV_PREFIX):
-        legacy = LEGACY_ENV_PREFIX + name[len(ENV_PREFIX) :]
-        value = os.getenv(legacy)
-        if value:
-            if legacy not in _WARNED:
-                _WARNED.add(legacy)
-                logger.warning(
-                    "[hookdeck] %s is deprecated — rename it to %s. Hookdeck "
-                    "env vars are namespaced per product now, and the bare "
-                    "HOOKDECK_ prefix is not the Event Gateway's to claim.",
-                    legacy,
-                    name,
-                )
-            return value
-
-    return default
-
 
 def api_key() -> str:
     """The Hookdeck API key, namespaced name first, CLI convention second."""

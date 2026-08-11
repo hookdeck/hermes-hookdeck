@@ -27,7 +27,6 @@ from .constants import (
     PROJECT_ID_ENV,
     WEBHOOK_SECRET_ENV,
     api_key,
-    env,
 )
 from .provision import (
     build_connection_payload,
@@ -427,8 +426,8 @@ class Check:
 
 def _check_credentials(extra: dict) -> list[Check]:
     key = api_key()
-    secret = extra.get("secret") or env(WEBHOOK_SECRET_ENV)
-    project = extra.get("project_id") or env(PROJECT_ID_ENV)
+    secret = extra.get("secret") or os.getenv(WEBHOOK_SECRET_ENV)
+    project = extra.get("project_id") or os.getenv(PROJECT_ID_ENV)
     return [
         Check(
             bool(key),
@@ -577,7 +576,7 @@ async def _check_live_connections(routes: dict) -> list[Check]:
 
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     extra = _platform_extra()
-    mode = extra.get("mode") or env(MODE_ENV) or "cli"
+    mode = extra.get("mode") or os.getenv(MODE_ENV) or "cli"
     routes = routes_from_config(_load_hermes_config())
 
     checks = [*_check_credentials(extra), _check_routes(routes)]

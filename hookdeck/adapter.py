@@ -62,7 +62,6 @@ from .constants import (
     WEBHOOK_SECRET_ENV,
     WILL_RETRY_AFTER,
     assert_declared_status,
-    env,
     header_name,
 )
 from .settings import AdapterSettings
@@ -1282,7 +1281,9 @@ def env_enablement() -> dict | None:
     Lets ``hermes gateway status`` report an env-only setup without
     constructing the adapter.
     """
-    secret = env(WEBHOOK_SECRET_ENV)
+    import os
+
+    secret = os.getenv(WEBHOOK_SECRET_ENV, "")
     if not secret:
         return None
     seeded: dict[str, Any] = {"secret": secret}
@@ -1292,7 +1293,7 @@ def env_enablement() -> dict | None:
         (PATH_ENV, "path", str),
         (SOURCE_ENV, "source", str),
     ):
-        value = env(env_var)
+        value = os.getenv(env_var)
         if not value:
             continue
         try:

@@ -8,11 +8,12 @@ API-version base URL live in exactly one place.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from .constants import API_BASE_URL, API_KEY_ENV, PROJECT_HEADER, PROJECT_ID_ENV, env
+from .constants import API_BASE_URL, API_KEY_ENV, PROJECT_HEADER, PROJECT_ID_ENV
 from .constants import api_key as resolve_api_key
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -93,7 +94,9 @@ class HookdeckAPI:
         # Optional while every Hookdeck API key is scoped to one project, so
         # the key implies the project. Organisation-level keys can reach
         # several, and then it has to be said.
-        self.project_id = project_id if project_id is not None else env(PROJECT_ID_ENV)
+        self.project_id = (
+            project_id if project_id is not None else os.getenv(PROJECT_ID_ENV, "")
+        )
         self.base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._client = client

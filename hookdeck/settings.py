@@ -37,7 +37,6 @@ from .constants import (
     PROJECT_ID_ENV,
     SOURCE_ENV,
     WEBHOOK_SECRET_ENV,
-    env,
 )
 from .routing import tunnel_plan
 from .ledger import default_state_path
@@ -152,7 +151,7 @@ class AdapterSettings:
         extra = extra or {}
 
         def text(key: str, env_var: str = "", default: str = "") -> str:
-            return str(extra.get(key) or (env(env_var) if env_var else "") or default)
+            return str(extra.get(key) or (os.getenv(env_var, "") if env_var else "") or default)
 
         mode = text("mode", MODE_ENV, "cli").lower()
 
@@ -162,7 +161,7 @@ class AdapterSettings:
             # cli mode is loopback-only by construction: the CLI is the only
             # thing that should be able to reach the listener.
             host="127.0.0.1" if mode == "cli" else (extra.get("host") or None),
-            port=int(extra.get("port") or env(PORT_ENV) or DEFAULT_PORT),
+            port=int(extra.get("port") or os.getenv(PORT_ENV) or DEFAULT_PORT),
             path="/" + text("path", PATH_ENV, DEFAULT_PATH).strip("/"),
             source=text("source", SOURCE_ENV),
             signing_secret=text("secret", WEBHOOK_SECRET_ENV),
