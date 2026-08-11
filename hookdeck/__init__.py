@@ -17,7 +17,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .constants import PLATFORM_NAME
+from .constants import (
+    ALLOW_ALL_USERS_ENV,
+    ALLOWED_USERS_ENV,
+    PLATFORM_NAME,
+    WEBHOOK_SECRET_ENV,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +55,13 @@ def _register_platform(ctx: Any) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         env_enablement_fn=env_enablement,
-        required_env=["HOOKDECK_WEBHOOK_SECRET"],
+        required_env=[WEBHOOK_SECRET_ENV],
         install_hint=(
             "pip install 'aiohttp==3.14.3' httpx   # aiohttp is a Hermes extra "
             "(messaging/slack/…), not a core dependency"
         ),
-        allowed_users_env="HOOKDECK_ALLOWED_USERS",
-        allow_all_env="HOOKDECK_ALLOW_ALL_USERS",
+        allowed_users_env=ALLOWED_USERS_ENV,
+        allow_all_env=ALLOW_ALL_USERS_ENV,
         emoji="🪝",
         platform_hint=PLATFORM_HINT,
         # Webhook payloads carry third-party names, emails and phone numbers.

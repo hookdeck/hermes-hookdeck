@@ -17,7 +17,7 @@ gateway:
         # public_url: https://agent.example.com
 
         # Verified against x-hookdeck-signature. Prefer the env var.
-        # secret: ${HOOKDECK_WEBHOOK_SECRET}
+        # secret: ${HOOKDECK_EG_WEBHOOK_SECRET}
 
         # async_retry — ack 202 now, ask Hookdeck to redeliver if the run fails.
         # sync        — hold the response until the run finishes (or times out).

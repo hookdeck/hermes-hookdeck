@@ -18,7 +18,17 @@ from pathlib import Path
 from typing import Any
 
 from .api import HookdeckAPI, HookdeckAPIError, run_sync
-from .constants import DEFAULT_PATH, DEFAULT_PORT
+from .constants import (
+    API_KEY_ENV,
+    CLI_API_KEY_ENV,
+    DEFAULT_PATH,
+    DEFAULT_PORT,
+    MODE_ENV,
+    PROJECT_ID_ENV,
+    WEBHOOK_SECRET_ENV,
+    api_key,
+    env,
+)
 from .provision import (
     build_connection_payload,
     routes_from_config,
@@ -262,7 +272,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     result = run_sync(_apply())
     if result == 0:
         print(
-            "\nNext: set HOOKDECK_WEBHOOK_SECRET to your project's signing "
+            f"\nNext: set {WEBHOOK_SECRET_ENV} to your project's signing "
             "secret, then start the gateway. Named source types (STRIPE, "
             "GITHUB, …) still need the provider's own signing secret entered "
             "on the source in the Hookdeck dashboard."
@@ -416,19 +426,40 @@ class Check:
 
 
 def _check_credentials(extra: dict) -> list[Check]:
+    key = api_key()
+    secret = extra.get("secret") or env(WEBHOOK_SECRET_ENV)
+    project = extra.get("project_id") or env(PROJECT_ID_ENV)
     return [
         Check(
-            bool(os.getenv("HOOKDECK_API_KEY")),
-            "HOOKDECK_API_KEY is set"
-            if os.getenv("HOOKDECK_API_KEY")
-            else "HOOKDECK_API_KEY is not set — setup, status and retry will not work",
+            bool(key),
+            f"API key is set ({API_KEY_ENV})"
+            if key
+            else f"No API key — setup, status and retry will not work. Set "
+            f"{API_KEY_ENV} (or {CLI_API_KEY_ENV}, which the Hookdeck CLI "
+            "reads too).",
         ),
         Check(
-            bool(extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET")),
+            bool(secret),
             "Signing secret is configured"
-            if (extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET"))
+            if secret
             else "No signing secret — the adapter will refuse to start. Set "
-            "HOOKDECK_WEBHOOK_SECRET to your project's signing secret.",
+            f"{WEBHOOK_SECRET_ENV} to your project's signing secret.",
+        ),
+        # Not a failure: a project-scoped key implies its project, and that is
+        # every key today. It stops being implied once an organisation-level
+        # key can reach several projects, and an unscoped key would then let
+        # this gateway act on a same-named connection in the wrong one.
+        Check(
+            True,
+            f"Project pinned to {project}"
+            if project
+            else "Project not pinned — fine for a project-scoped API key, "
+            f"which is every key today. Set {PROJECT_ID_ENV} before moving to "
+            "an organisation-level key.",
+            note=""
+            if project
+            else "An org-level key reaches several projects, and nothing here "
+            "would say which one to act on.",
         ),
     ]
 
@@ -546,7 +577,7 @@ async def _check_live_connections(routes: dict) -> list[Check]:
 
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     extra = _platform_extra()
-    mode = extra.get("mode") or os.getenv("HOOKDECK_MODE") or "cli"
+    mode = extra.get("mode") or env(MODE_ENV) or "cli"
     routes = routes_from_config(_load_hermes_config())
 
     checks = [*_check_credentials(extra), _check_routes(routes)]
@@ -572,7 +603,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     )
     _report_stranded_runs()
 
-    if os.getenv("HOOKDECK_API_KEY"):
+    if api_key():
         print()
         try:
             live = run_sync(_check_live_connections(routes))

@@ -31,6 +31,13 @@ from .constants import (
     DEFAULT_RUN_TIMEOUT_SECONDS,
     DEFAULT_SYNC_TIMEOUT_SECONDS,
     INSECURE_NO_AUTH,
+    MODE_ENV,
+    PATH_ENV,
+    PORT_ENV,
+    PROJECT_ID_ENV,
+    SOURCE_ENV,
+    WEBHOOK_SECRET_ENV,
+    env,
 )
 from .routing import tunnel_plan
 from .ledger import default_state_path
@@ -106,6 +113,10 @@ class AdapterSettings:
     # ── Verification ───────────────────────────────────────────────
     signing_secret: str = ""
     header_prefix: str = DEFAULT_HEADER_PREFIX
+    #: Which Hookdeck project the API key acts on. Optional while every key is
+    #: project-scoped; required once an organisation-level key can reach more
+    #: than one.
+    project_id: str = ""
 
     # ── Run semantics ──────────────────────────────────────────────
     ack_mode: str = DEFAULT_ACK_MODE
@@ -140,10 +151,10 @@ class AdapterSettings:
         """
         extra = extra or {}
 
-        def text(key: str, env: str = "", default: str = "") -> str:
-            return str(extra.get(key) or (os.getenv(env) if env else "") or default)
+        def text(key: str, env_var: str = "", default: str = "") -> str:
+            return str(extra.get(key) or (env(env_var) if env_var else "") or default)
 
-        mode = text("mode", "HOOKDECK_MODE", "cli").lower()
+        mode = text("mode", MODE_ENV, "cli").lower()
 
         return cls(
             routes=dict(extra.get("routes") or {}),
@@ -151,10 +162,11 @@ class AdapterSettings:
             # cli mode is loopback-only by construction: the CLI is the only
             # thing that should be able to reach the listener.
             host="127.0.0.1" if mode == "cli" else (extra.get("host") or None),
-            port=int(extra.get("port") or os.getenv("HOOKDECK_PORT") or DEFAULT_PORT),
-            path="/" + text("path", "HOOKDECK_PATH", DEFAULT_PATH).strip("/"),
-            source=text("source", "HOOKDECK_SOURCE"),
-            signing_secret=text("secret", "HOOKDECK_WEBHOOK_SECRET"),
+            port=int(extra.get("port") or env(PORT_ENV) or DEFAULT_PORT),
+            path="/" + text("path", PATH_ENV, DEFAULT_PATH).strip("/"),
+            source=text("source", SOURCE_ENV),
+            signing_secret=text("secret", WEBHOOK_SECRET_ENV),
+            project_id=text("project_id", PROJECT_ID_ENV),
             header_prefix=text("header_prefix", default=DEFAULT_HEADER_PREFIX),
             ack_mode=text("ack_mode", default=DEFAULT_ACK_MODE).lower(),
             max_concurrent=int(extra.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
@@ -237,7 +249,7 @@ class AdapterSettings:
             )
         if not self.signing_secret:
             raise ValueError(
-                "[hookdeck] No signing secret. Set HOOKDECK_WEBHOOK_SECRET (or "
+                f"[hookdeck] No signing secret. Set {WEBHOOK_SECRET_ENV} (or "
                 "platforms.hookdeck.extra.secret) to the signing secret from "
                 "your Hookdeck project settings. For local testing only, set "
                 f"it to '{INSECURE_NO_AUTH}' while bound to loopback."

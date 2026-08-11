@@ -8,9 +8,101 @@ the documented defaults.
 
 from __future__ import annotations
 
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
 PLATFORM_NAME = "hookdeck"
 
 DEFAULT_HEADER_PREFIX = "x-hookdeck"
+
+# ----------------------------------------------------------------------
+# Environment variables
+# ----------------------------------------------------------------------
+#
+# Namespaced to the Event Gateway. Hookdeck's platform is more than one product
+# — Outpost points the other way, at outbound delivery — and a bare `HOOKDECK_`
+# prefix claims the whole namespace for whichever integration got there first.
+# `HOOKDECK_EG_` says which product the value configures.
+ENV_PREFIX = "HOOKDECK_EG_"
+#: What these were called before the rename. Still honoured, with a warning.
+LEGACY_ENV_PREFIX = "HOOKDECK_"
+
+WEBHOOK_SECRET_ENV = f"{ENV_PREFIX}WEBHOOK_SECRET"
+MODE_ENV = f"{ENV_PREFIX}MODE"
+PORT_ENV = f"{ENV_PREFIX}PORT"
+PATH_ENV = f"{ENV_PREFIX}PATH"
+SOURCE_ENV = f"{ENV_PREFIX}SOURCE"
+ALLOWED_USERS_ENV = f"{ENV_PREFIX}ALLOWED_USERS"
+ALLOW_ALL_USERS_ENV = f"{ENV_PREFIX}ALLOW_ALL_USERS"
+
+# The API key is deliberately NOT renamed the same way. `HOOKDECK_API_KEY` is
+# the Hookdeck CLI's own documented variable — `hookdeck ci --api-key` defaults
+# to it, and this adapter passes it through to the `hookdeck listen` subprocess
+# it spawns. Forcing a second name for the same secret would mean setting two
+# variables to one value. So the namespaced name wins if present, and the
+# ecosystem-wide one is a first-class fallback rather than a deprecated one.
+API_KEY_ENV = f"{ENV_PREFIX}API_KEY"
+#: Read when the namespaced name is unset, and the name the CLI subprocess is
+#: always given, whichever of the two the value came from.
+CLI_API_KEY_ENV = "HOOKDECK_API_KEY"
+
+# Which Hookdeck project the API key should act on.
+#
+# Optional today and load-bearing soon. A Hookdeck API key is currently scoped
+# to one project, so the key implies the project and nothing has to say it.
+# Organisation-level keys are coming, and one of those can reach several
+# projects — at which point "the project" is no longer implied by the
+# credential and has to be stated.
+#
+# Setting it now is also a safety improvement rather than only future-proofing:
+# the dashboard decides which connections this gateway may pause by matching
+# *names* against the configured routes, and an unscoped org key would let a
+# same-named connection in an unrelated project match.
+PROJECT_ID_ENV = f"{ENV_PREFIX}PROJECT_ID"
+#: Header that selects the project, sent by the Hookdeck CLI too. Hookdeck's
+#: API still calls a project a "team" on the wire; the operator-facing name has
+#: been "project" for a while, so the config says project and this says team.
+PROJECT_HEADER = "X-Team-Id"
+
+#: Legacy names already warned about, so a long-running gateway says it once.
+_WARNED: set[str] = set()
+
+
+def env(name: str, default: str = "") -> str:
+    """Read a namespaced adapter variable, honouring its pre-rename name.
+
+    ``HOOKDECK_EG_MODE`` wins; ``HOOKDECK_MODE`` still works and says so once.
+    The fallback exists because the plugin documented the old names before it
+    was ever published, and a gateway that refuses to start over a rename is a
+    worse outcome than a warning.
+    """
+    value = os.getenv(name)
+    if value:
+        return value
+
+    if name.startswith(ENV_PREFIX):
+        legacy = LEGACY_ENV_PREFIX + name[len(ENV_PREFIX) :]
+        value = os.getenv(legacy)
+        if value:
+            if legacy not in _WARNED:
+                _WARNED.add(legacy)
+                logger.warning(
+                    "[hookdeck] %s is deprecated — rename it to %s. Hookdeck "
+                    "env vars are namespaced per product now, and the bare "
+                    "HOOKDECK_ prefix is not the Event Gateway's to claim.",
+                    legacy,
+                    name,
+                )
+            return value
+
+    return default
+
+
+def api_key() -> str:
+    """The Hookdeck API key, namespaced name first, CLI convention second."""
+    return os.getenv(API_KEY_ENV) or os.getenv(CLI_API_KEY_ENV, "")
 
 # Suffixes appended to the configured prefix. Hookdeck documents these as
 # X-Hookdeck-Signature, X-Hookdeck-EventID, X-Hookdeck-Attempt-Count, etc.

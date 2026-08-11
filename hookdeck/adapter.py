@@ -52,11 +52,17 @@ from .constants import (
     ATTEMPT_COUNT,
     ATTEMPT_TRIGGER,
     EVENT_ID,
+    MODE_ENV,
     OPERATOR_TRIGGERS,
+    PATH_ENV,
     PLATFORM_NAME,
+    PORT_ENV,
+    SOURCE_ENV,
     SOURCE_NAME,
+    WEBHOOK_SECRET_ENV,
     WILL_RETRY_AFTER,
     assert_declared_status,
+    env,
     header_name,
 )
 from .settings import AdapterSettings
@@ -184,7 +190,7 @@ class HookdeckAdapter(WebhookAdapter):
         route to the same outcome, and its contract fits: authorization
         performed by a trusted upstream over an authenticated transport, with
         no local policy to consult, because a Hookdeck source is not an account
-        an operator configures in ``HOOKDECK_ALLOWED_USERS``.
+        an operator configures in ``HOOKDECK_EG_ALLOWED_USERS``.
 
         Not a fail-open — false whenever verification is off, so the local
         allowlist still applies to an ``INSECURE_NO_AUTH`` route. That makes it
@@ -1276,18 +1282,17 @@ def env_enablement() -> dict | None:
     Lets ``hermes gateway status`` report an env-only setup without
     constructing the adapter.
     """
-    import os
-
-    if not os.getenv("HOOKDECK_WEBHOOK_SECRET"):
+    secret = env(WEBHOOK_SECRET_ENV)
+    if not secret:
         return None
-    seeded: dict[str, Any] = {"secret": os.getenv("HOOKDECK_WEBHOOK_SECRET", "")}
+    seeded: dict[str, Any] = {"secret": secret}
     for env_var, key, cast in (
-        ("HOOKDECK_MODE", "mode", str),
-        ("HOOKDECK_PORT", "port", int),
-        ("HOOKDECK_PATH", "path", str),
-        ("HOOKDECK_SOURCE", "source", str),
+        (MODE_ENV, "mode", str),
+        (PORT_ENV, "port", int),
+        (PATH_ENV, "path", str),
+        (SOURCE_ENV, "source", str),
     ):
-        value = os.getenv(env_var)
+        value = env(env_var)
         if not value:
             continue
         try:
