@@ -22,5 +22,5 @@ exempts its own webhook platform from the user allowlist by enum member,
 reasoning that HMAC verification in the adapter *is* the authorization; the
 reasoning carries over but the membership test cannot, since this platform is
 `Platform.HOOKDECK`. The flag goes false whenever verification is off, so an
-`INSECURE_NO_AUTH` route still falls under `HOOKDECK_ALLOWED_USERS` — narrower
+`INSECURE_NO_AUTH` route still falls under `HOOKDECK_EG_ALLOWED_USERS` — narrower
 than core's exemption, which covers built-in webhook routes even unverified.

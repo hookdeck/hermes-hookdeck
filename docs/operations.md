@@ -26,12 +26,29 @@ That is the durable path — paused events are held at `HOLD` and delivered on
 resume. Never reach for `disable` instead: it cancels pending events
 irrecoverably, as does deleting the connection.
 
-The adapter does **not** run `hookdeck ci` to authenticate the CLI. That command
-looks like a harmless idempotent login and is not: it rewrites the shared config
-at `~/.config/hookdeck/config.toml`, swapping the stored key for a CLI session
-key and switching the CLI's *active project*. Anyone using the CLI for other
-work would find their environment repointed by starting a gateway. Log in
-yourself with `hookdeck login`; set `cli_login: true` only if you accept that.
+**The gateway keeps its own CLI session.** Two independent things decide "which
+project": your API key decides what `setup`, `status` and the retry hand-back
+act on, while the Hookdeck CLI's own config decides what `hookdeck listen`
+forwards from. Nothing reconciles them, and when they differ every visible
+signal says the gateway is fine — `setup` succeeds, the adapter logs that it is
+listening, and only the tunnel's restart loop (`no connection found matching
+filter`) says otherwise, while every event becomes a `CLI_DISCONNECTED` ignored
+event.
+
+So the adapter authenticates a CLI config of its own from the API key it
+already has, at `~/.hermes/hookdeck/cli-config.toml`, and passes
+`--hookdeck-config` to every CLI call. Two projects cannot drift apart when
+only one of them is configurable, and `hermes hookdeck doctor` compares them.
+
+This is deliberately not `hookdeck ci` against your shared config: that
+rewrites `~/.config/hookdeck/config.toml` and switches the CLI's *active
+project*, so anyone using the CLI for other work would find their environment
+repointed by starting a gateway — and it does so even with `--local`, which
+claims to write only to the current directory
+([hookdeck-cli#332](https://github.com/hookdeck/hookdeck-cli/issues/332)).
+
+Set `cli_config_path: ""` to use your own `hookdeck login` session instead, and
+accept that the two projects can then diverge.
 
 Use a CLI version of at least 2.3.2. Earlier ones stop delivering after a
 listen session expires without saying so, which from the gateway's side looks

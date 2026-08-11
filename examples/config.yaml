@@ -51,7 +51,7 @@ gateway:
         # Leave false. `hookdeck ci` rewrites ~/.config/hookdeck/config.toml
         # and switches the CLI's active project — not something starting a
         # gateway should do to a shared tool. Run `hookdeck login` instead.
-        # cli_login: false
+        # cli_config_path: ""   # use your own `hookdeck login` session
 
         routes:
           # A GitHub PR reviewer. `source` is the Hookdeck source name.
