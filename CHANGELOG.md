@@ -39,6 +39,25 @@ with the caveat that until 1.0 the config surface — `platforms.hookdeck.extra`
 - The package version is read from `hookdeck.__version__` rather than declared
   a second time in `pyproject.toml`.
 
+### Documentation
+
+- The README opens by saying what Hermes Agent and Hookdeck Event Gateway are,
+  rather than assuming both.
+- It also says *which* Hookdeck. This is the Event Gateway — inbound events
+  arriving at your agent — and not Outpost, which is the other direction. And
+  "platform" in `kind: platform` is Hermes' word for a source of inbound work,
+  not a reference to the Hookdeck platform.
+- A new architecture section with two diagrams: topology, and a sequence diagram
+  for the ack-then-hand-back contract that the reliability rests on. The three
+  different things called "CLI" are separated there.
+- A new section listing Hookdeck capabilities the plugin does not currently use
+  — the Publish API, bulk operation plans and cancellation, request replay,
+  ignored-event retry, issue triggers, transformations, the wider metrics — so
+  the edge of `hookdeck/api.py` is not mistaken for the edge of the product.
+- The "no pull API" limitation now explains what the durability claim actually
+  rests on: an event is recoverable because a delivered-but-failed event stays
+  retryable, not because anything holds a lease on it.
+
 ## 0.1.0
 
 First release. Hookdeck platform adapter, `hermes hookdeck` operator commands,
