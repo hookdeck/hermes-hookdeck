@@ -1,4 +1,4 @@
-"""Hookdeck event gateway plugin for Hermes Agent.
+"""Hookdeck Event Gateway plugin for Hermes Agent.
 
 ``register(ctx)`` wires up three surfaces:
 
@@ -94,7 +94,7 @@ def _register_cli_commands(ctx: Any) -> None:
 
     ctx.register_cli_command(
         name="hookdeck",
-        help="Provision and operate the Hookdeck event gateway",
+        help="Provision and operate the Hookdeck Event Gateway",
         setup_fn=register_cli,
         handler_fn=hookdeck_command,
         description=(

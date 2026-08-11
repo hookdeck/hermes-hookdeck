@@ -1,8 +1,32 @@
 # hermes-hookdeck
 
-A Hookdeck platform plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
-It puts a durable, verified queue in front of the agent, so a webhook can
-trigger an agent run without the usual ways that goes wrong.
+A [Hookdeck Event Gateway](https://hookdeck.com/docs) plugin for
+[Hermes Agent](https://github.com/NousResearch/hermes-agent). It puts a durable,
+verified queue in front of the agent, so a webhook can trigger an agent run
+without the usual ways that goes wrong.
+
+If you have not met both halves: **Hermes Agent** is a self-hosted AI agent from
+Nous Research that runs as a long-lived gateway process — on a laptop, a $5 VPS,
+wherever — and takes work from Telegram, Discord, Slack, a terminal, a cron
+schedule, or a webhook. **Hookdeck Event Gateway** is a hosted service that sits
+between a webhook provider and you: it verifies the provider's signature, queues
+each event, applies filters and retries, and holds everything it has not yet
+delivered so you can inspect or replay it. This plugin makes Hookdeck the front
+door for Hermes' webhook trigger — so a GitHub pull request, a Stripe payment or
+a Shopify order becomes an agent run that is verified once, runs once, and is
+not silently lost when the run fails or the machine restarts.
+
+Two names worth pinning down, because both are overloaded:
+
+- **Event Gateway, not the rest of Hookdeck.** Hookdeck's platform also includes
+  [Outpost](https://hookdeck.com/docs/outpost), which is the other direction —
+  self-hosted infrastructure for sending *your* webhooks to *your* users. This
+  plugin is inbound only: third-party events arriving at your agent. Nothing
+  here helps Hermes publish webhooks, and it does not talk to Outpost.
+- **"Platform" is Hermes' word, not Hookdeck's.** In Hermes a *platform* is a
+  source of inbound work — Telegram is a platform, Slack is a platform — and
+  this plugin registers a new one called `hookdeck`, alongside the built-in
+  `webhook`. It is unrelated to the Hookdeck platform in the marketing sense.
 
 Hermes already has a good webhook trigger: a POST arrives, a route matches, a
 prompt template renders, the agent runs, the response gets delivered. This

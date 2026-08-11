@@ -4,7 +4,7 @@ name = "hermes-hookdeck"
 # and the one that drifts is always the one nobody looks at — `hermes plugins`
 # reports the module's, PyPI reports this one.
 dynamic = ["version"]
-description = "Hookdeck event gateway plugin for Hermes Agent — verified, queued, retryable webhook triggers"
+description = "Hookdeck Event Gateway plugin for Hermes Agent — verified, queued, retryable webhook triggers"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
