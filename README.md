@@ -327,38 +327,6 @@ than core's exemption, which covers built-in webhook routes even unverified.
   in the instant before a crash. That is the at-least-once contract the whole
   design assumes; set `recover_on_boot: false` if it is wrong for your routes.
 
-## Verified end to end
-
-Against a real Hermes 0.20.0 gateway, a real Hookdeck project and the Hookdeck
-CLI — not just unit tests. The gateway log:
-
-```
-gateway.run: ✓ hookdeck connected
-hookdeck.adapter: dispatch route=hermes-livetest event_id=evt_S1Sp… attempt=1
-gateway.run: inbound message: platform=hookdeck chat=hookdeck:hermes-livetest:evt_S1Sp…
-webhook: Response for hookdeck:hermes-livetest:evt_S1Sp…: …
-hookdeck.adapter: Found 1 run(s) interrupted by a previous shutdown; asked Hookdeck to redeliver 1 of them
-```
-
-That last line is boot recovery working against live Hookdeck: a run left
-`running` by a killed gateway was found at startup, handed back, redelivered
-and re-run. The ledger recording `succeeded` afterwards is also what confirms
-`on_processing_complete` fires and the outcome is recorded.
-
-The reliability claims are not just unit-tested either. In the event log:
-
-```
-evt_jyjuqko…  SUCCESSFUL  attempts=3  [(202,INITIAL), (202,MANUAL), (202,MANUAL)]
-evt_AeqyFZJ…  SUCCESSFUL  attempts=2  [(503,INITIAL), (202,AUTOMATIC)]
-```
-
-The first is the mechanism `async_retry` depends on: every attempt returned
-202, so Hookdeck recorded the event as delivered each time, and it still
-accepted two `MANUAL` retries afterwards. An early ack really is recoverable.
-
-The second is admission control: deferred with 503 while a run was in flight,
-then redelivered automatically and processed. Deferred, not dropped.
-
 ## Code layout
 
 | Module | What lives there |
