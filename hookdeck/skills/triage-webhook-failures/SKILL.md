@@ -46,6 +46,15 @@ State what failed, why, what you retried, and what you deliberately did not.
 Anything you could not diagnose from the payload and error code needs a human —
 name it explicitly rather than retrying hopefully.
 
+## Retry, not replay
+
+Everything here uses Hookdeck's **retry**: a fresh delivery attempt for the
+same event. Hookdeck also has **replay**, which re-ingests the original request
+and creates *new* events with the connection's current rules applied — the
+right tool after fixing a filter or transformation, and not something these
+tools do. If retrying is not working because the connection itself is
+misconfigured, say so rather than retrying repeatedly.
+
 ## Pausing
 
 `hookdeck_pause_connection` holds events in Hookdeck instead of dropping them.

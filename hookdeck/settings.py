@@ -32,7 +32,7 @@ from .constants import (
     INSECURE_NO_AUTH,
 )
 from .routing import tunnel_plan
-from .state import default_state_path
+from .ledger import default_state_path
 
 MODES = ("cli", "push")
 

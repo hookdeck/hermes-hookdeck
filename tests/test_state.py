@@ -4,12 +4,12 @@ import time
 
 import pytest
 
-from hookdeck.state import STATUS_RUNNING, DeliveryLedger
+from hookdeck.ledger import STATUS_RUNNING, RunLedger
 
 
 @pytest.fixture()
 def ledger(tmp_path):
-    led = DeliveryLedger(tmp_path / "state.db")
+    led = RunLedger(tmp_path / "state.db")
     yield led
     led.close()
 
@@ -55,7 +55,7 @@ def test_dedup_survives_a_restart(ledger, tmp_path):
     ledger.admit("evt_1", route="github", attempt=1)
     ledger.close()
 
-    reopened = DeliveryLedger(tmp_path / "state.db")
+    reopened = RunLedger(tmp_path / "state.db")
     try:
         assert not reopened.admit("evt_1", route="github", attempt=1).admitted
     finally:
@@ -143,7 +143,7 @@ def test_scheduled_resumes_survive_the_process_that_set_them(ledger, tmp_path):
     ledger.close()
 
     # The restart a pause most often precedes.
-    reopened = DeliveryLedger(tmp_path / "state.db")
+    reopened = RunLedger(tmp_path / "state.db")
     try:
         due = [row["connection_id"] for row in reopened.due_resumes()]
         assert due == ["web_1"]

@@ -10,7 +10,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from hookdeck.adapter import HookdeckAdapter
-from hookdeck.state import DeliveryLedger
+from hookdeck.ledger import RunLedger
 from hookdeck.verify import compute_signature
 from tests.hermes_stub import PlatformConfig, ProcessingOutcome, SendResult
 
@@ -47,7 +47,7 @@ def make_adapter(tmp_path, routes: dict, **extra) -> HookdeckAdapter:
     )
     adapter = HookdeckAdapter(config)
     adapter._validate_startup()
-    adapter._ledger = DeliveryLedger(tmp_path / "state.db")
+    adapter._ledger = RunLedger(tmp_path / "state.db")
     adapter._api = FakeAPI()
     return adapter
 

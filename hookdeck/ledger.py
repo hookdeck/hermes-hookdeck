@@ -1,18 +1,28 @@
-"""Restart-safe delivery ledger.
+"""What this gateway did with each event — the half Hookdeck cannot see.
 
-The built-in Hermes webhook adapter dedupes in a process-local dict with a
-one-hour TTL, so a gateway restart re-runs the agent on anything a provider
-redelivers. This ledger is a small SQLite table instead, keyed on the Hookdeck
-event id, so dedup survives restarts.
+This is a run ledger, not a delivery log. Hookdeck already tracks deliveries,
+and this deliberately does not duplicate that.
 
-The subtle part is that deduplication and retry pull in opposite directions.
-When an agent run fails, the adapter asks Hookdeck to redeliver the *same event
-id* — which naive dedup would then reject as a duplicate. The ledger resolves
-this with the attempt counter Hookdeck sends on every delivery
+It exists because the adapter answers 202 the moment it admits an event, so
+from Hookdeck's side every delivery succeeded regardless of what the agent then
+did. A run that fails after the ack is invisible to the queue: it cannot know,
+so it cannot retry, so something local has to remember and ask. That memory is
+this file. Boot recovery reads it, the retry budget counts against it, and the
+CLI and dashboard read it to show what the queue structurally cannot.
+
+Deduplication falls out of the same records rather than being their purpose.
+Hookdeck's own ``deduplicate`` rule — which this plugin provisions — suppresses
+duplicate *requests* at ingestion, and its docs are explicit that it is
+best-effort and that destinations should still be idempotent. The idempotency
+key here is the attempt counter on each delivery
 (``x-hookdeck-attempt-count``): a delivery is admitted when its attempt number
-is higher than the highest one already seen for that event, and rejected
-otherwise. Genuine duplicates repeat an attempt number; real retries increment
-it.
+exceeds the highest already recorded, and rejected otherwise. Genuine repeats
+carry the same attempt number; real retries increment it, which is what lets
+retrying and not-double-running coexist.
+
+In ``sync`` mode most of this is moot — there the response *is* the outcome and
+Hookdeck drives the retries — and only boot recovery for timed-out runs still
+needs it.
 """
 
 from __future__ import annotations
@@ -80,8 +90,8 @@ class Admission:
     reason: str = ""
 
 
-class DeliveryLedger:
-    """SQLite-backed record of every Hookdeck delivery this gateway has seen."""
+class RunLedger:
+    """SQLite-backed record of what this gateway did with each event."""
 
     def __init__(self, path: str | Path):
         self._path = Path(path).expanduser()
@@ -124,7 +134,7 @@ class DeliveryLedger:
         re-running the event long past ``max_agent_retries``.
 
         That block explicitly does not apply to an operator-initiated replay.
-        Refusing those would make ``hermes hookdeck replay``, the dashboard's
+        Refusing those would make ``hermes hookdeck retry``, the dashboard's
         Replay button and the ``hookdeck_retry_event`` tool all answer 200 and
         do nothing — a green tick over a dead event, and the escape hatch this
         code recommends by name.
@@ -375,7 +385,7 @@ class DeliveryLedger:
 
         After a hard crash these are the deliveries whose outcome was never
         recorded — ``hermes hookdeck doctor`` reports them so the operator can
-        decide whether to replay.
+        decide whether to retry them.
         """
         cutoff = time.time() - older_than_seconds
         with self._lock:

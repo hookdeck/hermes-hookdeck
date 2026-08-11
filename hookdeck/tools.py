@@ -86,14 +86,14 @@ def _cancel_scheduled_resume(connection_id: str) -> None:
 
 def _with_ledger(action) -> None:
     from .settings import configured_state_path
-    from .state import DeliveryLedger
+    from .ledger import RunLedger
 
     # The path the adapter actually reads, honouring a configured state_path.
     # Writing a pause deadline anywhere else records it where nothing will
     # honour it, and the pause simply never ends.
     path = configured_state_path()
     try:
-        ledger = DeliveryLedger(path)
+        ledger = RunLedger(path)
     except Exception as exc:  # noqa: BLE001 - observability, never fatal
         logging.getLogger(__name__).error(
             "[hookdeck] Could not open the ledger at %s: %s", path, exc

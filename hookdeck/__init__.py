@@ -99,8 +99,8 @@ def _register_cli_commands(ctx: Any) -> None:
         handler_fn=hookdeck_command,
         description=(
             "Create Hookdeck connections for Hermes webhook routes, inspect the "
-            "queue, pause and resume delivery around restarts, and replay "
-            "events that failed."
+            "queue, pause and resume delivery around restarts, and re-attempt "
+            "delivery of events whose runs failed."
         ),
     )
 

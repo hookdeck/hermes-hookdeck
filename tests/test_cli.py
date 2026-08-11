@@ -31,7 +31,7 @@ def test_parser_registers_every_subcommand():
     assert parsed.route == "github"
     assert parsed.mode == "cli"
 
-    for action in ("status", "doctor", "replay", "pause", "resume"):
+    for action in ("status", "doctor", "retry", "pause", "resume"):
         argv = [action] + (["conn"] if action in {"pause", "resume"} else [])
         fresh = argparse.ArgumentParser()
         cli.register_cli(fresh)

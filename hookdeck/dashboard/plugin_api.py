@@ -60,7 +60,7 @@ from hookdeck.api import HookdeckAPI, HookdeckAPIError  # noqa: E402
 from hookdeck.provision import routes_from_config  # noqa: E402
 from hookdeck.settings import configured_state_path  # noqa: E402
 from hookdeck.settings import load_hermes_config as _load_hermes_config  # noqa: E402
-from hookdeck.state import DeliveryLedger  # noqa: E402
+from hookdeck.ledger import RunLedger  # noqa: E402
 
 router = APIRouter()
 
@@ -161,7 +161,7 @@ def _local_state() -> dict:
     if not state["exists"]:
         return state
 
-    ledger = DeliveryLedger(path)
+    ledger = RunLedger(path)
     try:
         state["counts"] = ledger.counts()
         state["failures"] = [

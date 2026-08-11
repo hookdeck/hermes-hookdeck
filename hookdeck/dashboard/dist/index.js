@@ -141,7 +141,7 @@
           stranded.length
             ? h("p", { className: "text-sm text-destructive" },
                 stranded.length + " run(s) still marked running after an hour — a crash " +
-                "lost the completion signal. Restarting the gateway replays them.")
+                "lost the completion signal. Restarting the gateway retries them.")
             : null,
           (local.failures || []).map(function (f) {
             return h(Row, { key: f.event_id },
@@ -154,7 +154,7 @@
                 variant: "outline",
                 disabled: busy,
                 onClick: function () { act("/events/" + f.event_id + "/retry"); },
-              }, "Replay"));
+              }, "Retry"));
           }))),
 
       // ── Pause is the safe-restart control, so it belongs here ──────

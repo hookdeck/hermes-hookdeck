@@ -108,7 +108,7 @@ def test_every_caller_resolves_the_same_ledger(tmp_path, monkeypatch):
 
 def test_the_default_is_used_when_nothing_is_configured(monkeypatch):
     from hookdeck.settings import configured_state_path
-    from hookdeck.state import default_state_path
+    from hookdeck.ledger import default_state_path
 
     monkeypatch.setattr("hookdeck.settings.load_hermes_config", dict)
     assert configured_state_path() == default_state_path()

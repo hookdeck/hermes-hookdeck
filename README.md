@@ -18,10 +18,10 @@ money every time it happens, and it should not happen twice for the same event.
 | Ingress | Public HTTP listener | Hookdeck CLI (no public URL) or HTTP push |
 | Gateway offline | POST is lost | Pause the connection and events are held at `HOLD`, then drain on resume (see the CLI caveat below) |
 | Burst | 30/min per route, excess dropped | Queued and throttled; over the limit gets 503 + `Retry-After` |
-| Duplicate delivery | In-memory 1h cache, lost on restart | SQLite ledger keyed on the Hookdeck event id |
+| Duplicate delivery | In-memory 1h cache, lost on restart | Hookdeck's own dedupe rule, plus a restart-safe idempotency check on the attempt counter |
 | Run fails | 202 was already sent; the event is gone | Handed back to Hookdeck for redelivery |
 | Gateway dies mid-run | Silently lost | Orphaned runs found in the ledger at boot and redelivered |
-| Replay | — | Per-event and bulk replay, from the CLI or by the agent itself |
+| Retrying a failed run | — | Per-event and bulk retry through Hookdeck's API, from the CLI, the dashboard or the agent itself |
 
 The last two rows are the ones that matter most. The built-in adapter answers
 202 as soon as it dispatches, which is the right thing to do — but it means a
@@ -153,12 +153,27 @@ checks that one scheme, in constant time, before touching the payload.
 `x-hookdeck-signature-2` is also accepted so a secret roll does not drop live
 traffic.
 
-**Dedup that survives a restart.** Every delivery carries an event id and an
-attempt number. The ledger at `~/.hermes/hookdeck/state.db` admits a delivery
-when its attempt number is higher than the highest already seen for that event,
-and rejects it otherwise. Genuine duplicates repeat an attempt number; real
-retries increment it — which is what lets dedup and retry coexist instead of
-cancelling each other out.
+**A run ledger, not a second queue.** The plugin provisions Hookdeck's
+`deduplicate` rule and does not reimplement it — that rule suppresses duplicate
+*requests* at ingestion, and Hookdeck's docs are explicit that it is best-effort
+and destinations should be idempotent regardless.
+
+What the local SQLite file at `~/.hermes/hookdeck/state.db` holds is the half
+Hookdeck structurally cannot see. The adapter answers 202 the moment it admits
+an event, so from the queue's side every delivery succeeded — whatever the
+agent then did. A run that fails after the ack is invisible there: Hookdeck
+cannot know, so it cannot retry, so something local has to remember and ask.
+That memory drives the retry budget, boot recovery, and what `status` and the
+dashboard show.
+
+Idempotency falls out of the same records. Each delivery carries an attempt
+number, and one is admitted only when its number exceeds the highest already
+recorded — genuine repeats reuse a number, real retries increment it, which is
+what lets retrying and not-double-running coexist.
+
+In `sync` mode most of this is moot: there the response *is* the outcome and
+Hookdeck drives the retries, leaving only boot recovery for runs that outlasted
+the timeout.
 
 **Backpressure instead of dropping.** `max_concurrent` caps agent runs in
 flight. An event that arrives over the limit gets 503 and a `Retry-After`, so
@@ -195,9 +210,20 @@ hermes hookdeck setup <route> [--all] [--dry-run]   # create/update connections
 hermes hookdeck status                              # queue depth, failures, issues
 hermes hookdeck pause <connection>                  # hold events server-side
 hermes hookdeck resume <connection>                 # drain them
-hermes hookdeck replay <event_id> | --failed        # redeliver
+hermes hookdeck retry <event_id> | --failed         # re-attempt delivery
 hermes hookdeck doctor                              # check the whole setup
 ```
+
+`retry` is Hookdeck's retry — `POST /events/{id}/retry`, a fresh delivery
+attempt for the same event — and so are the dashboard's Retry buttons and the
+`hookdeck_retry_event` tool. None of it is reimplemented locally; the plugin
+asks Hookdeck and Hookdeck redelivers.
+
+Hookdeck's **replay** is a different thing: it re-ingests the original request
+and creates *new* events, with the connection's rules re-evaluated against
+current config. That is the right tool after fixing a filter or a
+transformation, and the plugin deliberately does not wrap it — a replayed event
+is new work, arrives with a new id, and needs no special handling here.
 
 `pause` before an upgrade and `resume` afterwards is a zero-loss restart:
 events accumulate in Hookdeck rather than hitting a dead port.

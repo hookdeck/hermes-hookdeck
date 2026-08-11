@@ -60,7 +60,7 @@ from .constants import (
     header_name,
 )
 from .settings import AdapterSettings
-from .state import DeliveryLedger
+from .ledger import RunLedger
 from .tunnel import HookdeckCLIMissing, HookdeckTunnel
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,7 @@ class HookdeckAdapter(WebhookAdapter):
         self._routes = self.settings.routes
         self._max_body_bytes = self.settings.max_body_bytes
 
-        self._ledger: Optional[DeliveryLedger] = None
+        self._ledger: Optional[RunLedger] = None
         self._api: Optional[HookdeckAPI] = None
         self._tunnels: list[HookdeckTunnel] = []
         self._site_runner = None
@@ -215,7 +215,7 @@ class HookdeckAdapter(WebhookAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self.settings.validate()
 
-        self._ledger = DeliveryLedger(self.settings.state_path)
+        self._ledger = RunLedger(self.settings.state_path)
         self._api = HookdeckAPI()
 
         self._site_runner = web.AppRunner(self.build_app())
@@ -965,7 +965,7 @@ class HookdeckAdapter(WebhookAdapter):
             )
             logger.error(
                 "[hookdeck] Event %s failed %d times — giving up. Inspect it in "
-                "Hookdeck and replay with `hermes hookdeck replay %s`.",
+                "Hookdeck and retry it with `hermes hookdeck retry %s`.",
                 event_id,
                 runs,
                 event_id,
@@ -980,7 +980,7 @@ class HookdeckAdapter(WebhookAdapter):
             logger.warning(
                 "[hookdeck] Event %s failed on its last automatic attempt — "
                 "requesting a manual redelivery; if that fails too, only "
-                "`hermes hookdeck replay %s` will bring it back",
+                "`hermes hookdeck retry %s` will bring it back",
                 event_id,
                 event_id,
             )
@@ -1036,7 +1036,7 @@ class HookdeckAdapter(WebhookAdapter):
         logger.error(
             "[hookdeck] Could not hand event %s back to Hookdeck after %d "
             "attempts (%s). It is marked failed locally and will be picked up "
-            "by boot recovery on the next restart; `hermes hookdeck replay %s` "
+            "by boot recovery on the next restart; `hermes hookdeck retry %s` "
             "brings it back now.",
             event_id,
             _REDELIVERY_ATTEMPTS,

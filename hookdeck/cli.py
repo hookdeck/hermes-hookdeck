@@ -26,7 +26,7 @@ from .provision import (
     uncovered_statuses,
 )
 from .settings import configured_state_path, load_hermes_config, platform_extra
-from .state import DeliveryLedger
+from .ledger import RunLedger
 
 # ----------------------------------------------------------------------
 # Config helpers
@@ -135,11 +135,17 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     resume = subs.add_parser("resume", help="Resume a paused connection and drain it")
     resume.add_argument("connection", help="Connection name or id")
 
-    replay = subs.add_parser("replay", help="Ask Hookdeck to redeliver events")
-    replay.add_argument("event_id", nargs="?", default="", help="A single event id")
-    replay.add_argument("--failed", action="store_true", help="Replay all failed events")
-    replay.add_argument("--since", default="", help="ISO 8601 lower bound for --failed")
-    replay.add_argument("--connection", default="", help="Restrict --failed to a connection id")
+    # `retry`, not `replay`: these call POST /events/{id}/retry, which makes a
+    # new delivery attempt for the same event. Hookdeck's *replay* re-ingests
+    # the original request and creates new events — a different tool, for when
+    # the connection's rules have changed.
+    retry = subs.add_parser(
+        "retry", help="Ask Hookdeck to re-attempt delivery of events"
+    )
+    retry.add_argument("event_id", nargs="?", default="", help="A single event id")
+    retry.add_argument("--failed", action="store_true", help="Retry all failed events")
+    retry.add_argument("--since", default="", help="ISO 8601 lower bound for --failed")
+    retry.add_argument("--connection", default="", help="Restrict --failed to a connection id")
 
     subs.add_parser("doctor", help="Check credentials, CLI, config and local state")
 
@@ -283,7 +289,7 @@ def _print_local_state(limit: int) -> None:
     if not path.exists():
         print("\nLocal delivery ledger: not created yet")
         return
-    ledger = DeliveryLedger(path)
+    ledger = RunLedger(path)
     try:
         print(f"\nLocal delivery ledger ({path}):")
         counts = ledger.counts()
@@ -335,7 +341,7 @@ def _cmd_pause(args: argparse.Namespace, pause: bool) -> int:
     return run_sync(_run())
 
 
-def _cmd_replay(args: argparse.Namespace) -> int:
+def _cmd_retry(args: argparse.Namespace) -> int:
     async def _run() -> int:
         async with _api() as api:
             if args.event_id:
@@ -348,7 +354,7 @@ def _cmd_replay(args: argparse.Namespace) -> int:
                     return 1
 
             if not args.failed:
-                print("Usage: hermes hookdeck replay <event_id> | --failed [--since ISO]")
+                print("Usage: hermes hookdeck retry <event_id> | --failed [--since ISO]")
                 return 2
 
             query: dict[str, Any] = {"status": "FAILED"}
@@ -388,7 +394,7 @@ def _check_credentials(extra: dict) -> list[Check]:
             bool(os.getenv("HOOKDECK_API_KEY")),
             "HOOKDECK_API_KEY is set"
             if os.getenv("HOOKDECK_API_KEY")
-            else "HOOKDECK_API_KEY is not set — setup, status and replay will not work",
+            else "HOOKDECK_API_KEY is not set — setup, status and retry will not work",
         ),
         Check(
             bool(extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET")),
@@ -457,7 +463,7 @@ def _report_stranded_runs() -> None:
     path = _ledger_path()
     if not path.exists():
         return
-    ledger = DeliveryLedger(path)
+    ledger = RunLedger(path)
     try:
         stale = ledger.stale_running(3600)
         if not stale:
@@ -467,7 +473,7 @@ def _report_stranded_runs() -> None:
             "— a crash probably lost their outcome. Replay them with:"
         )
         for row in stale[:10]:
-            print(f"    hermes hookdeck replay {row['event_id']}")
+            print(f"    hermes hookdeck retry {row['event_id']}")
     finally:
         ledger.close()
 
@@ -555,7 +561,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 def hookdeck_command(args: argparse.Namespace) -> int:
     action = getattr(args, "hookdeck_action", None)
     if not action:
-        print("Usage: hermes hookdeck {setup|status|pause|resume|replay|doctor}")
+        print("Usage: hermes hookdeck {setup|status|pause|resume|retry|doctor}")
         return 2
     if action == "setup":
         return _cmd_setup(args)
@@ -565,8 +571,8 @@ def hookdeck_command(args: argparse.Namespace) -> int:
         return _cmd_pause(args, pause=True)
     if action == "resume":
         return _cmd_pause(args, pause=False)
-    if action == "replay":
-        return _cmd_replay(args)
+    if action == "retry":
+        return _cmd_retry(args)
     if action == "doctor":
         return _cmd_doctor(args)
     print(f"Unknown action: {action}")
