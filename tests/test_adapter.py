@@ -909,6 +909,38 @@ async def test_a_delivery_with_no_event_id_is_processed_but_warned_about(
     assert "without deduplication or retry" in caplog.text
 
 
+async def test_a_proxys_request_id_is_not_mistaken_for_an_event_id(
+    client_factory, caplog
+):
+    """`X-Request-ID` is not a Hookdeck identifier and must not stand in.
+
+    Anything in front of the gateway can set it, it is not subject to
+    `header_prefix`, and one Hookdeck request fans out to one event per
+    matching connection — so it is not even unique per delivery. Accepting it
+    would key the ledger on the wrong thing and silence the warning that tells
+    an operator their `header_prefix` is wrong.
+    """
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    raw = json.dumps({"n": 1}).encode()
+    response = await client.post(
+        "/hookdeck",
+        data=raw,
+        headers={
+            "content-type": "application/json",
+            "x-hookdeck-signature": compute_signature(raw, SECRET),
+            "X-Request-ID": "req_from_some_proxy",
+        },
+    )
+    assert response.status == 202
+    await _settle()
+    assert "without deduplication or retry" in caplog.text
+    assert adapter._ledger is not None
+    assert adapter._ledger.get("req_from_some_proxy") is None
+
+
 # ----------------------------------------------------------------------
 # Deduplication precedence
 # ----------------------------------------------------------------------

@@ -17,6 +17,12 @@ DEFAULT_HEADER_PREFIX = "x-hookdeck"
 SIGNATURE = "signature"
 SIGNATURE_2 = "signature-2"
 EVENT_ID = "eventid"
+# Hookdeck sends this too, and it is deliberately not used as a delivery
+# identity. One request fans out to one event per matching connection, so two
+# routes sharing a source produce two events carrying the same request id —
+# dedup keyed on it would drop the second as a duplicate. `eventid` is the only
+# per-delivery identifier, which is why its absence is treated as "no id" and
+# said out loud rather than papered over.
 REQUEST_ID = "requestid"
 ATTEMPT_COUNT = "attempt-count"
 ATTEMPT_TRIGGER = "attempt-trigger"
