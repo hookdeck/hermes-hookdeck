@@ -1,366 +1,120 @@
 # hermes-hookdeck
 
-A Hookdeck platform plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
-It puts a durable, verified queue in front of the agent, so a webhook can
-trigger an agent run without the usual ways that goes wrong.
+**A durable, verified queue in front of your Hermes agent, so a webhook can trigger an agent run without the usual ways that goes wrong.**
 
-Hermes already has a good webhook trigger: a POST arrives, a route matches, a
-prompt template renders, the agent runs, the response gets delivered. This
-plugin keeps all of that and replaces the ingest half, because an agent run is
-an awkward thing to hang off a webhook. It takes seconds to minutes, it costs
-money every time it happens, and it should not happen twice for the same event.
+Agent runs are not ordinary webhook handlers. They take seconds to minutes, cost money per execution, and must not run twice for the same event. Hermes's built-in webhook platform is fine for trying things out, but in production it drops bursts over 30/min and forgets duplicates after a restart. Any run that fails after the 202 is sent is simply lost. This plugin replaces that ingestion path with [Hookdeck](https://hookdeck.com), plus a local ledger that tracks the outcomes Hookdeck can't see.
 
-## What changes
+## Why
 
-| | Built-in `webhook` platform | With `hookdeck` |
+| | Built-in webhooks | With this plugin |
 |---|---|---|
-| Signature verification | GitHub, GitLab, generic HMAC | ~140 provider schemes verified by Hookdeck at the edge; the adapter verifies one |
-| Ingress | Public HTTP listener | Hookdeck CLI (no public URL) or HTTP push |
-| Gateway offline | POST is lost | Pause the connection and events are held at `HOLD`, then drain on resume (see the CLI caveat below) |
-| Burst | 30/min per route, excess dropped | Queued and throttled; over the limit gets 503 + `Retry-After` |
-| Duplicate delivery | In-memory 1h cache, lost on restart | Hookdeck's own dedupe rule, plus a restart-safe idempotency check on the attempt counter |
-| Run fails | 202 was already sent; the event is gone | Handed back to Hookdeck for redelivery |
-| Gateway dies mid-run | Silently lost | Orphaned runs found in the ledger at boot and redelivered |
-| Retrying a failed run | — | Per-event and bulk retry through Hookdeck's API, from the CLI, the dashboard or the agent itself |
+| Signature verification | Limited providers | ~140 provider schemes verified by Hookdeck |
+| Gateway offline | Events lost | Paused events held server-side, drained on resume |
+| Traffic bursts | 30/min fixed window, excess dropped | Queued; overflow answered with 503 + `Retry-After` |
+| Duplicates | In-memory 1h cache | Hookdeck dedup + restart-safe SQLite ledger |
+| Failed runs | Lost after the 202 | Redelivered by Hookdeck |
+| Mid-run crashes | Silently lost | Boot-time recovery via the ledger |
 
-The last two rows are the ones that matter most. The built-in adapter answers
-202 as soon as it dispatches, which is the right thing to do — but it means a
-failed run has already been acknowledged, and nothing remembers it happened.
+The short version: with the built-in platform, a webhook provider believes an event was delivered the moment Hermes returns 202 — whatever happens to the agent run afterwards. This plugin keeps a run ledger in SQLite (`~/.hermes/hookdeck/state.db`) so failed and interrupted runs are redelivered instead of vanishing.
 
 ## Install
 
 ```bash
+# via the Hermes plugin manager
 hermes plugins install hookdeck/hermes-hookdeck
-```
-
-Hermes clones it into `~/.hermes/plugins/`, prompts for the two secrets below,
-and installs it disabled. Then:
-
-```bash
 hermes plugins enable hookdeck
-```
 
-<details>
-<summary>Other ways in</summary>
-
-**pip**, for a declarative or containerised setup — the package declares a
-`hermes_agent.plugins` entry point, so Hermes discovers it wherever it is
-installed, with no plugin directory involved:
-
-```bash
+# or via pip
 pip install hermes-hookdeck && hermes plugins enable hookdeck
-```
 
-**Git clone**, if you want to hack on it — the plugin lives in a subdirectory,
-which Hermes' category layout handles:
-
-```bash
+# or from source
 git clone https://github.com/hookdeck/hermes-hookdeck ~/.hermes/plugins/hermes-hookdeck
 ```
-</details>
 
-Set two secrets, both from your Hookdeck project settings:
-
-```bash
-export HOOKDECK_API_KEY=...        # Project Settings → Secrets
-export HOOKDECK_WEBHOOK_SECRET=... # the signing secret
-```
-
-## Quickstart — CLI mode (no public URL)
-
-The default. The Hookdeck CLI holds an outbound connection and forwards events
-to a loopback listener, so a laptop or a homelab box behind NAT works without
-ngrok or a VPS.
-
-**A CLI destination is not a durable buffer.** With no listener attached,
-events become `CLI_DISCONNECTED` ignored events and the request is discarded —
-not queued, not retried. An *abnormal* disconnect gets a short server-side
-grace window in which events are still created and fail as `CLI_UNAVAILABLE`,
-which keeps them in the normal retry pipeline; a clean Ctrl+C forfeits even
-that. So on a planned shutdown, **pause the connection before you stop the
-gateway**:
+Configure two environment variables from your Hookdeck dashboard (Project Settings > Secrets):
 
 ```bash
-hermes hookdeck pause github-prs
+export HOOKDECK_API_KEY=...        # provisions connections
+export HOOKDECK_WEBHOOK_SECRET=... # verifies deliveries
 ```
 
-That is the durable path — paused events are held at `HOLD` and delivered on
-resume. Never reach for `disable` instead: it cancels pending events
-irrecoverably, as does deleting the connection.
-
-The adapter does **not** run `hookdeck ci` to authenticate the CLI. That command
-looks like a harmless idempotent login and is not: it rewrites the shared config
-at `~/.config/hookdeck/config.toml`, swapping the stored key for a CLI session
-key and switching the CLI's *active project*. Anyone using the CLI for other
-work would find their environment repointed by starting a gateway. Log in
-yourself with `hookdeck login`; set `cli_login: true` only if you accept that.
-
-Use a CLI version of at least 2.3.2. Earlier ones stop delivering after a
-listen session expires without saying so, which from the gateway's side looks
-identical to "no events are arriving". `hermes hookdeck doctor` checks the
-version *and* prints which binary it resolved — an npm global shadowing a
-Homebrew install is common, and version-checking one binary while launching
-another is worse than not checking. Set `cli_binary` to pin it explicitly.
-
-Two behaviours worth recognising in the Hookdeck event log when the local
-server is down. With no listen session attached at all, attempts record
-`CLI_UNAVAILABLE` and no response status. With a session attached but the local
-port refusing, the CLI reports a **500** upstream — which is one reason the
-provisioned retry rule covers `500-599`: a gateway that has not finished
-starting produces exactly this, and those events must come back.
-
-Install the [Hookdeck CLI](https://hookdeck.com/docs/cli), add a route to
-`~/.hermes/config.yaml` (see [`examples/config.yaml`](examples/config.yaml)),
-then:
+Then create a route and check the setup:
 
 ```bash
-hermes hookdeck setup github-prs --source github --source-type GITHUB
+hermes hookdeck setup my-route
+hermes hookdeck doctor
 ```
 
-That creates a source with GitHub's verification already configured, a CLI
-destination, and a connection carrying exponential retries and a dedup window.
+A [free Hookdeck account](https://hookdeck.com/signup) is enough for development and small production workloads.
 
-Start the gateway and the adapter launches `hookdeck listen` for you — one
-process per route, since the CLI forwards a single source each, given
-`--path /hookdeck/<route>` so the adapter resolves the route from the path.
-Every route therefore needs a `source`, or a shared
-`platforms.hookdeck.extra.source`.
+## How it works
 
-Point GitHub at the source URL Hookdeck gives you and open a pull request.
+Events flow: **provider -> Hookdeck -> (CLI or HTTP push) -> plugin listener -> Hermes agent run**, with three reliability layers on top:
 
-`hookdeck listen` creates the source itself if it does not exist, so it will
-work without `setup` — but you get a bare connection with none of the retry,
-dedup or filter rules, which is most of the point.
+1. **Signature verification.** Every delivery carries an `x-hookdeck-signature` header, verified with HMAC-SHA256 in constant time. Provider-side verification (Stripe, Shopify, GitHub, and ~140 others) happens at Hookdeck's edge before the event ever reaches you.
+2. **Run ledger.** A local SQLite database records each delivery attempt and its agent-run outcome. If the process crashes mid-run, boot-time recovery finds the orphaned events and re-runs them.
+3. **Backpressure.** `max_concurrent` caps simultaneous agent runs. Requests over the cap get a 503 with `Retry-After`, and Hookdeck redelivers on schedule instead of piling runs onto your box.
 
-## Quickstart — push mode
+### Acknowledgment modes
 
-For a gateway with a reachable URL. Push mode unlocks the settings CLI
-destinations do not support: delivery rate limits, delivery groups, issue
-triggers and alerting.
+- **`async_retry`** (default): respond 202 immediately, run the agent async, call Hookdeck's retry API if the run fails.
+- **`sync`**: hold the HTTP response until the agent finishes, letting Hookdeck's native retry rules apply. Best for short runs.
 
-Set `mode: push` and `public_url` in the config, then:
+### Connection modes
 
-```bash
-hermes hookdeck setup --all --mode push --rate-limit 2 --rate-limit-period concurrent
-```
-
-## How the reliability works
-
-**One verifier.** Hookdeck verifies Stripe's signature, Shopify's HMAC,
-Twilio's, and so on, then signs its own delivery with
-`base64(HMAC-SHA256(body, secret))` in `x-hookdeck-signature`. The adapter
-checks that one scheme, in constant time, before touching the payload.
-`x-hookdeck-signature-2` is also accepted so a secret roll does not drop live
-traffic.
-
-**A run ledger, not a second queue.** The plugin provisions Hookdeck's
-`deduplicate` rule and does not reimplement it — that rule suppresses duplicate
-*requests* at ingestion, and Hookdeck's docs are explicit that it is best-effort
-and destinations should be idempotent regardless.
-
-What the local SQLite file at `~/.hermes/hookdeck/state.db` holds is the half
-Hookdeck structurally cannot see. The adapter answers 202 the moment it admits
-an event, so from the queue's side every delivery succeeded — whatever the
-agent then did. A run that fails after the ack is invisible there: Hookdeck
-cannot know, so it cannot retry, so something local has to remember and ask.
-That memory drives the retry budget, boot recovery, and what `status` and the
-dashboard show.
-
-Idempotency falls out of the same records. Each delivery carries an attempt
-number, and one is admitted only when its number exceeds the highest already
-recorded — genuine repeats reuse a number, real retries increment it, which is
-what lets retrying and not-double-running coexist.
-
-In `sync` mode most of this is moot: there the response *is* the outcome and
-Hookdeck drives the retries, leaving only boot recovery for runs that outlasted
-the timeout.
-
-**Backpressure that queues in Hookdeck, not here.** `max_concurrent` caps
-agent runs in flight. An event over the limit gets a 503 and a `Retry-After`,
-and that is the whole mechanism — nothing is written down, no local queue
-exists, the event simply stays in Hookdeck and comes back. (Nothing is recorded
-for a deferred event on purpose: a ledger entry would make the redelivery look
-like a duplicate.)
-
-The *count* is local because Hookdeck cannot take it. Its destination rate
-limit with `rate_limit_period: concurrent` caps "simultaneous delivery attempts
-open to the destination", which ends when the connection closes — and in
-`async_retry` that is the 202, milliseconds in, while the run continues for
-seconds or minutes. Set it to 1 and it would still never engage. Hookdeck can
-limit deliveries; only the adapter can see runs. CLI destinations have no
-`rate_limit` field at all, so in the default transport it is not on the table
-either way.
-
-In `sync` mode this inverts: the delivery stays open for the run's duration, so
-a destination-level `--rate-limit N --rate-limit-period concurrent` genuinely
-does cap concurrent runs, and does it better — Hookdeck holds the event without
-a 503 round trip or a dent in its retry budget. Worth preferring there, with
-`max_concurrent` left as the backstop for runs that outlast the sync timeout.
-
-`--group-key` throttles per subject (`--group-rate 1 --group-period minute`).
-Delivery groups accept only `second|minute|hour`, so per-subject *concurrency*
-is not expressible — `concurrent` is destination-level only.
-
-**Outcomes reported, not assumed.** `ack_mode` decides how:
-
-- `async_retry` (default) — ack 202 immediately, run the agent in the
-  background, and call `POST /events/{id}/retry` if the run fails. Retry state
-  lives in Hookdeck, so it survives a gateway restart. Stops after
-  `max_agent_retries` and marks the event exhausted rather than looping.
-
-  The same call covers the harder case. If the gateway dies mid-run, Hookdeck
-  has already recorded that delivery as successful and will never redeliver it
-  on its own — so at startup the adapter reads every ledger row still marked
-  `running`, which by then can only be an orphan, and asks for redelivery.
-  Between the two, an early ack is recoverable in both directions, which is
-  what lets Hookdeck be the work queue instead of the plugin owning one.
-- `sync` — hold the HTTP response until the run finishes, bounded by
-  `sync_timeout_seconds`, so the event's status in Hookdeck is the agent's real
-  outcome and Hookdeck's own retry rules apply. A run that outlasts the timeout
-  degrades to 202; answering 5xx there would redeliver work still in progress.
+- **CLI mode** (default): the Hookdeck CLI holds an outbound connection and forwards events to a loopback listener. Works behind NAT with no public URL, ngrok, or VPS. Pause the connection before shutdown to avoid losing events while disconnected.
+- **Push mode**: for publicly reachable gateways. Unlocks delivery rate limits, delivery groups, issue triggers, and alerting.
 
 ## Operator commands
 
 ```bash
-hermes hookdeck setup <route> [--all] [--dry-run]   # create/update connections
-hermes hookdeck status                              # queue depth, failures, issues
-hermes hookdeck pause <connection>                  # hold events server-side
-hermes hookdeck resume <connection>                 # drain them
-hermes hookdeck retry <event_id> | --failed         # re-attempt delivery
-hermes hookdeck doctor                              # check the whole setup
+hermes hookdeck setup <route>       # create/update connections
+hermes hookdeck status              # queue depth, failures, issues
+hermes hookdeck pause <connection>  # hold events server-side
+hermes hookdeck resume <connection> # drain them
+hermes hookdeck retry <event_id>    # re-attempt a delivery
+hermes hookdeck doctor              # check the whole setup
 ```
-
-`retry` is Hookdeck's retry — `POST /events/{id}/retry`, a fresh delivery
-attempt for the same event — and so are the dashboard's Retry buttons and the
-`hookdeck_retry_event` tool. None of it is reimplemented locally; the plugin
-asks Hookdeck and Hookdeck redelivers.
-
-Hookdeck's **replay** is a different thing: it re-ingests the original request
-and creates *new* events, with the connection's rules re-evaluated against
-current config. That is the right tool after fixing a filter or a
-transformation, and the plugin deliberately does not wrap it — a replayed event
-is new work, arrives with a new id, and needs no special handling here.
-
-`pause` before an upgrade and `resume` afterwards is a zero-loss restart:
-events accumulate in Hookdeck rather than hitting a dead port.
 
 ## Agent tools
 
-The `hookdeck` toolset lets the agent inspect and repair its own inbox —
-`hookdeck_queue_status`, `hookdeck_list_failed_events`,
-`hookdeck_get_event_body`, `hookdeck_retry_event`, `hookdeck_bulk_retry`,
-`hookdeck_pause_connection`, `hookdeck_resume_connection`.
+The plugin exposes the queue to the agent itself:
 
-The bundled `triage-webhook-failures` skill drives them: group failures by
-error code, retry what a retry will actually fix, and report the rest instead of
-retrying hopefully.
+- `hookdeck_queue_status`
+- `hookdeck_list_failed_events`
+- `hookdeck_get_event_body`
+- `hookdeck_retry_event`
+- `hookdeck_bulk_retry`
+- `hookdeck_pause_connection` / `hookdeck_resume_connection`
 
-## Dashboard tab
+A bundled `triage-webhook-failures` skill teaches the agent to group failures by error code, retry what a retry will actually fix, and report the rest instead of retrying hopefully.
 
-`hermes dashboard` gets a **Hookdeck** tab showing the queue depth, failed
-deliveries with a retry button, the local ledger's agent-run outcomes, and
-pause/resume per connection.
+## Dashboard
 
-The two panels are deliberately separate. Hookdeck's view is what is still
-*owed* to this gateway; the ledger is what this gateway *did* with each
-delivery. A run that fails after the 202 appears only in the second, because
-from Hookdeck's side that delivery succeeded.
+`hermes dashboard` gains a Hookdeck tab: queue depth, failed deliveries with one-click retry, agent-run outcomes from the ledger, and per-connection pause/resume. Optional, no build step.
 
-It needs nothing built: `dashboard/dist/index.js` is a plain IIFE against the
-host's `window.__HERMES_PLUGIN_SDK__`, which is why it is committed rather than
-generated. The tab is optional — without `HOOKDECK_API_KEY` it says so and the
-adapter carries on regardless.
+## Documentation
 
-## Trust boundary
-
-A valid signature proves Hookdeck sent the request. It says nothing about the
-contents. PR titles, commit messages, issue bodies and customer names are
-written by third parties, and they end up in the prompt.
-
-Hermes' own guidance applies and is worth following: run webhook-triggered
-routes against a sandboxed terminal backend (Docker or SSH), scope the toolset
-on those routes, require approval for destructive tools, and prefer a specific
-prompt template over dumping `{__raw__}`. The adapter sets a platform hint
-telling the model that payload text is data, never instructions addressed to it.
-
-For local testing only, `secret: INSECURE_NO_AUTH` skips verification. It is
-refused unless the listener is bound to loopback.
-
-The adapter declares `authorization_is_upstream`, which is what stops the
-gateway refusing every delivery as `Unauthorized user: hookdeck:<route>`. Core
-exempts its own webhook platform from the user allowlist by enum member,
-reasoning that HMAC verification in the adapter *is* the authorization; the
-reasoning carries over but the membership test cannot, since this platform is
-`Platform.HOOKDECK`. The flag goes false whenever verification is off, so an
-`INSECURE_NO_AUTH` route still falls under `HOOKDECK_ALLOWED_USERS` — narrower
-than core's exemption, which covers built-in webhook routes even unverified.
+- [How the reliability works](docs/reliability.md) — verification, the run
+  ledger and its idempotency rule, backpressure, ack modes, and why retry
+  rather than replay
+- [Running it](docs/operations.md) — CLI and push mode in full, the operational
+  cautions that matter in production, and the operator commands
+- [Trust boundary](docs/security.md) — payload text is third-party input that
+  reaches a prompt; what to do about it
+- [Limitations](docs/limitations.md) — the complete set, including the ones
+  that only surface once you provision connections yourself
+- [Development](docs/development.md) — running the tests, and what lives where
+- [`examples/config.yaml`](examples/config.yaml) — every setting, annotated
 
 ## Limitations
 
-- CLI destinations do not support delivery rate limits or issue triggers — a
-  Hookdeck restriction, not a plugin one. `max_concurrent` still applies, since
-  it is enforced adapter-side. Use push mode if you need gateway-side throttling
-  or alerting.
-- CLI mode runs one `hookdeck listen` process per route. That is fine for a
-  handful; a gateway with dozens of routes wants push mode.
-- `setup` only pushes an `events` filter down into Hookdeck when it knows where
-  the event name lives: a header for GitHub, GitLab and Shopify, or a body path
-  you set with `event_path`. Otherwise the filter stays adapter-side, because a
-  wrong filter discards traffic silently.
-- Named source types (`STRIPE`, `SHOPIFY`, …) still need the provider's own
-  signing secret entered on the source in the Hookdeck dashboard. `setup`
-  creates the source with the right verification shape but cannot invent the
-  secret.
-- The plugin does not poll. Hookdeck has no pull/consumer API — the Events API
-  is inspection-only, with no ack, lease or consumer group — so if you cannot
-  run the CLI and cannot expose a URL, it will not help you.
-- Delivery groups throttle per subject by rate, not by concurrency, because
-  Hookdeck's group-level period is `second|minute|hour`.
-- Every recovery path is bounded by your plan's retention: 3 days on
-  Developer, 7 on Team, 30 on Growth. An outage longer than that is not
-  replayable.
-- Only JSON and form-encoded bodies are understood. XML or plain-text
-  providers are rejected with 400 and, since no operator change makes such a
-  body parse, never retried. Put a Hookdeck transformation in front of the
-  connection to convert them, or use a provider webhook that speaks JSON.
-- Boot-time recovery re-runs an event whose run might in fact have completed
-  in the instant before a crash. That is the at-least-once contract the whole
-  design assumes; set `recover_on_boot: false` if it is wrong for your routes.
-
-## Code layout
-
-| Module | What lives there |
-|---|---|
-| `adapter.py` | The platform adapter: lifecycle, the delivery pipeline, outcome reporting |
-| `settings.py` | Every knob, resolved once from config + env, validated before start |
-| `routing.py` | Which route a delivery belongs to, and what event it is |
-| `payload.py` | Bytes → payload, including the encoding rules that bite |
-| `verify.py` | The one signature scheme |
-| `state.py` | The SQLite delivery ledger |
-| `api.py` | A thin async client for the Hookdeck API |
-| `provision.py` | Building the connection Hookdeck should have |
-| `cli.py` | `hermes hookdeck …` |
-| `tools.py` | The agent-facing toolset |
-| `dashboard/` | The dashboard tab: manifest, backend routes, and a no-build bundle |
-
-`routing.py`, `payload.py`, `verify.py`, `provision.py` and `settings.py` are
-pure — no Hermes, no HTTP, no state — so the rules they encode can be read and
-tested on their own. `adapter.py` is the only module that needs a gateway.
-
-## Development
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-```
-
-```bash
-.venv/bin/python -m pytest
-```
-
-The tests stub the Hermes internals the adapter imports (`tests/hermes_stub.py`)
-so the ingest path — verification, dedup, admission control, ack modes, outcome
-reporting — is exercised without a Hermes checkout.
+- CLI destinations don't support delivery rate limits or issue triggers; use push mode for those.
+- CLI mode runs one `hookdeck listen` process per route; impractical beyond a handful of routes.
+- JSON and form-encoded bodies only. XML and plain-text providers are rejected.
+- Recovery is bounded by your Hookdeck plan's retention window (3-30 days by tier).
+- Boot-time recovery is at-least-once: an event whose run completed just before a crash may run again. Keep agent actions idempotent where you can.
 
 ## License
 
-MIT.
+MIT
