@@ -11,9 +11,10 @@ traffic.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any
 
 from .constants import (
     ACK_MODES,
@@ -62,7 +63,7 @@ def load_hermes_config() -> dict:
         return {}
 
 
-def platform_extra(config: Optional[Mapping[str, Any]] = None) -> dict:
+def platform_extra(config: Mapping[str, Any] | None = None) -> dict:
     """``gateway.platforms.hookdeck.extra`` from a parsed config."""
     parsed = load_hermes_config() if config is None else config
     gateway = parsed.get("gateway") or {}
@@ -85,7 +86,7 @@ def configured_state_path() -> Path:
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
-def is_loopback(host: Optional[str]) -> bool:
+def is_loopback(host: str | None) -> bool:
     return bool(host) and host in LOOPBACK_HOSTS
 
 
@@ -97,7 +98,7 @@ class AdapterSettings:
 
     # ── Transport ──────────────────────────────────────────────────
     mode: str = "cli"
-    host: Optional[str] = None
+    host: str | None = None
     port: int = DEFAULT_PORT
     path: str = DEFAULT_PATH
     source: str = ""
@@ -129,7 +130,7 @@ class AdapterSettings:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_extra(cls, extra: Optional[Mapping[str, Any]]) -> "AdapterSettings":
+    def from_extra(cls, extra: Mapping[str, Any] | None) -> AdapterSettings:
         """Build settings from ``platforms.hookdeck.extra``, with env fallbacks.
 
         Environment variables are a fallback rather than an override, so a
@@ -201,7 +202,7 @@ class AdapterSettings:
         return self.signing_secret not in ("", INSECURE_NO_AUTH)
 
     @property
-    def bind_hosts(self) -> list[Optional[str]]:
+    def bind_hosts(self) -> list[str | None]:
         """Addresses to listen on.
 
         In cli mode that is *both* loopback families. The Hookdeck CLI forwards

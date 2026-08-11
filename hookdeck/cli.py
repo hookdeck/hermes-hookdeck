@@ -15,7 +15,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .api import HookdeckAPI, HookdeckAPIError, run_sync
 from .constants import DEFAULT_PATH, DEFAULT_PORT
@@ -44,7 +44,7 @@ def _cli_version(binary: str) -> str:
         out = subprocess.run(
             [binary, "version"], capture_output=True, text=True, timeout=10
         ).stdout
-    except Exception:
+    except Exception:  # noqa: BLE001 - an unknown version is reported, not raised
         return ""
     match = re.search(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", out)
     return match.group(0) if match else ""
@@ -333,7 +333,7 @@ def _print_local_state(limit: int) -> None:
         ledger.close()
 
 
-async def _resolve_connection_id(api: HookdeckAPI, value: str) -> Optional[str]:
+async def _resolve_connection_id(api: HookdeckAPI, value: str) -> str | None:
     if value.startswith("web_") or value.startswith("con_"):
         return value
     result = await api.list_connections(name=value)

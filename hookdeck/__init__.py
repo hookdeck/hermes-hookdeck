@@ -22,7 +22,7 @@ from .constants import PLATFORM_NAME
 logger = logging.getLogger(__name__)
 
 __version__ = "0.1.0"
-__all__ = ["register", "PLATFORM_NAME", "__version__"]
+__all__ = ["PLATFORM_NAME", "__version__", "register"]
 
 PLATFORM_HINT = (
     "You were triggered by a webhook delivered through Hookdeck, not by a "

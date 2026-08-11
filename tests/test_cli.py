@@ -6,19 +6,19 @@ from hookdeck import cli
 
 
 def _args(**kwargs) -> argparse.Namespace:
-    defaults = dict(
-        route="",
-        all=False,
-        source="",
-        source_type="",
-        mode="",
-        url="",
-        path="",
-        rate_limit=None,
-        rate_limit_period="concurrent",
-        group_key="",
-        dry_run=True,
-    )
+    defaults = {
+        "route": "",
+        "all": False,
+        "source": "",
+        "source_type": "",
+        "mode": "",
+        "url": "",
+        "path": "",
+        "rate_limit": None,
+        "rate_limit_period": "concurrent",
+        "group_key": "",
+        "dry_run": True,
+    }
     defaults.update(kwargs)
     return argparse.Namespace(hookdeck_action="setup", **defaults)
 

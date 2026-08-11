@@ -16,7 +16,6 @@ import asyncio
 import logging
 import os
 import shutil
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +67,8 @@ class HookdeckTunnel:
         self._api_key = api_key or os.getenv("HOOKDECK_API_KEY", "")
         self._login_enabled = login
         self._binary = binary
-        self._process: Optional[asyncio.subprocess.Process] = None
-        self._supervisor: Optional[asyncio.Task] = None
+        self._process: asyncio.subprocess.Process | None = None
+        self._supervisor: asyncio.Task | None = None
         self._stopping = False
 
     # ------------------------------------------------------------------
@@ -171,7 +170,7 @@ class HookdeckTunnel:
                 )
         except asyncio.TimeoutError:
             logger.warning("[hookdeck] `hookdeck ci` timed out after 30s")
-        except Exception as exc:  # pragma: no cover - environment dependent
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - environment dependent
             logger.warning("[hookdeck] `hookdeck ci` failed: %s", exc)
 
     async def _supervise(self, binary: str) -> None:
@@ -182,7 +181,7 @@ class HookdeckTunnel:
                 await self._run_once(binary)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - the supervisor restarts, never dies
                 logger.error("[hookdeck] CLI tunnel error: %s", exc)
 
             if self._stopping:

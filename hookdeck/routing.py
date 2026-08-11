@@ -6,7 +6,8 @@ matching rules can be read and tested on their own.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any
 
 from .payload import dig
 
@@ -37,7 +38,7 @@ def route_name_from_path(path_tail: str) -> str:
 
 def resolve(
     routes: Routes, *, path_tail: str = "", source_name: str = ""
-) -> tuple[str, Optional[dict]]:
+) -> tuple[str, dict | None]:
     """Pick the route for a delivery, most explicit signal first.
 
     Returns the route name and its config, or the name and ``None`` when

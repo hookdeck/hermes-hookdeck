@@ -26,7 +26,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 try:
     from aiohttp import web
@@ -135,8 +135,8 @@ class HookdeckAdapter(WebhookAdapter):
         self._routes = self.settings.routes
         self._max_body_bytes = self.settings.max_body_bytes
 
-        self._ledger: Optional[RunLedger] = None
-        self._api: Optional[HookdeckAPI] = None
+        self._ledger: RunLedger | None = None
+        self._api: HookdeckAPI | None = None
         self._tunnels: list[HookdeckTunnel] = []
         self._site_runner = None
 
@@ -147,7 +147,7 @@ class HookdeckAdapter(WebhookAdapter):
         # failures need the same explicit hand-back an async_retry run gets,
         # because Hookdeck has already recorded the delivery as successful.
         self._acked_before_completion: set[str] = set()
-        self._maintenance: Optional[asyncio.Task] = None
+        self._maintenance: asyncio.Task | None = None
         self._last_sweep = 0.0
 
     @staticmethod
@@ -263,7 +263,7 @@ class HookdeckAdapter(WebhookAdapter):
         """Start a listener per address. One family may be absent; both failing is fatal."""
         assert self._site_runner is not None
         started: list[str] = []
-        last_error: Optional[OSError] = None
+        last_error: OSError | None = None
         for host in self.settings.bind_hosts:
             try:
                 await web.TCPSite(self._site_runner, host, self._port).start()
@@ -513,7 +513,7 @@ class HookdeckAdapter(WebhookAdapter):
 
     async def _read_verified_body(
         self, request: web.Request
-    ) -> tuple[bytes, Optional[web.Response]]:
+    ) -> tuple[bytes, web.Response | None]:
         """Read the body within limits and verify it, before anything parses it."""
         too_large = self._respond({"error": "Payload too large"}, status=413)
 
@@ -523,7 +523,7 @@ class HookdeckAdapter(WebhookAdapter):
             raw_body = await request.read()
         except web.HTTPRequestEntityTooLarge:
             return b"", too_large
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - any read failure is a bad request
             logger.error("[hookdeck] Failed to read body: %s", exc)
             return b"", self._respond({"error": "Bad request"}, status=400)
         if len(raw_body) > self.settings.max_body_bytes:
@@ -552,7 +552,7 @@ class HookdeckAdapter(WebhookAdapter):
 
     def _parse_delivery(
         self, request: web.Request, raw_body: bytes
-    ) -> tuple[Delivery, Optional[web.Response]]:
+    ) -> tuple[Delivery, web.Response | None]:
         """Build a :class:`Delivery` from a verified request."""
         source_name = self._header(request, SOURCE_NAME)
         # No fallback. An id that did not come from Hookdeck is worse than
@@ -630,7 +630,7 @@ class HookdeckAdapter(WebhookAdapter):
 
     async def _reject_if_filtered(
         self, request: web.Request, delivery: Delivery
-    ) -> Optional[web.Response]:
+    ) -> web.Response | None:
         """Apply the route's own filters. Ignored events answer 200, not an error."""
         route = delivery.route
 
@@ -701,7 +701,7 @@ class HookdeckAdapter(WebhookAdapter):
             }
         )
 
-    def _already_handled(self, delivery: Delivery) -> Optional[str]:
+    def _already_handled(self, delivery: Delivery) -> str | None:
         """Why this delivery needs no run, if it needs none.
 
         Read-only on purpose. Answering this *before* the capacity check is
@@ -720,7 +720,7 @@ class HookdeckAdapter(WebhookAdapter):
             logger.info("[hookdeck] Skipping %s: %s", delivery.event_id, reason)
         return reason
 
-    def _admit(self, delivery: Delivery) -> Optional[web.Response]:
+    def _admit(self, delivery: Delivery) -> web.Response | None:
         """Claim a slot and a ledger entry, or defer.
 
         Nothing is recorded for a deferred event: a ledger entry would make
@@ -1033,7 +1033,7 @@ class HookdeckAdapter(WebhookAdapter):
         """
         assert self._api is not None
         delay = _REDELIVERY_RETRY_INITIAL_SECONDS
-        last: Optional[HookdeckAPIError] = None
+        last: HookdeckAPIError | None = None
         for attempt in range(1, _REDELIVERY_ATTEMPTS + 1):
             try:
                 await self._api.retry_event(event_id)
@@ -1066,7 +1066,7 @@ class HookdeckAdapter(WebhookAdapter):
         body: dict,
         *,
         status: int = 200,
-        headers: Optional[dict] = None,
+        headers: dict | None = None,
     ) -> web.Response:
         """Answer a delivery, refusing any status whose retryability is undeclared.
 
@@ -1172,7 +1172,7 @@ class HookdeckAdapter(WebhookAdapter):
                 content = build_skill_invocation_message(command, user_instruction=prompt)
                 if content:
                     return content
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a missing skill must not lose the event
             logger.warning("[hookdeck] Skill loading failed: %s", exc)
         return prompt
 
@@ -1222,7 +1222,7 @@ class HookdeckAdapter(WebhookAdapter):
     def _validate_startup(self) -> None:
         self.settings.validate()
 
-    def _bind_hosts(self) -> list[Optional[str]]:
+    def _bind_hosts(self) -> list[str | None]:
         return self.settings.bind_hosts
 
     def _tunnel_plan(self) -> dict[str, str]:
@@ -1270,7 +1270,7 @@ def is_connected(config: PlatformConfig) -> bool:
     return validate_config(config)
 
 
-def env_enablement() -> Optional[dict]:
+def env_enablement() -> dict | None:
     """Seed ``PlatformConfig.extra`` from the environment.
 
     Lets ``hermes gateway status`` report an env-only setup without
