@@ -17,6 +17,9 @@ import logging
 import os
 import shutil
 
+from .constants import CLI_API_KEY_ENV
+from .constants import api_key as resolve_api_key
+
 logger = logging.getLogger(__name__)
 
 _BACKOFF_INITIAL = 2.0
@@ -64,7 +67,7 @@ class HookdeckTunnel:
         self._path = path
         self._source = source
         self._connection_name = connection_name
-        self._api_key = api_key or os.getenv("HOOKDECK_API_KEY", "")
+        self._api_key = api_key or resolve_api_key()
         self._login_enabled = login
         self._binary = binary
         self._process: asyncio.subprocess.Process | None = None
@@ -210,7 +213,7 @@ class HookdeckTunnel:
             # otherwise exceed asyncio's 64KiB default and raise, bouncing an
             # otherwise healthy tunnel through the restart backoff.
             limit=_STDOUT_LINE_LIMIT,
-            env={**os.environ, **({"HOOKDECK_API_KEY": self._api_key} if self._api_key else {})},
+            env={**os.environ, **({CLI_API_KEY_ENV: self._api_key} if self._api_key else {})},
         )
         assert self._process.stdout is not None
         async for line in self._process.stdout:

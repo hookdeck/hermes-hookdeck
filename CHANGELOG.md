@@ -6,6 +6,29 @@ with the caveat that until 1.0 the config surface — `platforms.hookdeck.extra`
 
 ## Unreleased
 
+### Changed — action required
+
+- **Environment variables are namespaced to the Event Gateway**: `HOOKDECK_*`
+  becomes `HOOKDECK_EG_*`. Hookdeck's platform is more than one product, and the
+  bare prefix is not the Event Gateway's to claim. The old names still work and
+  log a deprecation warning naming their replacement; that fallback goes at 1.0.
+
+  `HOOKDECK_API_KEY` is the deliberate exception. It is the Hookdeck CLI's own
+  variable, and the adapter passes it to the `hookdeck listen` subprocess it
+  spawns, so `HOOKDECK_EG_API_KEY` wins when set and `HOOKDECK_API_KEY` remains
+  a first-class fallback rather than a deprecated one.
+
+### Added — forward compatibility
+
+- `HOOKDECK_EG_PROJECT_ID` (or `project_id` in `config.yaml`) pins which
+  Hookdeck project the API key acts on, sent as `X-Team-Id` — the same header
+  the Hookdeck CLI uses. Optional while every key is scoped to one project;
+  required once organisation-level keys can reach several. Also a safety
+  improvement today: the dashboard authorises pause/resume by matching
+  connection *names* against configured routes, so an unscoped organisation key
+  would let a same-named connection in an unrelated project match.
+  `hermes hookdeck doctor` reports whether the project is pinned.
+
 ### Fixed
 
 - A signature header containing a non-ASCII byte answered 500 instead of 401.

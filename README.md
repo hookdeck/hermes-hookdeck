@@ -191,9 +191,50 @@ git clone https://github.com/hookdeck/hermes-hookdeck ~/.hermes/plugins/hermes-h
 Set two secrets, both from your Hookdeck project settings:
 
 ```bash
-export HOOKDECK_API_KEY=...        # Project Settings → Secrets
-export HOOKDECK_WEBHOOK_SECRET=... # the signing secret
+export HOOKDECK_EG_API_KEY=...        # Project Settings → Secrets
+export HOOKDECK_EG_WEBHOOK_SECRET=... # the signing secret
 ```
+
+<details>
+<summary>Every environment variable, and why they are <code>HOOKDECK_EG_</code></summary>
+
+`EG` is Event Gateway. Hookdeck's platform is more than one product, and a bare
+`HOOKDECK_` prefix would claim the whole namespace for whichever integration
+happened to get there first.
+
+| Variable | |
+|---|---|
+| `HOOKDECK_EG_API_KEY` | Project Settings → Secrets. **`HOOKDECK_API_KEY` is also read**, and is not deprecated — see below. |
+| `HOOKDECK_EG_WEBHOOK_SECRET` | The signing secret the adapter verifies `x-hookdeck-signature` against. |
+| `HOOKDECK_EG_PROJECT_ID` | Which project to act on. Optional today; see below. |
+| `HOOKDECK_EG_MODE` | `cli` or `push`. |
+| `HOOKDECK_EG_PORT`, `HOOKDECK_EG_PATH` | Where the adapter listens. |
+| `HOOKDECK_EG_SOURCE` | Shared source for routes that do not name their own. |
+| `HOOKDECK_EG_ALLOWED_USERS`, `HOOKDECK_EG_ALLOW_ALL_USERS` | Only consulted for `INSECURE_NO_AUTH` routes. |
+
+Anything set under the old bare `HOOKDECK_` name still works and logs a
+deprecation warning naming its replacement. That fallback exists because these
+names were documented before the plugin was published; it will go at 1.0.
+
+**The API key is the deliberate exception.** `HOOKDECK_API_KEY` is what the
+Hookdeck CLI itself reads, and this adapter passes it straight through to the
+`hookdeck listen` subprocess it spawns. Insisting on a second name for one
+secret would be worse than sharing the ecosystem's convention, so
+`HOOKDECK_EG_API_KEY` wins when set and `HOOKDECK_API_KEY` is a first-class
+fallback rather than a deprecated one.
+
+**Why pin a project.** A Hookdeck API key is currently scoped to a single
+project, so the key implies the project and nothing has to say which one.
+Organisation-level keys that reach several projects are coming, and then it does
+have to be said — `HOOKDECK_EG_PROJECT_ID` (or `project_id` in `config.yaml`)
+sends `X-Team-Id`, the same header the Hookdeck CLI uses.
+
+Worth setting before you need it. The dashboard decides which connections this
+gateway may pause by matching names against your configured routes, so an
+unscoped organisation key would let a same-named connection in an unrelated
+project match. `hermes hookdeck doctor` reports whether the project is pinned.
+
+</details>
 
 ## Quickstart — CLI mode (no public URL)
 
@@ -355,7 +396,7 @@ from Hookdeck's side that delivery succeeded.
 
 It needs nothing built: `dashboard/dist/index.js` is a plain IIFE against the
 host's `window.__HERMES_PLUGIN_SDK__`, which is why it is committed rather than
-generated. The tab is optional — without `HOOKDECK_API_KEY` it says so and the
+generated. The tab is optional — without an API key it says so and the
 adapter carries on regardless.
 
 ## Trust boundary
@@ -379,7 +420,7 @@ exempts its own webhook platform from the user allowlist by enum member,
 reasoning that HMAC verification in the adapter *is* the authorization; the
 reasoning carries over but the membership test cannot, since this platform is
 `Platform.HOOKDECK`. The flag goes false whenever verification is off, so an
-`INSECURE_NO_AUTH` route still falls under `HOOKDECK_ALLOWED_USERS` — narrower
+`INSECURE_NO_AUTH` route still falls under `HOOKDECK_EG_ALLOWED_USERS` — narrower
 than core's exemption, which covers built-in webhook routes even unverified.
 
 ## Limitations
