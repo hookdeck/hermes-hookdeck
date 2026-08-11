@@ -80,6 +80,11 @@ with the caveat that until 1.0 the config surface — `platforms.hookdeck.extra`
 - The "no pull API" limitation now explains what the durability claim actually
   rests on: an event is recoverable because a delivered-but-failed event stays
   retryable, not because anything holds a lease on it.
+- `CLI_DISCONNECTED` events are documented as recoverable. They are a
+  first-class ignored-event cause, and bulk ignored-event retry re-runs the
+  original request through ingestion — provided a listener is attached again
+  first, since the retry re-evaluates the condition that ignored it. The plugin
+  does not automate this yet.
 
 ## 0.1.0
 

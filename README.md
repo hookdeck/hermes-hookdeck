@@ -250,6 +250,14 @@ which keeps them in the normal retry pipeline; a clean Ctrl+C forfeits even
 that. So on a planned shutdown, **pause the connection before you stop the
 gateway**:
 
+> Not quite unrecoverable, if you forget. Ignored events can be bulk-retried by
+> `cause`, and retrying re-runs the original request through ingestion — but
+> only once a listener is attached again, since the retry re-checks the same
+> condition that ignored it. The plugin does not do this for you yet; see
+> [Hookdeck can do more than this plugin asks it to](#hookdeck-can-do-more-than-this-plugin-asks-it-to).
+> Pausing is still much the better path, because it never drops the event in the
+> first place.
+
 ```bash
 hermes hookdeck pause github-prs
 ```
@@ -477,16 +485,26 @@ connection without waiting for a provider to fire one, and a way for Hermes to
 enqueue durable work for itself — the queue, ledger, retry and replay machinery
 all apply to a published event exactly as to a provider's.
 
-**Recovering what the queue calls "ignored".** The CLI-mode caveat above — that
-events arriving with no listener attached become `CLI_DISCONNECTED` ignored
-events and are discarded — is stated against what the plugin currently does with
-them, which is nothing. Hookdeck has
-[`POST /bulk/ignored-events/retry`](https://hookdeck.com/docs/api/bulk.md#bulk-retry-ignored-events),
-which retries ignored events matching a `cause`. Whether `CLI_DISCONNECTED` is
-among the causes it accepts needs confirming against a live project — the docs
-show `FILTERED` and `TRANSFORMATION_FAILED` — but if it is, the sharpest edge in
-CLI mode has a recovery path and `hermes hookdeck doctor` should be pointing at
-it.
+**Recovering what the queue calls "ignored" — including a disconnected CLI.**
+The CLI-mode caveat above says events arriving with no listener attached are
+discarded. That is what *this plugin* does with them, not what Hookdeck can do.
+[`POST /bulk/ignored-events/retry`](https://hookdeck.com/docs/api/bulk.md#bulk-retry-ignored-events)
+takes a query filtered by `cause` and `webhook_id`, and `CLI_DISCONNECTED` is a
+first-class cause alongside `FILTERED`, `TRANSFORMATION_FAILED`, `DISABLED` and
+`DUPLICATE`. Retrying re-runs the *original request* through ingestion for the
+connections you name, producing real events — so the recovery is genuine, not a
+status change.
+
+One ordering rule makes it work, and it is the whole trick: **reconnect first,
+then retry.** An ignored event is created when a CLI destination has no attached
+listen session, and the retry re-evaluates exactly that condition — so retrying
+while still disconnected simply produces another `CLI_DISCONNECTED` ignored
+event. Bring the gateway up, confirm the tunnel is attached, then retry scoped to
+your connection.
+
+That is a `hermes hookdeck recover` waiting to be written, and something
+`doctor` should offer after a restart rather than leaving the operator to find
+the API themselves.
 
 **Bulk operations with the safety catch on.** `hookdeck_bulk_retry` is an
 *agent-callable* tool that fires `POST /bulk/events/retry` immediately. Hookdeck
