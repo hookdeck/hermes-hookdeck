@@ -51,6 +51,111 @@ The last two rows are the ones that matter most. The built-in adapter answers
 202 as soon as it dispatches, which is the right thing to do — but it means a
 failed run has already been acknowledged, and nothing remembers it happened.
 
+## How it fits together
+
+```mermaid
+flowchart LR
+    P["<b>Provider</b><br/>GitHub · Stripe · Shopify · …"]
+
+    subgraph HD["Hookdeck Event Gateway — hosted"]
+        direction TB
+        SRC["<b>Source</b><br/>verifies the provider's<br/>own signature"]
+        RULES["<b>Connection rules</b><br/>filter · deduplicate · retry"]
+        Q[("<b>Event queue</b><br/>holds what is not yet<br/>delivered, within retention")]
+        SRC --> RULES --> Q
+    end
+
+    subgraph GW["Your machine — one hermes gateway process"]
+        direction TB
+        AD["<b>hookdeck adapter</b><br/>verifies x-hookdeck-signature<br/>deduplicates · admission control"]
+        LED[("<b>Delivery ledger</b><br/>SQLite, survives restarts")]
+        RUN["<b>Agent run</b><br/>prompt → tools → response"]
+        AD <--> LED
+        AD --> RUN
+    end
+
+    P -->|"POST, signed by the provider"| SRC
+    Q -->|"<b>cli mode</b><br/>hookdeck listen holds an outbound<br/>connection — no public URL"| AD
+    Q -->|"<b>push mode</b><br/>HTTPS to your reachable URL"| AD
+
+    style HD fill:#f4f7ff,stroke:#4571d1,color:#26324d
+    style GW fill:#f3faf1,stroke:#3f8f3c,color:#1f3d1e
+```
+
+Two signatures, two different jobs. Hookdeck checks the *provider's* signature
+at the edge — Stripe's, Shopify's, Twilio's, ~140 schemes — and then signs its
+own delivery. The adapter checks only that one, which is the whole point of the
+integration: Hermes implements one verifier instead of one per provider.
+
+### The delivery that has to come back
+
+The diagram above is just the path in. What makes this more than a webhook
+listener is the arrow it does not show — the adapter telling Hookdeck that a run
+failed, so the event returns instead of being forgotten:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as Hookdeck
+    participant A as Adapter
+    participant L as Ledger
+    participant R as Agent run
+
+    H->>A: deliver — event id, attempt 1, x-hookdeck-signature
+    A->>A: verify · route · parse · filter
+    A->>L: is this new work?
+    L-->>A: yes — attempt 1 beats nothing seen
+    A-->>H: 202 accepted
+    Note over A,H: The ack goes out before the run finishes.<br/>Recoverable in both directions, which is what lets<br/>Hookdeck be the queue instead of the plugin owning one.
+    A->>R: dispatch
+    R-->>A: failed
+    A->>L: mark failed
+    A->>H: POST /events/{id}/retry
+    H->>A: deliver — same event id, attempt 2
+    Note over L: attempt 2 > attempt 1, so this is a retry, not a duplicate.<br/>A repeat of attempt 1 would be refused.
+```
+
+The attempt counter is what lets deduplication and retry coexist rather than
+cancelling each other out. It is also how a gateway that dies at step 7 recovers:
+the ledger row is still `running` at the next boot, which by then can only mean
+the process that owned it is gone, so the adapter asks for the same redelivery
+at step 9. That is [`ack_mode: async_retry`](#how-the-reliability-works), the
+default; `sync` holds the response open instead and lets Hookdeck's own retry
+rules do the work.
+
+### Two ways in
+
+Both modes run the same adapter and the same reliability machinery. They differ
+only in how an event crosses your network boundary.
+
+| | `mode: cli` (default) | `mode: push` |
+|---|---|---|
+| Reachability | None needed — the connection is outbound | A public HTTPS URL |
+| Suits | A laptop, a homelab box, anything behind NAT | A VPS, a container, anything with an address |
+| Extra process | One `hookdeck listen` per route | None |
+| Gateway-side throttling | Not available — CLI destinations have no rate limit | Delivery rate limits, delivery groups, issue triggers, alerting |
+| Buffering while you are down | Only if you **pause** first — see the caveat in the CLI quickstart | Yes; failed deliveries stay queued and retry |
+
+In `cli` mode the listener binds loopback only and is not reachable from the
+network at all. In `push` mode it binds whatever `host` you configure, and the
+signature check is the only thing in front of it.
+
+### Three things here are called "CLI"
+
+Worth separating once, because the quickstarts use all three:
+
+- **The Hookdeck CLI** (`hookdeck`) — a binary you install from Hookdeck, and
+  the thing that makes `cli` mode work. You do not run it by hand: the adapter
+  spawns `hookdeck listen` itself, one process per route, and supervises it —
+  restarting with capped backoff if it dies, piping its output into the gateway
+  log. What you do need is to be logged in (`hookdeck login`) and on version
+  2.3.2 or later.
+- **`hermes hookdeck …`** — the operator commands this plugin adds: `setup`,
+  `status`, `pause`, `resume`, `replay`, `doctor`. These call the Hookdeck REST
+  API rather than the binary above, and work in both modes.
+- **`hermes`** — Hermes' own CLI, which hosts all of the above. `hermes gateway`
+  runs the process the adapter lives in.
+
 ## Install
 
 ```bash
