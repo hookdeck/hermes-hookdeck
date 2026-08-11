@@ -11,3 +11,6 @@ dist/
 # file outside it (see README).
 *.env
 .env*
+# The Hookdeck CLI writes a session here when run with `--local`, and the
+# gateway's own session lives under HERMES_HOME. Both hold credentials.
+.hookdeck/
