@@ -24,8 +24,7 @@ import types
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
-
+from typing import Any
 
 # Names the registry has been told about. Real Hermes mints a Platform member
 # only for a registered plugin name — "arbitrary strings are rejected to
@@ -56,7 +55,7 @@ class Platform(Enum):
 @dataclass
 class PlatformConfig:
     enabled: bool = True
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 class MessageType(Enum):
@@ -73,11 +72,11 @@ class ProcessingOutcome(Enum):
 class SessionSource:
     platform: Any = None
     chat_id: str = ""
-    chat_name: Optional[str] = None
+    chat_name: str | None = None
     chat_type: str = "dm"
-    user_id: Optional[str] = None
-    user_name: Optional[str] = None
-    profile: Optional[str] = None
+    user_id: str | None = None
+    user_name: str | None = None
+    profile: str | None = None
 
 
 @dataclass
@@ -86,15 +85,15 @@ class MessageEvent:
     message_type: Any = MessageType.TEXT
     source: Any = None
     raw_message: Any = None
-    message_id: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    message_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class SendResult:
     success: bool
-    message_id: Optional[str] = None
-    error: Optional[str] = None
+    message_id: str | None = None
+    error: str | None = None
 
 
 class _RouteProcessor:
@@ -154,11 +153,11 @@ class WebhookAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         self._host = extra.get("host") or None
         self._port = int(extra.get("port", 8787))
-        self._routes: Dict[str, dict] = dict(extra.get("routes") or {})
+        self._routes: dict[str, dict] = dict(extra.get("routes") or {})
         self._max_body_bytes = int(extra.get("max_body_bytes", 1_048_576))
         self._route_processor = _RouteProcessor()
-        self._delivery_info: Dict[str, dict] = {}
-        self._delivery_info_created: Dict[str, float] = {}
+        self._delivery_info: dict[str, dict] = {}
+        self._delivery_info_created: dict[str, float] = {}
         self._delivery_info_order: deque = deque()
         self.direct_deliveries: list = []
         self.direct_deliver_result = SendResult(success=True)

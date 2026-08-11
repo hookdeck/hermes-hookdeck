@@ -15,7 +15,8 @@ The rules attached to the connection are where most of the reliability lives:
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any
 
 from .constants import RETRYABLE_STATUSES
 
@@ -54,7 +55,7 @@ GROUP_RATE_PERIODS = ("second", "minute", "hour")
 def _http_destination_config(
     url: str,
     *,
-    rate_limit: Optional[int],
+    rate_limit: int | None,
     rate_limit_period: str,
     delivery_group_key: str,
     group_rate: int,
@@ -100,16 +101,16 @@ def build_connection_payload(
     mode: str = "cli",
     path: str = "/hookdeck",
     url: str = "",
-    events: Optional[list[str]] = None,
+    events: list[str] | None = None,
     event_path: str = "",
-    rate_limit: Optional[int] = None,
+    rate_limit: int | None = None,
     rate_limit_period: str = "concurrent",
     delivery_group_key: str = "",
     group_rate: int = DEFAULT_GROUP_RATE,
     group_rate_period: str = DEFAULT_GROUP_RATE_PERIOD,
     retry_count: int = DEFAULT_RETRY_COUNT,
     retry_interval_ms: int = DEFAULT_RETRY_INTERVAL_MS,
-    dedupe_window_ms: Optional[int] = DEFAULT_DEDUPE_WINDOW_MS,
+    dedupe_window_ms: int | None = DEFAULT_DEDUPE_WINDOW_MS,
     source_secret: str = "",
 ) -> dict[str, Any]:
     """Assemble the ``PUT /connections`` body for one Hermes route.
@@ -168,7 +169,7 @@ def _destination_spec(
     mode: str,
     path: str,
     url: str,
-    rate_limit: Optional[int],
+    rate_limit: int | None,
     rate_limit_period: str,
     delivery_group_key: str,
     group_rate: int,
@@ -220,7 +221,7 @@ def _rules(
     event_path: str,
     retry_count: int,
     retry_interval_ms: int,
-    dedupe_window_ms: Optional[int],
+    dedupe_window_ms: int | None,
 ) -> list[dict[str, Any]]:
     """Connection rules — where most of the reliability actually lives."""
     rules: list[dict[str, Any]] = [
@@ -243,7 +244,7 @@ def _rules(
 
 def build_event_filter(
     events: list[str], source_type: str, event_path: str
-) -> Optional[dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Turn a route's ``events`` list into a Hookdeck filter rule.
 
     Returns ``None`` when the event name's location is unknown — a wrong filter
@@ -290,7 +291,7 @@ def retryable_status_codes() -> list[str]:
     return ordered
 
 
-def _code_expression_matches(expression: str, status: int) -> Optional[bool]:
+def _code_expression_matches(expression: str, status: int) -> bool | None:
     """Evaluate one Hookdeck retry-rule code expression against *status*.
 
     Returns True/False for a positive match, or None when the expression is an
@@ -318,7 +319,7 @@ def _code_expression_matches(expression: str, status: int) -> Optional[bool]:
 
 
 def uncovered_statuses(
-    codes: Optional[list[str]], statuses: tuple[int, ...] = ADAPTER_RETRYABLE_STATUSES
+    codes: list[str] | None, statuses: tuple[int, ...] = ADAPTER_RETRYABLE_STATUSES
 ) -> list[int]:
     """Which of *statuses* a retry rule's ``response_status_codes`` misses.
 

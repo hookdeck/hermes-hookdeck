@@ -17,7 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-from typing import Iterable, Mapping
+from collections.abc import Iterable, Mapping
 
 from .constants import DEFAULT_HEADER_PREFIX, SIGNATURE, SIGNATURE_2, header_name
 
