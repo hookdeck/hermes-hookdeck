@@ -441,11 +441,26 @@ def test_a_failing_retry_exits_non_zero(fake_api, capsys):
 
 @pytest.fixture()
 def doctor_env(monkeypatch, ledger_at):
-    """A doctor run with nothing live: no API key, no CLI binary."""
-    monkeypatch.delenv("HOOKDECK_API_KEY", raising=False)
-    monkeypatch.delenv("HOOKDECK_WEBHOOK_SECRET", raising=False)
-    monkeypatch.delenv("HOOKDECK_MODE", raising=False)
-    monkeypatch.setattr(cli.shutil, "which", lambda _binary: None)
+    """A doctor run with nothing live: no API key, no CLI binary.
+
+    Both env-var spellings are cleared. Only the unprefixed names are read on
+    this branch, but an operator's shell may have either set, and a doctor
+    test that passes because of the caller's environment is worse than none.
+    """
+    for name in ("API_KEY", "WEBHOOK_SECRET", "MODE", "PROJECT_ID"):
+        monkeypatch.delenv(f"HOOKDECK_{name}", raising=False)
+        monkeypatch.delenv(f"HOOKDECK_EG_{name}", raising=False)
+
+    # Recorded, not just stubbed: "did the CLI checks run at all?" is the
+    # question in push mode, and answering it by grepping the output for
+    # "Hookdeck CLI" breaks as soon as an unrelated message mentions the CLI.
+    monkeypatch.which_calls = []
+
+    def which(binary):
+        # Returns None: no binary is on PATH in this fixture's world.
+        monkeypatch.which_calls.append(binary)
+
+    monkeypatch.setattr(cli.shutil, "which", which)
     monkeypatch.setattr(cli, "_load_hermes_config", dict)
     monkeypatch.setattr(cli, "_platform_extra", dict)
     return monkeypatch
@@ -465,13 +480,21 @@ def _configure(monkeypatch, *, routes=None, **extra):
 def test_doctor_fails_and_names_every_missing_piece(doctor_env, capsys):
     assert cli.hookdeck_command(_ns("doctor")) == 1
     out = capsys.readouterr().out
-    assert "HOOKDECK_API_KEY is not set" in out
-    assert "No signing secret" in out
-    assert "No routes under" in out
-    assert "not found" in out  # the CLI binary
+
+    # Matched against the failing lines only, so a passing check that happens
+    # to use the same words cannot satisfy this.
+    failures = "\n".join(
+        line for line in out.splitlines() if line.startswith("✗")
+    ).lower()
+    # Either spelling of the variable counts: the regression worth catching is
+    # doctor staying quiet about a missing key, not what the key is called.
+    assert "api key" in failures or "api_key" in failures
+    assert "no signing secret" in failures
+    assert "no routes under" in failures
+    assert "not found" in failures  # the CLI binary
     # An operator running this is already stuck; the diagnosis has to say what
     # to do, not just that something is wrong.
-    assert "mode: push" in out
+    assert "mode: push" in failures
 
 
 def test_doctor_passes_when_everything_is_in_place(
@@ -536,10 +559,10 @@ def test_doctor_names_a_shadowed_cli_install(doctor_env, capsys):
 def test_doctor_in_push_mode_requires_a_public_url(doctor_env, capsys):
     _configure(doctor_env, mode="push")
     assert cli.hookdeck_command(_ns("doctor")) == 1
-    out = capsys.readouterr().out
-    assert "push mode with no public_url" in out
-    # cli-mode checks must not run in push mode.
-    assert "Hookdeck CLI" not in out
+    assert "push mode with no public_url" in capsys.readouterr().out
+    # The cli-mode checks must not run in push mode: looking for a binary the
+    # gateway will never launch is a failure an operator cannot act on.
+    assert doctor_env.which_calls == []
 
 
 def test_doctor_surfaces_runs_that_were_never_completed(doctor_env, capsys, ledger_at):
