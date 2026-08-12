@@ -31,6 +31,9 @@ class FakeAPI:
     responses: ClassVar[dict] = {}
     calls: ClassVar[list] = []
     raises: ClassVar[Exception | None] = None
+    #: Raise only for a named method, so a test can fail one call in a
+    #: sequence rather than all of them.
+    raises_for: ClassVar[dict] = {}
 
     def __init__(self, *_args, **_kwargs) -> None:
         pass
@@ -45,6 +48,9 @@ class FakeAPI:
         # Positional-only: callers pass through their own kwargs, and
         # `list_connections(name=…)` would otherwise collide with this one.
         type(self).calls.append((_name, args, kwargs))
+        per_method = type(self).raises_for.get(_name)
+        if per_method is not None:
+            raise per_method
         if type(self).raises is not None:
             raise type(self).raises
         return type(self).responses.get(_name, {})
@@ -82,14 +88,12 @@ class FakeAPI:
 
 @pytest.fixture()
 def api(monkeypatch):
-    FakeAPI.responses = {}
-    FakeAPI.calls = []
-    FakeAPI.raises = None
+    FakeAPI.responses, FakeAPI.calls = {}, []
+    FakeAPI.raises, FakeAPI.raises_for = None, {}
     monkeypatch.setattr(tools, "HookdeckAPI", FakeAPI)
     yield FakeAPI
-    FakeAPI.responses = {}
-    FakeAPI.calls = []
-    FakeAPI.raises = None
+    FakeAPI.responses, FakeAPI.calls = {}, []
+    FakeAPI.raises, FakeAPI.raises_for = None, {}
 
 
 @pytest.fixture()
@@ -420,10 +424,61 @@ def test_retrying_one_event_names_it_back(api):
     assert calls_named(api, "retry_event") == [("retry_event", ("evt_1",), {})]
 
 
-def test_an_unscoped_bulk_retry_is_still_scoped_to_failures(api):
-    # Without the status filter this would replay successful events too.
+def test_bulk_retry_is_scoped_to_this_gateways_connections(api, ledger_at, monkeypatch):
+    # `status: FAILED` alone matches the whole project, and a project usually
+    # holds connections belonging to something else. An agent can call this
+    # with no arguments, so the default must not redeliver their traffic.
+    monkeypatch.setattr(
+        "hookdeck.settings.load_hermes_config",
+        lambda: {"gateway": {"platforms": {"hookdeck": {"extra": {
+            "routes": {"github": {}, "stripe": {}}}}}}},
+    )
+    api.responses["list_connections"] = {"models": [{"id": "web_mine"}]}
     call("hookdeck_bulk_retry")
-    assert calls_named(api, "bulk_retry_events")[0][1][0] == {"status": "FAILED"}
+
+    sent = calls_named(api, "bulk_retry_events")[0][1][0]
+    assert sent["status"] == "FAILED"
+    assert sent["webhook_id"] == ["web_mine", "web_mine"]  # one per route
+    # Resolved by name, the same way the dashboard decides what it may pause.
+    assert [c[2]["name"] for c in calls_named(api, "list_connections")] == [
+        "github", "stripe"
+    ]
+
+
+def test_bulk_retry_refuses_rather_than_widening_when_it_owns_nothing(
+    api, ledger_at, monkeypatch
+):
+    # The dangerous fallback would be "no connections resolved, so retry
+    # everything". Refuse and say so instead.
+    monkeypatch.setattr(
+        "hookdeck.settings.load_hermes_config",
+        lambda: {"gateway": {"platforms": {"hookdeck": {"extra": {"routes": {}}}}}},
+    )
+    message = call("hookdeck_bulk_retry")
+    assert "nothing this gateway owns" in message
+    assert not calls_named(api, "bulk_retry_events")
+
+
+def test_an_explicit_connection_overrides_the_default_scope(api, ledger_at):
+    call("hookdeck_bulk_retry", {"connection_id": "web_explicit"})
+    sent = calls_named(api, "bulk_retry_events")[0][1][0]
+    assert sent["webhook_id"] == "web_explicit"
+    assert not calls_named(api, "list_connections"), "no need to resolve ours"
+
+
+def test_matching_no_events_reads_as_an_answer_not_a_failure(api, ledger_at):
+    # The API refuses an empty batch with 422. Surfacing that as an API error
+    # tells the model something is broken when the true answer is "nothing to
+    # do" — and it is the common case on a healthy gateway.
+    from hookdeck.api import HookdeckAPIError
+
+    api.responses["list_connections"] = {"models": [{"id": "web_1"}]}
+    api.raises_for = {"bulk_retry_events": HookdeckAPIError(
+        422, "POST", "/bulk/events/retry",
+        "The query filter for the batch operations does not include any events.",
+    )}
+    message = call("hookdeck_bulk_retry", {"connection_id": "web_1"})
+    assert message == "No failed events matched — nothing to retry."
 
 
 def test_a_bulk_retry_carries_its_scope_into_the_query(api):

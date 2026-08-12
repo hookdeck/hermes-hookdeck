@@ -226,19 +226,56 @@ def hookdeck_retry_event(args: dict) -> str:
 
 @_guard
 def hookdeck_bulk_retry(args: dict) -> str:
-    """Retry every failed event, optionally scoped by time or connection."""
+    """Retry failed events for this gateway's connections."""
     query: dict[str, Any] = {"status": "FAILED"}
     if args.get("since"):
         query["created_at"] = {"gte": args["since"]}
-    if args.get("connection_id"):
-        query["webhook_id"] = args["connection_id"]
 
     async def _go() -> str:
         async with HookdeckAPI() as api:
-            result = await api.bulk_retry_events(query)
+            if args.get("connection_id"):
+                query["webhook_id"] = args["connection_id"]
+            else:
+                # Scoped to the routes this gateway serves. `status: FAILED`
+                # alone matches the whole project, and a project usually holds
+                # connections belonging to something else — redelivering their
+                # traffic is not this tool's to do, and an agent can call it
+                # with no arguments at all.
+                owned = await _owned_connection_ids(api)
+                if not owned:
+                    return (
+                        "No connection matches a configured route, so there is "
+                        "nothing this gateway owns to retry. Pass connection_id "
+                        "to act on a specific connection."
+                    )
+                query["webhook_id"] = owned
+            try:
+                result = await api.bulk_retry_events(query)
+            except HookdeckAPIError as exc:
+                if exc.status == 422 and "does not include any events" in exc.body:
+                    # A normal answer, not a fault: the API refuses a batch that
+                    # would match nothing.
+                    return "No failed events matched — nothing to retry."
+                raise
         return f"Bulk retry queued: {json.dumps(result)[:1000]}"
 
     return _run(_go())
+
+
+async def _owned_connection_ids(api: Any) -> list[str]:
+    """Connection ids for the routes this gateway is configured to serve.
+
+    Resolved by name, one request per route, the same way the dashboard decides
+    which connections it may pause — so both surfaces agree on what "ours"
+    means rather than each inventing it.
+    """
+    from .settings import platform_extra
+
+    ids: list[str] = []
+    for route_name in platform_extra().get("routes") or {}:
+        found = await api.list_connections(name=route_name, limit=10)
+        ids += [c["id"] for c in _models(found) if c.get("id")]
+    return ids
 
 
 #: Longest an agent may pause a connection for. Pausing is safe — events are
@@ -360,8 +397,9 @@ SCHEMAS = {
     ),
     "hookdeck_bulk_retry": _schema(
         "hookdeck_bulk_retry",
-        "Retry every failed event, optionally scoped by time or connection. "
-        "Prefer retrying individually unless the failures share one cause.",
+        "Retry failed events, scoped to this gateway's own connections unless "
+        "you name connection_id. Prefer retrying individually unless the "
+        "failures share one cause.",
         dict(_SINCE_PROP),
         [],
     ),
