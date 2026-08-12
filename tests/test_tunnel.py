@@ -446,3 +446,133 @@ async def test_the_session_names_itself_so_it_is_findable_in_the_dashboard(
     argv = spawned.commands[0][0]
     assert argv[argv.index("--device-name") + 1].startswith("hermes-")
     assert argv[argv.index("--name") + 1] == "hermes-gateway"
+
+
+# ----------------------------------------------------------------------
+# Escalating a failure that retrying cannot fix (#4)
+# ----------------------------------------------------------------------
+
+#: The output observed in #4, verbatim. The project the CLI forwards from has
+#: no such source, so it invents one and then finds no connection for it.
+PROJECT_MISMATCH_OUTPUT = [
+    b'Source "hermes-livetest" not found.\n',
+    b'Non-interactive mode detected. Automatically creating source "hermes-livetest".\n',
+    b'no connection found matching filter "livetest" for source "hermes-livetest"\n',
+]
+
+
+def test_a_project_mismatch_is_recognised_from_the_cli_output():
+    cause = tunnel_mod.diagnose(
+        [line.decode().strip() for line in PROJECT_MISMATCH_OUTPUT]
+    )
+    assert "different Hookdeck project" in cause
+    assert "hermes hookdeck doctor" in cause
+
+
+def test_an_expired_session_is_recognised():
+    assert "invalid or expired" in tunnel_mod.diagnose(
+        ["Authentication failed: your API key is invalid or expired."]
+    )
+
+
+def test_output_with_no_known_cause_diagnoses_nothing():
+    # Better to say only what is known than to guess a cause and send an
+    # operator after the wrong thing.
+    assert tunnel_mod.diagnose(["some unrecognised failure"]) == ""
+    assert tunnel_mod.diagnose([]) == ""
+
+
+async def test_a_tunnel_stuck_in_a_restart_loop_escalates_and_names_the_cause(
+    spawned, no_waiting, caplog
+):
+    # #4: the gateway logs that it is listening, the tunnel fails identically
+    # every couple of seconds at warning level, and nothing ever says the
+    # gateway is receiving no events.
+    for _ in range(10):
+        spawned.queue.append(FakeProcess(lines=list(PROJECT_MISMATCH_OUTPUT)))
+
+    tunnel = HookdeckTunnel(port=1, path="/x", source="hermes-livetest")
+    with caplog.at_level(logging.INFO):
+        await _supervise_rounds(tunnel, 5, no_waiting)
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, "escalate once per streak, not on every restart"
+    assert "No events are reaching the gateway" in errors[0]
+    assert "different Hookdeck project" in errors[0]
+    # The operator needs the CLI's own words too, not just our interpretation.
+    assert "no connection found matching filter" in errors[0]
+
+
+async def test_escalation_waits_for_a_streak_rather_than_one_bad_start(
+    spawned, no_waiting, caplog
+):
+    # A single fast exit happens on an ordinary flap. Crying wolf there would
+    # make the error level meaningless for the case that matters.
+    for _ in range(10):
+        spawned.queue.append(FakeProcess(lines=list(PROJECT_MISMATCH_OUTPUT)))
+
+    tunnel = HookdeckTunnel(port=1, path="/x", source="s")
+    await _supervise_rounds(
+        tunnel, tunnel_mod._FAST_FAILURES_BEFORE_ESCALATING - 1, no_waiting
+    )
+
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+async def test_a_healthy_run_rearms_the_escalation(
+    spawned, no_waiting, caplog, monkeypatch
+):
+    # A tunnel that recovers and later breaks again deserves to be shouted
+    # about again — otherwise the second outage is silent.
+    clock = {"now": 0.0}
+
+    class FakeLoop:
+        def time(self):
+            return clock["now"]
+
+    monkeypatch.setattr(tunnel_mod.asyncio, "get_running_loop", lambda: FakeLoop())
+    for _ in range(20):
+        spawned.queue.append(FakeProcess(lines=list(PROJECT_MISMATCH_OUTPUT)))
+
+    tunnel = HookdeckTunnel(port=1, path="/x", source="s")
+    runs = {"n": 0}
+    original = tunnel._run_once
+
+    async def timed_run(binary):
+        runs["n"] += 1
+        # Three fast failures, one healthy session, then three more failures.
+        healthy = runs["n"] == 4
+        clock["now"] += tunnel_mod._HEALTHY_RUN_SECONDS * 2 if healthy else 1.0
+        await original(binary)
+
+    tunnel._run_once = timed_run
+    await _supervise_rounds(tunnel, 7, no_waiting)
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 2, "once before the recovery, once after it breaks again"
+
+
+async def test_the_diagnosis_does_not_outlive_the_run_that_produced_it(spawned):
+    # Carrying output across runs would name a cause that has since been
+    # fixed — the worst kind of wrong, because it looks specific.
+    tunnel = HookdeckTunnel(port=1, path="/x", source="s")
+    spawned.queue.append(FakeProcess(lines=list(PROJECT_MISMATCH_OUTPUT)))
+    await tunnel._run_once("/usr/bin/hookdeck")
+    assert tunnel_mod.diagnose(tunnel._recent_output)
+
+    spawned.queue.append(FakeProcess(lines=[b"Ready!\n"]))
+    await tunnel._run_once("/usr/bin/hookdeck")
+    assert tunnel._recent_output == ["Ready!"]
+    assert tunnel_mod.diagnose(tunnel._recent_output) == ""
+
+
+async def test_the_output_buffer_is_bounded(spawned):
+    # A chatty tunnel runs for days; the tail is what diagnoses, not the whole
+    # session.
+    tunnel = HookdeckTunnel(port=1, path="/x", source="s")
+    spawned.queue.append(
+        FakeProcess(lines=[f"line {i}\n".encode() for i in range(500)])
+    )
+    await tunnel._run_once("/usr/bin/hookdeck")
+    assert len(tunnel._recent_output) == tunnel_mod._OUTPUT_MEMORY
+    assert tunnel._recent_output[-1] == "line 499"
