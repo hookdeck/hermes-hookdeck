@@ -171,6 +171,16 @@ class HookdeckAPI:
     async def list_connections(self, **params: Any) -> Any:
         return await self.request("GET", "/connections", params=params)
 
+    async def list_requests(self, **params: Any) -> Any:
+        """GET /requests — inbound requests, before they fan out into events.
+
+        The only place the API says whether a source actually verified what it
+        received: each request carries ``verified``. A source's own record does
+        not expose whether a provider secret is configured, so observed traffic
+        is the only signal there is.
+        """
+        return await self.request("GET", "/requests", params=params)
+
     async def list_sources(self, **params: Any) -> Any:
         return await self.request("GET", "/sources", params=params)
 
