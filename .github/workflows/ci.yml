@@ -79,6 +79,27 @@ jobs:
             fi
             echo "  ✓ $required"
           done
+      - name: The dashboard manifest must carry the version that was built
+        # Hermes reads this off disk and shows it. It used to be a literal, and
+        # it silently drifted: 0.1.1 shipped with a manifest saying 0.1.0. It is
+        # generated now, so this asserts the generator ran rather than trusting
+        # that it did.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob, json, re, sys, zipfile
+
+          wheel = glob.glob("dist/*.whl")[0]
+          built = re.match(r"[^-]+-([^-]+)-", wheel.split("/")[-1]).group(1)
+          manifest = json.loads(
+              zipfile.ZipFile(wheel).read("hookdeck/dashboard/manifest.json")
+          )
+          found = manifest.get("version")
+          if found != built:
+              print(f"::error::wheel is {built} but its dashboard manifest says {found}")
+              sys.exit(1)
+          print(f"  ✓ dashboard manifest reports {found}")
+          PY
       - name: The entry point Hermes discovers the plugin by must be declared
         run: |
           set -euo pipefail

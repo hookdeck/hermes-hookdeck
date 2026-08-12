@@ -37,13 +37,19 @@ at build time and writes `hookdeck/_version.py` into the wheel, so the PyPI
 version, `hookdeck.__version__` and what `hermes plugins list` reports are the
 same string by construction.
 
-**Do not add a version anywhere.** Three copies existed before this rule and
-all three had drifted: `plugin.yaml` and `dashboard/manifest.json` both said
-`0.1.0` while the package was at `0.1.1`, and each was invisible enough that
-nobody noticed. Both keys are now absent — the dashboard shows `0.0.0` for its
-plugin version, which is honestly unset rather than confidently wrong. If that
-display matters, wire it to the real version rather than reintroducing a
-literal.
+**Do not write a version literal anywhere.** Three copies existed before this
+rule and all three had drifted: `plugin.yaml` and `dashboard/manifest.json`
+both said `0.1.0` while the package was at `0.1.1`, and each was invisible
+enough that nobody noticed.
+
+`plugin.yaml`'s key is gone — nothing reads it for an entrypoint install.
+`dashboard/manifest.json` genuinely needs one, because Hermes reads that file
+off disk to display the plugin's version, so it is **generated at build time**
+by `_build/hermes_build.py` and is absent from the tracked file. CI fails the
+build if a wheel's manifest disagrees with the wheel's own version.
+
+If you find yourself adding a third place the version must appear, generate it
+the same way rather than typing the number.
 
 Between releases a checkout reports `0.1.2.dev4+g1a2b3c4` — "four commits past
 v0.1.1". That is correct, not a placeholder to fill in.

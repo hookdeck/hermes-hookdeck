@@ -1,0 +1,3 @@
+# PEP 517 backend-path: without this the sdist builds, and then fails to build
+# a wheel from itself because the backend module is missing.
+include _build/hermes_build.py

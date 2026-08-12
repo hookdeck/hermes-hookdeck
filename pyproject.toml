@@ -3,7 +3,11 @@
 # confusingly, or silently inlines the whole licence text into the metadata.
 [build-system]
 requires = ["setuptools>=77", "setuptools-scm>=8"]
-build-backend = "setuptools.build_meta"
+# A thin wrapper around setuptools that also stamps the resolved version into
+# hookdeck/dashboard/manifest.json, which Hermes reads off disk. See
+# _build/hermes_build.py for why it is a wrapper and not a post-build step.
+build-backend = "hermes_build"
+backend-path = ["_build"]
 
 [project]
 name = "hermes-hookdeck"
