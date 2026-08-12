@@ -10,6 +10,18 @@ The default. The Hookdeck CLI holds an outbound connection and forwards events
 to a loopback listener, so a laptop or a homelab box behind NAT works without
 ngrok or a VPS.
 
+The CLI is a separate binary — `brew install hookdeck/hookdeck/hookdeck`, or
+`npm install -g hookdeck-cli`. It is not bundled with this plugin and pip does
+not install it, so a gateway that has everything else right still refuses to
+start in `cli` mode without it:
+
+```
+✗ Hookdeck CLI 'hookdeck' not found — install it, set
+  platforms.hookdeck.extra.cli_binary, or switch to mode: push
+```
+
+`hermes hookdeck doctor` reports the same thing before you get that far.
+
 **A CLI destination is not a durable buffer.** With no listener attached,
 events become `CLI_DISCONNECTED` ignored events and the request is discarded —
 not queued, not retried. An *abnormal* disconnect gets a short server-side
