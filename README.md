@@ -125,12 +125,13 @@ Publishing a GitHub release is what ships the package — there is no separate
 approval step, and pushing a bare tag does nothing.
 
 1. **Get everything onto `main`** and make sure its checks are green.
-2. **Bump `__version__`** in [`hookdeck/__init__.py`](hookdeck/__init__.py) and
-   merge that to `main`. The release tag must equal `v` + this value; the
-   workflow checks it before building and fails the release otherwise.
-3. **Publish a GitHub release** — *Releases → Draft a new release*, tag
+2. **Publish a GitHub release** — *Releases → Draft a new release*, tag
    `vMAJOR.MINOR.PATCH`, target `main`, write the notes, Publish. Tick
    *Set as a pre-release* for `rc` versions.
+
+**The tag is the version.** setuptools-scm derives it at build time, so there
+is nothing in the repo to bump and nothing that can disagree — you decide the
+number when you create the release, not in a commit beforehand.
 
 [`release.yml`](.github/workflows/release.yml) then runs the test suite against
 the release's own commit, builds, publishes to PyPI via Trusted Publishing (no

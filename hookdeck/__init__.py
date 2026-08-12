@@ -26,7 +26,33 @@ from .constants import (
 
 logger = logging.getLogger(__name__)
 
-__version__ = "0.1.1"
+def _resolve_version() -> str:
+    """The version, which is the release tag and is never written down here.
+
+    `_version.py` is generated at build time by setuptools-scm from the git
+    tag, so an installed package always has it. A git checkout that has not
+    been built does not, and falls back to the installed distribution's
+    metadata — which is what an editable install has. Neither existing means
+    the package is being imported from a source tree that was never installed,
+    and no version can be known.
+    """
+    try:
+        from ._version import __version__ as scm_version
+    except ImportError:
+        pass
+    else:
+        return scm_version
+
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _dist_version
+
+    try:
+        return _dist_version("hermes-hookdeck")
+    except PackageNotFoundError:
+        return "0.0.0+unknown"
+
+
+__version__ = _resolve_version()
 __all__ = ["PLATFORM_NAME", "__version__", "register"]
 
 PLATFORM_HINT = (

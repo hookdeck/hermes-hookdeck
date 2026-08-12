@@ -1,7 +1,6 @@
 name: hookdeck
 label: Hookdeck
 kind: platform
-version: 0.1.0
 description: >
   Hookdeck event gateway adapter for Hermes Agent. Hookdeck sits in front of the
   agent as a durable, verified inbox: it verifies provider signatures for ~140

@@ -16,3 +16,6 @@ dist/
 # The Hookdeck CLI writes a session here when run with `--local`, and the
 # gateway's own session lives under HERMES_HOME. Both hold credentials.
 .hookdeck/
+
+# Generated at build time by setuptools-scm from the git tag.
+hookdeck/_version.py

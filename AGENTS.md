@@ -30,6 +30,24 @@ plugin rather than the product: the exact code or field the plugin keys off
 that mentions it), and behaviour the docs do not cover because it only arises
 here. Say the fact, then link the page.
 
+## The version is the git tag
+
+Nothing in this repo declares a version. setuptools-scm derives it from the tag
+at build time and writes `hookdeck/_version.py` into the wheel, so the PyPI
+version, `hookdeck.__version__` and what `hermes plugins list` reports are the
+same string by construction.
+
+**Do not add a version anywhere.** Three copies existed before this rule and
+all three had drifted: `plugin.yaml` and `dashboard/manifest.json` both said
+`0.1.0` while the package was at `0.1.1`, and each was invisible enough that
+nobody noticed. Both keys are now absent — the dashboard shows `0.0.0` for its
+plugin version, which is honestly unset rather than confidently wrong. If that
+display matters, wire it to the real version rather than reintroducing a
+literal.
+
+Between releases a checkout reports `0.1.2.dev4+g1a2b3c4` — "four commits past
+v0.1.1". That is correct, not a placeholder to fill in.
+
 ## Skills
 
 Two directories here are called "skills" and they are not the same thing.

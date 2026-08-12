@@ -1,16 +1,16 @@
 # Release-driven publish to PyPI.
 #
 #   1. get everything you want released onto `main`
-#   2. bump `__version__` in hookdeck/__init__.py (pyproject reads it from there)
-#   3. publish a GitHub release whose tag is v<that version>, targeting main
+#   2. publish a GitHub release, targeting main, tagged vMAJOR.MINOR.PATCH
+#
+# The tag is the version: setuptools-scm derives it, so there is nothing in the
+# repo to bump and nothing that can disagree with the tag.
 #
 # Publishing the release is the decision to ship — there is no second approval
 # step. `skills/hermes-hookdeck-release` walks an agent through it; the human
 # version is in README.md § Releasing.
 #
-# The tag is created by the release, so nothing here pushes tags. A release
-# whose tag disagrees with `hookdeck.__version__` fails before anything is
-# uploaded.
+# The tag is created by the release, so nothing here pushes tags.
 #
 # Publishing uses PyPI Trusted Publishing (OIDC), so there is no API token in
 # the repository to leak or rotate. It needs a one-time setup on PyPI:
@@ -34,24 +34,19 @@ jobs:
           # A release can target any commit. Build the one it actually points
           # at, not the tip of the default branch.
           ref: ${{ github.event.release.tag_name }}
+          # setuptools-scm derives the version from the tag, so the tag has to
+          # be in the clone. A shallow checkout builds 0.1.dev1+g<sha>.
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e '.[dev]' build twine
 
-      - name: The release tag and the package version must agree
-        env:
-          TAG: ${{ github.event.release.tag_name }}
+      - name: Show the version the tag resolves to
         run: |
           set -euo pipefail
-          tagged="${TAG#v}"
-          declared=$(python -c 'import hookdeck; print(hookdeck.__version__)')
-          if [ "$tagged" != "$declared" ]; then
-            echo "::error::release $TAG does not match hookdeck.__version__ ($declared)."
-            echo "::error::Delete the release and its tag, fix the version on main, and publish again."
-            exit 1
-          fi
-          echo "✓ releasing $declared"
+          echo "✓ releasing $(python -c 'import hookdeck; print(hookdeck.__version__)')"
 
       # A release that cannot pass its own test suite is not a release.
       - run: ruff check .

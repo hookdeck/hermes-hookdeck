@@ -49,6 +49,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # setuptools-scm reads the version from the tags. Without them this
+          # still builds, but at a meaningless version — and the point of this
+          # job is to inspect an artifact that resembles a released one.
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

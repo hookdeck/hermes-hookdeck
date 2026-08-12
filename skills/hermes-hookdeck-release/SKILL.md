@@ -2,8 +2,8 @@
 name: hermes-hookdeck-release
 description: >-
   Guides maintainers through releasing the hermes-hookdeck plugin to PyPI.
-  Publishing a GitHub release is what triggers the publish, so the version on
-  main must already match the tag. Validates the proposed version against
+  Publishing a GitHub release is what triggers the publish, and the tag is the
+  version — nothing in the repo is bumped. Validates the proposed version against
   SemVer from the actual change set, including the rule that a change to the
   bundled skill or plugin.yaml is a shipped change. Use when cutting a release,
   publishing to PyPI, drafting release notes, choosing vMAJOR.MINOR.PATCH,
@@ -18,20 +18,24 @@ Follow **[README.md](../../README.md) § Releasing** for the human steps
 (GitHub UI). This skill adds **how the automation works**, the **gates that
 must pass first**, and a **research loop** for drafting notes.
 
-## The one thing that goes wrong
+## The tag is the version
 
-`hookdeck/__init__.py` declares `__version__`, and the release tag must equal
-`v` + that value. The workflow checks this **first** and fails the build if
-they disagree.
+Nothing in the repo declares a version. setuptools-scm derives it from the git
+tag at build time and bakes it into `hookdeck/_version.py` inside the wheel, so
+`hookdeck.__version__` and the PyPI version are the same string by
+construction and cannot drift.
 
-So the version bump is a **commit on `main`, merged before the release is
-created** — not something you do while releasing. Publishing a release for a
-version that is not yet on `main` fails, and the only way out is deleting the
-release *and* its tag and starting again.
+The practical consequence: **you choose the number when you create the
+release**, not in a commit beforehand. There is nothing to bump, and no
+pre-release step that can be forgotten.
 
 **PyPI is append-only.** A version number that has been published can never be
-reused or replaced, even after a yank. Getting the number right before you
-publish matters more than any other step here.
+reused or replaced, even after a yank. That is why the number is worth getting
+right before you publish — it is the one part of this that cannot be undone.
+
+Between releases a source checkout reports a dev version derived from the last
+tag (`0.1.2.dev4+g1a2b3c4`). That is expected, not a bug: it says "four commits
+past v0.1.1".
 
 ## Agent checklist (end-to-end)
 
@@ -45,10 +49,9 @@ explicitly overrides.
 - [ ] **Change set reviewed:** `git log PREV_TAG..origin/main` — read the full
       messages, not just subjects. Group for **user-facing** notes.
 - [ ] **gate — SemVer:** `NEW_TAG` matches the **minimum** bump for the delta
-      (see **SemVer** below). Stop and realign if under-bumped.
-- [ ] **gate — version bump merged:** `hookdeck.__version__` on `origin/main`
-      equals `NEW_TAG` without the `v`. If not, that bump is its own commit,
-      merged first.
+      (see **SemVer** below). Stop and realign if under-bumped. Nothing else
+      validates this — the tag *is* the version, so a wrong tag is a wrong
+      release.
 - [ ] **gate — CI green on `main`:** the tip of `main` has passing checks.
 - [ ] **Release notes drafted** — see **Drafting release notes** and
       [references/release-notes-template.md](references/release-notes-template.md).
@@ -67,9 +70,9 @@ Pushing a bare tag does **nothing**. The tag is created by the release.
 
 ## What the workflow does
 
-1. **build** — checks out the release's tag, asserts the tag matches
-   `hookdeck.__version__`, runs `ruff` and the full test suite, builds the
-   wheel and sdist, and runs `twine check`.
+1. **build** — checks out the release's tag with full history (setuptools-scm
+   needs the tag present to resolve the version), runs `ruff` and the full test
+   suite, builds the wheel and sdist, and runs `twine check`.
 2. **publish** — uploads to PyPI via Trusted Publishing (OIDC, no stored
    token), in the `pypi` environment.
 3. **attach-artifacts** — attaches the wheel and sdist to the GitHub release
@@ -79,6 +82,10 @@ A failure in **build** means nothing was published; fix `main` and publish a
 new release. A failure in **publish** can be re-run from the Actions tab
 (`gh run rerun <id> --failed`) — do not create a second release for the same
 version.
+
+Because the version comes from the tag, a mistyped tag produces a real release
+at the wrong number rather than an error. Check the tag before publishing; that
+is the check the workflow can no longer do for you.
 
 ## SemVer: validate the proposed version
 
@@ -145,8 +152,8 @@ trigger anything.
 
 4. **Watch it**: `gh run watch` — or `gh run list --workflow=release.yml --limit 1`.
 
-**Requirements:** `gh` authenticated, and the version bump already on `main`.
-Do not put secrets in the notes file.
+**Requirements:** `gh` authenticated. Nothing needs to be bumped first — the
+tag you pass here becomes the version. Do not put secrets in the notes file.
 
 ### Verify afterwards
 
@@ -204,8 +211,8 @@ only for a first-time contributor or an exceptionally large contribution.
   fail the build, but finding out during a release is the wrong time.
 - **Do not under-bump.** Resolve a SemVer disagreement with the maintainer
   before publishing, not after.
-- **Do not publish a release for a version not yet on `main`** — it fails, and
-  recovering means deleting both the release and its tag.
+- **The tag is unchecked.** Nothing compares it to the change set, so a typo
+  (`v0.2.0` for a patch) ships at that number and burns it permanently.
 - **Green tests are not proof of integration.** The suite runs against a stub
   this repo also owns. Both defects found after 200 green tests came from a
   real `hermes gateway run`. For a release touching the delivery path, say
@@ -217,6 +224,6 @@ only for a first-time contributor or an exceptionally large contribution.
 |---|---|
 | Human release steps | [README.md § Releasing](../../README.md) |
 | CI entrypoint | [.github/workflows/release.yml](../../.github/workflows/release.yml) |
-| Version declaration | [hookdeck/\_\_init\_\_.py](../../hookdeck/__init__.py) |
+| Version derivation | [pyproject.toml](../../pyproject.toml) `[tool.setuptools_scm]` |
 | What is packaged | [pyproject.toml](../../pyproject.toml) `[tool.setuptools.package-data]` |
 | Repo conventions | [AGENTS.md](../../AGENTS.md) |

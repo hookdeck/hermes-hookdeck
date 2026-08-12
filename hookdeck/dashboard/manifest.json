@@ -3,7 +3,6 @@
   "label": "Hookdeck",
   "description": "Event queue: depth, failures, replay, and pause/resume for webhook-triggered agent runs.",
   "icon": "Webhook",
-  "version": "0.1.0",
   "tab": {
     "path": "/hookdeck",
     "position": "end"

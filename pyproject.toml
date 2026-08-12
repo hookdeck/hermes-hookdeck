@@ -2,14 +2,14 @@
 # understands from 77 — without this pin a build on an older setuptools fails
 # confusingly, or silently inlines the whole licence text into the metadata.
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-hookdeck"
-# Read from `hookdeck.__version__` rather than repeated here. Two copies drift,
-# and the one that drifts is always the one nobody looks at — `hermes plugins`
-# reports the module's, PyPI reports this one.
+# Derived from the git tag by setuptools-scm, never written down in the repo.
+# The release tag is the only declaration, so there is nothing to bump and
+# nothing that can disagree with it.
 dynamic = ["version"]
 description = "Hookdeck event gateway plugin for Hermes Agent — verified, queued, retryable webhook triggers"
 readme = "README.md"
@@ -123,8 +123,11 @@ ignore = [
 packages = ["hookdeck", "hookdeck.dashboard"]
 include-package-data = true
 
-[tool.setuptools.dynamic]
-version = { attr = "hookdeck.__version__" }
+# The tag is the version. `version_file` bakes the resolved value into the
+# package at build time, so an installed copy knows its own version without
+# git — which is what `hermes plugins list` reports.
+[tool.setuptools_scm]
+version_file = "hookdeck/_version.py"
 
 [tool.setuptools.package-data]
 hookdeck = [
