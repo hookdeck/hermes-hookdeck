@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
+.coverage
+htmlcov/
 *.egg-info/
 build/
 dist/
@@ -14,5 +16,3 @@ dist/
 # The Hookdeck CLI writes a session here when run with `--local`, and the
 # gateway's own session lives under HERMES_HOME. Both hold credentials.
 .hookdeck/
-.coverage
-htmlcov/
