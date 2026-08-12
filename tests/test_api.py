@@ -110,3 +110,26 @@ async def test_a_timeout_is_raised_as_an_api_error():
     api = HookdeckAPI("key", client=_client(handler))
     with pytest.raises(HookdeckAPIError):
         await api.list_events()
+
+
+async def test_bulk_retry_wraps_its_filters_in_a_query_object():
+    """The filters belong inside `query`, not at the top level.
+
+    Sent flat, the API answers 500 FATAL_ERROR rather than 400 — so a wrong
+    shape is indistinguishable from Hookdeck being down, and the agent
+    reported exactly that. Every other test fakes the client and asserts the
+    dict handed to this method, which is why none of them saw the wire.
+    """
+    import json as _json
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={"id": "bch_1", "estimated_count": 3})
+
+    api = HookdeckAPI("key", client=_client(handler))
+    await api.bulk_retry_events({"status": "FAILED", "webhook_id": "web_1"})
+
+    assert seen["body"] == {"query": {"status": "FAILED", "webhook_id": "web_1"}}
+    assert "status" not in seen["body"], "filters must not sit at the top level"

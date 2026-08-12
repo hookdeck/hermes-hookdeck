@@ -21,6 +21,7 @@ from .api import HookdeckAPI, HookdeckAPIError, run_sync
 from .constants import (
     API_KEY_ENV,
     CLI_API_KEY_ENV,
+    DEFAULT_MAX_CONCURRENT,
     DEFAULT_PATH,
     DEFAULT_PORT,
     MODE_ENV,
@@ -505,6 +506,44 @@ def _api_key_project() -> str:
         return ""
 
 
+def _burst_headroom(connection: dict, retry_rule: dict, extra: dict) -> Check:
+    """How large a burst this connection absorbs before events start dying.
+
+    An event deferred with 503 gets back in only on a later retry attempt, so
+    the queue drains at roughly `max_concurrent` events per round and each
+    event has `count` rounds before Hookdeck gives up. Their product is the
+    burst that survives; past it the tail exhausts its retries while waiting.
+
+    Reported rather than judged: the number that matters is the burst this
+    gateway actually sees, and only the operator knows that.
+    """
+    concurrent = int(extra.get("max_concurrent", DEFAULT_MAX_CONCURRENT) or 0)
+    count = int(retry_rule.get("count") or 0)
+    name = connection.get("name")
+
+    if not concurrent:
+        return Check(
+            True,
+            f"connection '{name}': max_concurrent is unlimited, so nothing is "
+            "deferred for capacity",
+        )
+    if not count:
+        return Check(
+            True, f"connection '{name}': retry rule has no count to reason about"
+        )
+    return Check(
+        True,
+        f"connection '{name}' absorbs a burst of about {concurrent * count} "
+        f"events (max_concurrent {concurrent} x {count} retries)",
+        note=(
+            "A larger simultaneous burst drains at max_concurrent per retry "
+            "round, and the tail runs out of retries before it is admitted. "
+            "Raise max_concurrent to spend more on parallel runs, or the "
+            "rule's count to wait longer."
+        ),
+    )
+
+
 def _check_cli_project(extra: dict) -> Check:
     """The two projects in play must be the same one.
 
@@ -635,7 +674,7 @@ def _report_stranded_runs() -> None:
         ledger.close()
 
 
-async def _check_live_connections(routes: dict) -> list[Check]:
+async def _check_live_connections(routes: dict, extra: dict) -> list[Check]:
     """Reachability, plus whether each retry rule covers what the adapter emits.
 
     A rule narrower than the emitted statuses is silent data loss — a deferred
@@ -670,6 +709,7 @@ async def _check_live_connections(routes: dict) -> list[Check]:
                             "never come back. Re-run `hermes hookdeck setup`.",
                         )
                     )
+                checks.append(_burst_headroom(connection, rule, extra))
     checks.append(Check(True, "Hookdeck API reachable and the key is accepted"))
     return checks
 
@@ -706,7 +746,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     if api_key():
         print()
         try:
-            live = run_sync(_check_live_connections(routes))
+            live = run_sync(_check_live_connections(routes, extra))
         except HookdeckAPIError as exc:
             live = [Check(False, f"Hookdeck API check failed: {exc}")]
         for check in live:

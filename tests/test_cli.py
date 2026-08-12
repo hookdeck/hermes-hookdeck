@@ -617,3 +617,48 @@ def test_doctor_reports_an_unreachable_api_as_a_failed_check(
     _configure(doctor_env, routes={"github": {}})
     assert cli.hookdeck_command(_ns("doctor")) == 1
     assert "Hookdeck API check failed" in capsys.readouterr().out
+
+
+# ── doctor: burst headroom ──────────────────────────────────────────
+
+
+def test_doctor_reports_how_large_a_burst_survives(doctor_env, fake_api, monkeypatch, capsys):
+    # An event deferred with 503 only gets back in on a retry, so the queue
+    # drains at max_concurrent per round and each event has `count` rounds.
+    # Their product is the burst that survives — a real loss we measured.
+    from hookdeck.provision import retryable_status_codes
+
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    doctor_env.setattr(cli.shutil, "which", lambda _b: "/usr/local/bin/hookdeck")
+    doctor_env.setattr(cli, "_cli_version", lambda _b: "2.4.0")
+    doctor_env.setattr(cli, "_other_hookdeck_binaries", lambda _r: [])
+    fake_api.responses["list_connections"] = {
+        "models": [{
+            "name": "github", "team_id": "tm_1",
+            "rules": [{"type": "retry", "count": 10,
+                       "response_status_codes": retryable_status_codes()}],
+        }]
+    }
+    _configure(doctor_env, secret="s", max_concurrent=3,
+               cli_config_path="", routes={"github": {}})
+
+    cli.hookdeck_command(_ns("doctor"))
+    out = capsys.readouterr().out
+    assert "absorbs a burst of about 30 events" in out
+    assert "max_concurrent 3 x 10 retries" in out
+
+
+def test_unlimited_concurrency_defers_nothing(doctor_env, fake_api, monkeypatch, capsys):
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    doctor_env.setattr(cli.shutil, "which", lambda _b: "/usr/local/bin/hookdeck")
+    doctor_env.setattr(cli, "_cli_version", lambda _b: "2.4.0")
+    doctor_env.setattr(cli, "_other_hookdeck_binaries", lambda _r: [])
+    fake_api.responses["list_connections"] = {
+        "models": [{"name": "github", "team_id": "tm_1",
+                    "rules": [{"type": "retry", "count": 10}]}]
+    }
+    _configure(doctor_env, secret="s", max_concurrent=0,
+               cli_config_path="", routes={"github": {}})
+
+    cli.hookdeck_command(_ns("doctor"))
+    assert "nothing is deferred for capacity" in capsys.readouterr().out

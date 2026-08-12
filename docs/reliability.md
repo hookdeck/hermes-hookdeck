@@ -48,6 +48,38 @@ limit deliveries; only the adapter can see runs. CLI destinations have no
 `rate_limit` field at all, so in the default transport it is not on the table
 either way.
 
+**Size it against the retry count, or a big enough burst loses its tail.** A
+deferred event is not held anywhere — it gets back in only when Hookdeck
+retries it. So a simultaneous burst drains at roughly `max_concurrent` events
+per retry round, and each event has the connection rule's `count` rounds before
+Hookdeck gives up on it. The product is the burst that survives:
+
+| `max_concurrent` | retry `count` | burst absorbed |
+|---|---|---|
+| 2 (default) | 10 (what `setup` provisions) | ~20 |
+| 1 | 5 | ~5 |
+
+Past that, the tail exhausts its retries while still waiting for a slot, and
+those events end `FAILED`. Measured, not theorised: a burst of 6 against
+`max_concurrent: 1` and a `count: 5` connection lost 2.
+
+`hermes hookdeck doctor` reports the figure per connection, using the rule
+that is really on it rather than the default:
+
+```
+✓ connection 'github' absorbs a burst of about 20 events (max_concurrent 2 x 10 retries)
+```
+
+Raise `max_concurrent` to spend more on parallel runs, or the rule's `count` to
+wait longer. Two runs is the default because agent runs cost money per
+execution, which is a different economy from a webhook handler — it is a
+spending decision as much as a throughput one.
+
+`defer_attempt_limit` (default 2) keeps a *sustained* overload from burning
+the budget faster still: past that many deferrals of one event the `Retry-After`
+hint is dropped, so Hookdeck falls back to exponential backoff instead of
+returning every few seconds.
+
 In `sync` mode this inverts: the delivery stays open for the run's duration, so
 a destination-level `--rate-limit N --rate-limit-period concurrent` genuinely
 does cap concurrent runs, and does it better — Hookdeck holds the event without

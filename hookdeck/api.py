@@ -198,7 +198,16 @@ class HookdeckAPI:
         return await self.request("POST", f"/events/{event_id}/retry")
 
     async def bulk_retry_events(self, query: Mapping[str, Any]) -> Any:
-        return await self.request("POST", "/bulk/events/retry", json=dict(query))
+        """POST /bulk/events/retry — redeliver every event matching *query*.
+
+        The filters go inside a ``query`` object. Sent at the top level the API
+        answers 500 ``FATAL_ERROR`` rather than a 400, so a wrong shape reads
+        as Hookdeck being down — which is exactly how this went unnoticed, and
+        why the wrapper is applied here rather than left to each caller.
+        """
+        return await self.request(
+            "POST", "/bulk/events/retry", json={"query": dict(query)}
+        )
 
     # ------------------------------------------------------------------
     # Observability
