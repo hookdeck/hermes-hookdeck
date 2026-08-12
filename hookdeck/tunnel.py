@@ -32,6 +32,48 @@ _HEALTHY_RUN_SECONDS = 20.0
 # Generous enough that CLI output never kills a working tunnel.
 _STDOUT_LINE_LIMIT = 1024 * 1024
 
+# How many consecutive too-short runs before the restart loop is treated as a
+# standing failure rather than a blip. Two would fire on an ordinary flap; this
+# is small enough to be prompt and large enough not to cry wolf.
+_FAST_FAILURES_BEFORE_ESCALATING = 3
+
+# How much of the CLI's output to keep for diagnosis. The useful line is the
+# last one before it exits.
+_OUTPUT_MEMORY = 12
+
+#: Substrings the CLI prints for failures that retrying cannot fix, paired with
+#: what to do about them. The backoff exists for network blips; these need a
+#: person, and without this they scroll past at warning level for ever.
+_DETERMINISTIC_FAILURES: tuple[tuple[str, str], ...] = (
+    (
+        "no connection found matching filter",
+        "the CLI is forwarding from a different Hookdeck project than the API "
+        "key manages, or `hermes hookdeck setup` has not been run for this "
+        "route. Run `hermes hookdeck doctor` — it compares the two.",
+    ),
+    (
+        "automatically creating source",
+        "the source does not exist in the project the CLI is forwarding from, "
+        "so the CLI has just created a stray one there. That is usually a "
+        "different project than the API key manages. Run `hermes hookdeck "
+        "doctor`.",
+    ),
+    (
+        "authentication failed",
+        "the CLI session is invalid or expired. If the gateway owns its "
+        "config, delete it and restart; otherwise run `hookdeck login`.",
+    ),
+)
+
+
+def diagnose(lines: list[str]) -> str:
+    """A likely cause for the CLI's exit, or "" if none is recognised."""
+    haystack = "\n".join(lines).lower()
+    for marker, explanation in _DETERMINISTIC_FAILURES:
+        if marker in haystack:
+            return explanation
+    return ""
+
 
 def _device_name() -> str:
     """How this gateway's CLI sessions identify themselves to Hookdeck.
@@ -89,6 +131,9 @@ class HookdeckTunnel:
         self._process: asyncio.subprocess.Process | None = None
         self._supervisor: asyncio.Task | None = None
         self._stopping = False
+        #: Tail of the last run's output, kept so a failing restart loop can
+        #: say *why* rather than only that it is looping.
+        self._recent_output: list[str] = []
 
     # ------------------------------------------------------------------
     # Command construction
@@ -222,6 +267,8 @@ class HookdeckTunnel:
 
     async def _supervise(self, binary: str) -> None:
         backoff = _BACKOFF_INITIAL
+        fast_failures = 0
+        escalated = False
         while not self._stopping:
             started = asyncio.get_running_loop().time()
             try:
@@ -237,6 +284,29 @@ class HookdeckTunnel:
             ran_for = asyncio.get_running_loop().time() - started
             if ran_for >= _HEALTHY_RUN_SECONDS:
                 backoff = _BACKOFF_INITIAL
+                fast_failures = 0
+                escalated = False
+            else:
+                fast_failures += 1
+
+            # A tunnel that never stays up is not retrying its way out of
+            # anything, and at warning level it reads as routine churn — which
+            # is how "the gateway is receiving nothing" stays invisible. Say so
+            # once, loudly, with the cause when the CLI named one, then fall
+            # back to the quiet line so the log does not fill up.
+            if fast_failures >= _FAST_FAILURES_BEFORE_ESCALATING and not escalated:
+                escalated = True
+                cause = diagnose(self._recent_output)
+                logger.error(
+                    "[hookdeck] CLI tunnel has failed to stay up %d times in a "
+                    "row (last run %.0fs). No events are reaching the gateway. "
+                    "%sLast output: %s",
+                    fast_failures,
+                    ran_for,
+                    f"Likely cause: {cause} " if cause else "",
+                    " / ".join(self._recent_output[-3:]) or "(none)",
+                )
+
             logger.warning(
                 "[hookdeck] CLI tunnel exited after %.0fs — restarting in %.0fs",
                 ran_for,
@@ -259,11 +329,17 @@ class HookdeckTunnel:
             limit=_STDOUT_LINE_LIMIT,
             env={**os.environ, **({CLI_API_KEY_ENV: self._api_key} if self._api_key else {})},
         )
+        # Reset per run: the diagnosis is about why *this* run ended, and
+        # carrying lines over from the previous one would name a cause that has
+        # since been fixed.
+        self._recent_output = []
         assert self._process.stdout is not None
         async for line in self._process.stdout:
             text = line.decode("utf-8", "replace").rstrip()
             if text:
                 logger.info("[hookdeck cli] %s", text)
+                self._recent_output.append(text)
+                del self._recent_output[:-_OUTPUT_MEMORY]
         await self._process.wait()
 
     async def _terminate(self) -> None:
