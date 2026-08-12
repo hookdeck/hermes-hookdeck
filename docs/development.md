@@ -14,6 +14,21 @@ The tests stub the Hermes internals the adapter imports (`tests/hermes_stub.py`)
 so the ingest path — verification, dedup, admission control, ack modes, outcome
 reporting — is exercised without a Hermes checkout.
 
+The dashboard bundle is JavaScript, so pytest cannot see it. It has its own
+suite, run by node's built-in test runner:
+
+```bash
+node --test "tests/dashboard/*.test.mjs"
+```
+
+No `package.json`, no install, nothing to build. The bundle takes React, its
+hooks and its fetch from the injected `window.__HERMES_PLUGIN_SDK__`, so
+`tests/dashboard/harness.mjs` fakes that SDK and runs the shipped file under
+`node:vm` — the real `dist/index.js`, byte for byte. `createElement` returns
+plain objects instead of rendering, because the questions worth asking are
+which endpoint a button posts to and whether it is disabled, and neither needs
+a DOM.
+
 ## Code layout
 
 | Module | What lives there |
