@@ -506,6 +506,91 @@ def _api_key_project() -> str:
         return ""
 
 
+async def _check_source_verification(api: HookdeckAPI, routes: dict) -> list[Check]:
+    """Whether a provider-typed source is actually verifying anything.
+
+    Setting a source's type to STRIPE or GITHUB does *not* switch verification
+    on. The provider's own signing secret has to be set on the source, and
+    until it is the source accepts anything — measured: an unsigned request and
+    one carrying `sha256=deadbeef` were both accepted by a GITHUB source with
+    no secret, and both produced events.
+
+    The source's own record does not say whether a secret is configured; a
+    source with one set is byte-identical to one without over the API. So the
+    only signal is observed traffic, where each request carries `verified`.
+    That means this can confirm a problem but never confirm its absence, and it
+    says which of the two it is doing rather than implying the stronger one.
+    """
+    typed = {
+        name: route
+        for name, route in routes.items()
+        if str(route.get("source_type") or "WEBHOOK").upper() != "WEBHOOK"
+    }
+    if not typed:
+        return []
+
+    checks: list[Check] = []
+    for route_name, route in typed.items():
+        source_type = str(route["source_type"]).upper()
+        source_name = route.get("source") or route_name
+        found = _models(await api.list_sources(name=source_name))
+        if not found:
+            continue
+        source = found[0]
+        requests = _models(
+            await api.list_requests(source_id=source.get("id"), limit=10)
+        )
+        if not requests:
+            checks.append(
+                Check(
+                    True,
+                    f"source '{source.get('name')}' is type {source_type} — no "
+                    "traffic yet, so verification is unconfirmed",
+                    note=(
+                        f"A {source_type} source verifies nothing until the "
+                        "provider's signing secret is set on it in the Hookdeck "
+                        "dashboard, and the API does not report whether it is. "
+                        "Until then the source accepts forged payloads."
+                    ),
+                )
+            )
+            continue
+
+        unverified = [r for r in requests if not r.get("verified")]
+        if unverified:
+            checks.append(
+                Check(
+                    False,
+                    f"source '{source.get('name')}' is type {source_type} but "
+                    f"{len(unverified)} of its last {len(requests)} requests "
+                    "were not verified — its signing secret is missing or does "
+                    "not match the sender's.",
+                    note=(
+                        "Set the provider's signing secret on the source in the "
+                        "Hookdeck dashboard. Without it the source accepts "
+                        "anything, including forged payloads."
+                    ),
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    True,
+                    f"source '{source.get('name')}' verified all of its last "
+                    f"{len(requests)} requests as {source_type}",
+                )
+            )
+    return checks
+
+
+def _models(result: Any) -> list[dict]:
+    """The list out of a paginated response, whichever key it used."""
+    if not isinstance(result, dict):
+        return []
+    models = result.get("models") or result.get("data") or []
+    return models if isinstance(models, list) else []
+
+
 def _burst_headroom(connection: dict, retry_rule: dict, extra: dict) -> Check:
     """How large a burst this connection absorbs before events start dying.
 
@@ -710,6 +795,7 @@ async def _check_live_connections(routes: dict, extra: dict) -> list[Check]:
                         )
                     )
                 checks.append(_burst_headroom(connection, rule, extra))
+        checks += await _check_source_verification(api, routes)
     checks.append(Check(True, "Hookdeck API reachable and the key is accepted"))
     return checks
 

@@ -269,6 +269,12 @@ class FakeAPI:
     async def list_connections(self, **kw):
         return self._answer("list_connections", **kw)
 
+    async def list_sources(self, **kw):
+        return self._answer("list_sources", **kw)
+
+    async def list_requests(self, **kw):
+        return self._answer("list_requests", **kw)
+
     async def pause_connection(self, cid):
         return self._answer("pause_connection", cid)
 
@@ -662,3 +668,91 @@ def test_unlimited_concurrency_defers_nothing(doctor_env, fake_api, monkeypatch,
 
     cli.hookdeck_command(_ns("doctor"))
     assert "nothing is deferred for capacity" in capsys.readouterr().out
+
+
+# ── doctor: named source types verify nothing without a secret ──────
+
+
+def _typed_route_doctor(doctor_env, fake_api, monkeypatch, *, requests):
+    """A doctor run with one STRIPE-typed route and the given request history."""
+    from hookdeck.provision import retryable_status_codes
+
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    doctor_env.setattr(cli.shutil, "which", lambda _b: "/usr/local/bin/hookdeck")
+    doctor_env.setattr(cli, "_cli_version", lambda _b: "2.4.0")
+    doctor_env.setattr(cli, "_other_hookdeck_binaries", lambda _r: [])
+    fake_api.responses["list_connections"] = {
+        "models": [{"name": "payments", "team_id": "tm_1",
+                    "rules": [{"type": "retry", "count": 10,
+                               "response_status_codes": retryable_status_codes()}]}]
+    }
+    fake_api.responses["list_sources"] = {"models": [{"id": "src_1", "name": "payments"}]}
+    fake_api.responses["list_requests"] = {"models": requests}
+    _configure(doctor_env, secret="s", cli_config_path="",
+               routes={"payments": {"source": "payments", "source_type": "STRIPE"}})
+    return cli.hookdeck_command(_ns("doctor"))
+
+
+def test_doctor_fails_when_a_typed_source_is_not_verifying(
+    doctor_env, fake_api, monkeypatch, capsys
+):
+    # Measured, not theorised: a GITHUB source with no secret accepted an
+    # unsigned request and one signed `sha256=deadbeef`, and made events from
+    # both. The type alone verifies nothing.
+    code = _typed_route_doctor(
+        doctor_env, fake_api, monkeypatch,
+        requests=[{"verified": False}, {"verified": False}, {"verified": True}],
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "2 of its last 3 requests were not verified" in out
+    assert "signing secret is missing or does not match" in out
+    assert "accepts anything" in out
+
+
+def test_doctor_confirms_verification_when_the_traffic_shows_it(
+    doctor_env, fake_api, monkeypatch, capsys
+):
+    code = _typed_route_doctor(
+        doctor_env, fake_api, monkeypatch,
+        requests=[{"verified": True}, {"verified": True}],
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "verified all of its last 2 requests as STRIPE" in out
+
+
+def test_doctor_says_unconfirmed_rather_than_ok_with_no_traffic(
+    doctor_env, fake_api, monkeypatch, capsys
+):
+    # The source's own record is identical whether or not a secret is set, so
+    # with no requests there is nothing to read. Claiming it is fine would be
+    # the one answer that is definitely wrong.
+    code = _typed_route_doctor(doctor_env, fake_api, monkeypatch, requests=[])
+    out = capsys.readouterr().out
+    assert code == 0  # not a failure — unknowable, not broken
+    assert "no traffic yet, so verification is unconfirmed" in out
+    assert "accepts forged payloads" in out
+
+
+def test_a_plain_webhook_source_is_not_nagged_about_provider_secrets(
+    doctor_env, fake_api, monkeypatch, capsys
+):
+    # WEBHOOK sources verify with the project's own signing secret, which the
+    # adapter already checks. This warning would be noise.
+    from hookdeck.provision import retryable_status_codes
+
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    doctor_env.setattr(cli.shutil, "which", lambda _b: "/usr/local/bin/hookdeck")
+    doctor_env.setattr(cli, "_cli_version", lambda _b: "2.4.0")
+    doctor_env.setattr(cli, "_other_hookdeck_binaries", lambda _r: [])
+    fake_api.responses["list_connections"] = {
+        "models": [{"name": "generic", "team_id": "tm_1",
+                    "rules": [{"type": "retry", "count": 10,
+                               "response_status_codes": retryable_status_codes()}]}]
+    }
+    _configure(doctor_env, secret="s", cli_config_path="", routes={"generic": {}})
+    cli.hookdeck_command(_ns("doctor"))
+    out = capsys.readouterr().out
+    assert "verification is unconfirmed" not in out
+    assert not calls_named(fake_api, "list_requests")

@@ -10,7 +10,7 @@ Agent runs are not ordinary webhook handlers. They take seconds to minutes, cost
 
 | | Built-in webhooks | With this plugin |
 |---|---|---|
-| Signature verification | Limited providers | ~140 provider schemes verified by Hookdeck |
+| Signature verification | Limited providers | ~140 provider schemes verified by Hookdeck, once the provider's secret is set on the source |
 | Gateway offline | Events lost | Paused events held server-side, drained on resume |
 | Traffic bursts | 30/min fixed window, excess dropped | Queued; overflow answered with 503 + `Retry-After` |
 | Duplicates | In-memory 1h cache | Hookdeck dedup + restart-safe SQLite ledger |
@@ -63,7 +63,7 @@ A [free Hookdeck account](https://dashboard.hookdeck.com/signup) is enough for d
 
 Events flow: **provider -> Hookdeck -> (CLI or HTTP push) -> plugin listener -> Hermes agent run**, with three reliability layers on top:
 
-1. **Signature verification.** Every delivery carries an `x-hookdeck-signature` header, verified with HMAC-SHA256 in constant time. Provider-side verification (Stripe, Shopify, GitHub, and ~140 others) happens at Hookdeck's edge before the event ever reaches you.
+1. **Signature verification.** Every delivery carries an `x-hookdeck-signature` header, verified with HMAC-SHA256 in constant time. Provider-side verification (Stripe, Shopify, GitHub, and ~140 others) happens at Hookdeck's edge before the event ever reaches you — but only once you paste that provider's signing secret onto the source in the Hookdeck dashboard. `hermes hookdeck setup` creates the source with the right type and cannot set the secret; until it is set, a typed source accepts unsigned and forged payloads. `hermes hookdeck doctor` reports what the source actually verified.
 2. **Run ledger.** A local SQLite database records each delivery attempt and its agent-run outcome. If the process crashes mid-run, boot-time recovery finds the orphaned events and re-runs them.
 3. **Backpressure.** `max_concurrent` caps simultaneous agent runs. Requests over the cap get a 503 with `Retry-After`, and Hookdeck redelivers on schedule instead of piling runs onto your box.
 
