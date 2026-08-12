@@ -8,15 +8,57 @@ the documented defaults.
 
 from __future__ import annotations
 
+import os
+
 PLATFORM_NAME = "hookdeck"
 
 DEFAULT_HEADER_PREFIX = "x-hookdeck"
+
+# ----------------------------------------------------------------------
+# Environment variables
+# ----------------------------------------------------------------------
+#
+# Namespaced to the Event Gateway. Hookdeck's platform is more than one product
+# — Outpost points the other way, at outbound delivery — and a bare `HOOKDECK_`
+# prefix claims the whole namespace for whichever integration got there first.
+# `HOOKDECK_EG_` says which product the value configures.
+ENV_PREFIX = "HOOKDECK_EG_"
+
+WEBHOOK_SECRET_ENV = f"{ENV_PREFIX}WEBHOOK_SECRET"
+MODE_ENV = f"{ENV_PREFIX}MODE"
+PORT_ENV = f"{ENV_PREFIX}PORT"
+PATH_ENV = f"{ENV_PREFIX}PATH"
+SOURCE_ENV = f"{ENV_PREFIX}SOURCE"
+ALLOWED_USERS_ENV = f"{ENV_PREFIX}ALLOWED_USERS"
+ALLOW_ALL_USERS_ENV = f"{ENV_PREFIX}ALLOW_ALL_USERS"
+
+# The API key is deliberately NOT renamed the same way. `HOOKDECK_API_KEY` is
+# the Hookdeck CLI's own documented variable — `hookdeck ci --api-key` defaults
+# to it, and this adapter passes it through to the `hookdeck listen` subprocess
+# it spawns. Forcing a second name for the same secret would mean setting two
+# variables to one value. So the namespaced name wins if present, and the
+# ecosystem-wide one is a first-class fallback rather than a deprecated one.
+API_KEY_ENV = f"{ENV_PREFIX}API_KEY"
+#: Read when the namespaced name is unset, and the name the CLI subprocess is
+#: always given, whichever of the two the value came from.
+CLI_API_KEY_ENV = "HOOKDECK_API_KEY"
+
+
+def api_key() -> str:
+    """The Hookdeck API key, namespaced name first, CLI convention second."""
+    return os.getenv(API_KEY_ENV) or os.getenv(CLI_API_KEY_ENV, "")
 
 # Suffixes appended to the configured prefix. Hookdeck documents these as
 # X-Hookdeck-Signature, X-Hookdeck-EventID, X-Hookdeck-Attempt-Count, etc.
 SIGNATURE = "signature"
 SIGNATURE_2 = "signature-2"
 EVENT_ID = "eventid"
+# Hookdeck sends this too, and it is deliberately not used as a delivery
+# identity. One request fans out to one event per matching connection, so two
+# routes sharing a source produce two events carrying the same request id —
+# dedup keyed on it would drop the second as a duplicate. `eventid` is the only
+# per-delivery identifier, which is why its absence is treated as "no id" and
+# said out loud rather than papered over.
 REQUEST_ID = "requestid"
 ATTEMPT_COUNT = "attempt-count"
 ATTEMPT_TRIGGER = "attempt-trigger"

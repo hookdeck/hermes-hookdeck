@@ -8,11 +8,12 @@ API-version base URL live in exactly one place.
 from __future__ import annotations
 
 import asyncio
-import os
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any
 
-from .constants import API_BASE_URL
+from .constants import API_BASE_URL, API_KEY_ENV
+from .constants import api_key as resolve_api_key
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import httpx
@@ -81,13 +82,13 @@ class HookdeckAPI:
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         *,
         base_url: str = API_BASE_URL,
         timeout: float = 20.0,
-        client: Optional["httpx.AsyncClient"] = None,
+        client: httpx.AsyncClient | None = None,
     ):
-        self.api_key = api_key or os.getenv("HOOKDECK_API_KEY", "")
+        self.api_key = api_key or resolve_api_key()
         self.base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._client = client
@@ -97,7 +98,7 @@ class HookdeckAPI:
     # Plumbing
     # ------------------------------------------------------------------
 
-    def _ensure_client(self) -> "httpx.AsyncClient":
+    def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = _httpx().AsyncClient(timeout=self._timeout)
         return self._client
@@ -107,7 +108,7 @@ class HookdeckAPI:
             await self._client.aclose()
             self._client = None
 
-    async def __aenter__(self) -> "HookdeckAPI":
+    async def __aenter__(self) -> HookdeckAPI:
         return self
 
     async def __aexit__(self, *_exc: Any) -> None:
@@ -123,7 +124,7 @@ class HookdeckAPI:
     ) -> Any:
         if not self.api_key:
             raise HookdeckAPIError(
-                401, method, path, "HOOKDECK_API_KEY is not set"
+                401, method, path, f"{API_KEY_ENV} is not set"
             )
         client = self._ensure_client()
         try:
@@ -132,10 +133,7 @@ class HookdeckAPI:
                 f"{self.base_url}{path}",
                 json=json,
                 params=_clean_params(params),
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=self._headers(),
             )
         except Exception as exc:
             # Timeouts, DNS failures, connection resets. Raised as the same
@@ -155,6 +153,12 @@ class HookdeckAPI:
         except ValueError:
             return response.text
 
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
     # ------------------------------------------------------------------
     # Connections
     # ------------------------------------------------------------------
@@ -166,6 +170,9 @@ class HookdeckAPI:
 
     async def list_connections(self, **params: Any) -> Any:
         return await self.request("GET", "/connections", params=params)
+
+    async def list_sources(self, **params: Any) -> Any:
+        return await self.request("GET", "/sources", params=params)
 
     async def pause_connection(self, connection_id: str) -> Any:
         return await self.request("PUT", f"/connections/{connection_id}/pause")
@@ -198,7 +205,7 @@ class HookdeckAPI:
     # ------------------------------------------------------------------
 
     async def queue_depth(
-        self, *, hours: int = 24, measures: Optional[list[str]] = None
+        self, *, hours: int = 24, measures: list[str] | None = None
     ) -> Any:
         """GET /metrics/queue-depth over the last *hours*.
 

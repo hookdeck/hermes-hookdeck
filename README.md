@@ -2,7 +2,9 @@
 
 **A durable, verified queue in front of your Hermes agent, so a webhook can trigger an agent run without the usual ways that goes wrong.**
 
-Agent runs are not ordinary webhook handlers. They take seconds to minutes, cost money per execution, and must not run twice for the same event. Hermes's built-in webhook platform is fine for trying things out, but in production it drops bursts over 30/min and forgets duplicates after a restart. Any run that fails after the 202 is sent is simply lost. This plugin replaces that ingestion path with [Hookdeck](https://hookdeck.com), plus a local ledger that tracks the outcomes Hookdeck can't see.
+Agent runs are not ordinary webhook handlers. They take seconds to minutes, cost money per execution, and must not run twice for the same event. Hermes's built-in webhook platform is fine for trying things out, but in production it drops bursts over 30/min and forgets duplicates after a restart. Any run that fails after the 202 is sent is simply lost. This plugin replaces that ingestion path with the [Hookdeck Event Gateway](https://hookdeck.com/docs), plus a local ledger that tracks the outcomes Hookdeck can't see.
+
+> Inbound only. This is the Event Gateway — third-party events arriving at your agent. It is not [Outpost](https://hookdeck.com/docs/outpost), which points the other way, and nothing here helps Hermes publish webhooks.
 
 ## Why
 
@@ -31,11 +33,11 @@ pip install hermes-hookdeck && hermes plugins enable hookdeck
 git clone https://github.com/hookdeck/hermes-hookdeck ~/.hermes/plugins/hermes-hookdeck
 ```
 
-Configure two environment variables from your Hookdeck dashboard (Project Settings > Secrets):
+Configure two environment variables from your Hookdeck dashboard (Project Settings > Secrets). They are prefixed `HOOKDECK_EG_` for the Event Gateway, since Hookdeck's platform is more than one product:
 
 ```bash
-export HOOKDECK_API_KEY=...        # provisions connections
-export HOOKDECK_WEBHOOK_SECRET=... # verifies deliveries
+export HOOKDECK_EG_API_KEY=...        # provisions connections
+export HOOKDECK_EG_WEBHOOK_SECRET=... # verifies deliveries
 ```
 
 Then create a route and check the setup:
@@ -95,6 +97,8 @@ A bundled `triage-webhook-failures` skill teaches the agent to group failures by
 
 ## Documentation
 
+- [How it fits together](docs/architecture.md) — where each piece runs, the
+  delivery pipeline, and the three different things called "CLI"
 - [How the reliability works](docs/reliability.md) — verification, the run
   ledger and its idempotency rule, backpressure, ack modes, and why retry
   rather than replay

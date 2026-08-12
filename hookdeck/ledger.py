@@ -33,7 +33,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 # Terminal and non-terminal statuses for a delivery.
 STATUS_RUNNING = "running"
@@ -118,7 +117,7 @@ class RunLedger:
 
     @staticmethod
     def _admits(
-        row: Optional[sqlite3.Row], attempt: int, *, operator_initiated: bool = False
+        row: sqlite3.Row | None, attempt: int, *, operator_initiated: bool = False
     ) -> tuple[bool, str]:
         """Whether *attempt* is new work, given what is already recorded.
 
@@ -151,7 +150,7 @@ class RunLedger:
 
     def rejection_reason(
         self, event_id: str, attempt: int, *, operator_initiated: bool = False
-    ) -> Optional[str]:
+    ) -> str | None:
         """Read-only: why :meth:`admit` would reject this delivery, if it would.
 
         Lets a caller recognise a repeat *without* recording anything — which
@@ -304,7 +303,7 @@ class RunLedger:
             )
             self._conn.commit()
 
-    def get(self, event_id: str) -> Optional[sqlite3.Row]:
+    def get(self, event_id: str) -> sqlite3.Row | None:
         with self._lock:
             return self._conn.execute(
                 "SELECT * FROM deliveries WHERE event_id = ?", (event_id,)
@@ -342,7 +341,7 @@ class RunLedger:
             )
             self._conn.commit()
 
-    def due_resumes(self, now: Optional[float] = None) -> list[sqlite3.Row]:
+    def due_resumes(self, now: float | None = None) -> list[sqlite3.Row]:
         moment = time.time() if now is None else now
         with self._lock:
             return self._conn.execute(

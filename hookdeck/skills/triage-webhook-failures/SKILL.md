@@ -22,7 +22,7 @@ Call `hookdeck_list_failed_events`. Group what comes back by `error_code` and
 - **`503` / `ERR_CONNECTION` in a burst** — the gateway hit its concurrency
   limit or was down. The events are fine; retrying is the whole fix.
 - **`401`** — a signing-secret mismatch. Retrying changes nothing until
-  `HOOKDECK_WEBHOOK_SECRET` matches the project's signing secret. Say so
+  `HOOKDECK_EG_WEBHOOK_SECRET` matches the project's signing secret. Say so
   instead of retrying.
 - **`404`** — no route matched the source. Fix the route config first; the
   events will keep failing otherwise.

@@ -4,6 +4,10 @@ import httpx
 import pytest
 
 from hookdeck.api import HookdeckAPI, HookdeckAPIError, _clean_params
+from hookdeck.constants import (
+    API_KEY_ENV,
+    CLI_API_KEY_ENV,
+)
 
 
 def _client(handler) -> httpx.AsyncClient:
@@ -50,10 +54,29 @@ def test_clean_params_preserves_repeated_keys():
     assert _clean_params([("m", "x"), ("m", "y"), ("n", None)]) == [("m", "x"), ("m", "y")]
 
 
-async def test_a_missing_api_key_fails_before_any_request():
+async def test_a_missing_api_key_fails_before_any_request(monkeypatch):
+    # Cleared explicitly: the client falls back to the environment, so a
+    # developer with a key exported would otherwise not be testing this at all.
+    monkeypatch.delenv(API_KEY_ENV, raising=False)
+    monkeypatch.delenv(CLI_API_KEY_ENV, raising=False)
     api = HookdeckAPI("")
-    with pytest.raises(HookdeckAPIError, match="HOOKDECK_API_KEY"):
+    with pytest.raises(HookdeckAPIError, match=API_KEY_ENV):
         await api.list_events()
+
+
+async def test_the_cli_api_key_variable_is_a_first_class_fallback(monkeypatch):
+    # Not deprecated: HOOKDECK_API_KEY is what the Hookdeck CLI itself reads,
+    # and this adapter passes it to the `hookdeck listen` subprocess. Demanding
+    # a second name for one secret would be worse than sharing the convention.
+    monkeypatch.delenv(API_KEY_ENV, raising=False)
+    monkeypatch.setenv(CLI_API_KEY_ENV, "key_from_the_cli_convention")
+    assert HookdeckAPI().api_key == "key_from_the_cli_convention"
+
+
+async def test_the_namespaced_api_key_wins(monkeypatch):
+    monkeypatch.setenv(API_KEY_ENV, "key_namespaced")
+    monkeypatch.setenv(CLI_API_KEY_ENV, "key_shared")
+    assert HookdeckAPI().api_key == "key_namespaced"
 
 
 async def test_non_2xx_carries_the_status_and_body():

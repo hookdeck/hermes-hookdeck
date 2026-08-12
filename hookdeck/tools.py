@@ -16,7 +16,7 @@ import json
 import logging
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 from .api import HookdeckAPI, HookdeckAPIError
 
@@ -40,7 +40,7 @@ def _run(coro: Any) -> Any:
     def _worker() -> None:
         try:
             box["value"] = asyncio.run(coro)
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
             box["error"] = exc
 
     thread = threading.Thread(target=_worker, daemon=True)
@@ -85,8 +85,8 @@ def _cancel_scheduled_resume(connection_id: str) -> None:
 
 
 def _with_ledger(action) -> None:
-    from .settings import configured_state_path
     from .ledger import RunLedger
+    from .settings import configured_state_path
 
     # The path the adapter actually reads, honouring a configured state_path.
     # Writing a pause deadline anywhere else records it where nothing will
@@ -115,12 +115,12 @@ def _models(result: Any) -> list[dict]:
 def _guard(fn: Any) -> Any:
     """Turn API errors into a message the model can act on."""
 
-    def wrapper(args: Optional[dict] = None, **_: Any) -> str:
+    def wrapper(args: dict | None = None, **_: Any) -> str:
         try:
             return fn(args or {})
         except HookdeckAPIError as exc:
             return f"Hookdeck API error: {exc}"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - the model gets a message, not a traceback
             return f"Hookdeck tool failed: {exc}"
 
     wrapper.__name__ = getattr(fn, "__name__", "hookdeck_tool")

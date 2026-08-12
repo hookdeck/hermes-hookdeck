@@ -15,18 +15,31 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .api import HookdeckAPI, HookdeckAPIError, run_sync
-from .constants import DEFAULT_PATH, DEFAULT_PORT
+from .constants import (
+    API_KEY_ENV,
+    CLI_API_KEY_ENV,
+    DEFAULT_PATH,
+    DEFAULT_PORT,
+    MODE_ENV,
+    WEBHOOK_SECRET_ENV,
+    api_key,
+)
+from .ledger import RunLedger
 from .provision import (
     build_connection_payload,
     routes_from_config,
     summarise_payload,
     uncovered_statuses,
 )
-from .settings import configured_state_path, load_hermes_config, platform_extra
-from .ledger import RunLedger
+from .settings import (
+    configured_state_path,
+    default_cli_config_path,
+    load_hermes_config,
+    platform_extra,
+)
 
 # ----------------------------------------------------------------------
 # Config helpers
@@ -44,7 +57,7 @@ def _cli_version(binary: str) -> str:
         out = subprocess.run(
             [binary, "version"], capture_output=True, text=True, timeout=10
         ).stdout
-    except Exception:
+    except Exception:  # noqa: BLE001 - an unknown version is reported, not raised
         return ""
     match = re.search(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", out)
     return match.group(0) if match else ""
@@ -262,7 +275,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     result = run_sync(_apply())
     if result == 0:
         print(
-            "\nNext: set HOOKDECK_WEBHOOK_SECRET to your project's signing "
+            f"\nNext: set {WEBHOOK_SECRET_ENV} to your project's signing "
             "secret, then start the gateway. Named source types (STRIPE, "
             "GITHUB, …) still need the provider's own signing secret entered "
             "on the source in the Hookdeck dashboard."
@@ -333,7 +346,7 @@ def _print_local_state(limit: int) -> None:
         ledger.close()
 
 
-async def _resolve_connection_id(api: HookdeckAPI, value: str) -> Optional[str]:
+async def _resolve_connection_id(api: HookdeckAPI, value: str) -> str | None:
     if value.startswith("web_") or value.startswith("con_"):
         return value
     result = await api.list_connections(name=value)
@@ -416,19 +429,23 @@ class Check:
 
 
 def _check_credentials(extra: dict) -> list[Check]:
+    key = api_key()
+    secret = extra.get("secret") or os.getenv(WEBHOOK_SECRET_ENV)
     return [
         Check(
-            bool(os.getenv("HOOKDECK_API_KEY")),
-            "HOOKDECK_API_KEY is set"
-            if os.getenv("HOOKDECK_API_KEY")
-            else "HOOKDECK_API_KEY is not set — setup, status and retry will not work",
+            bool(key),
+            f"API key is set ({API_KEY_ENV})"
+            if key
+            else f"No API key — setup, status and retry will not work. Set "
+            f"{API_KEY_ENV} (or {CLI_API_KEY_ENV}, which the Hookdeck CLI "
+            "reads too).",
         ),
         Check(
-            bool(extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET")),
+            bool(secret),
             "Signing secret is configured"
-            if (extra.get("secret") or os.getenv("HOOKDECK_WEBHOOK_SECRET"))
+            if secret
             else "No signing secret — the adapter will refuse to start. Set "
-            "HOOKDECK_WEBHOOK_SECRET to your project's signing secret.",
+            f"{WEBHOOK_SECRET_ENV} to your project's signing secret.",
         ),
     ]
 
@@ -439,6 +456,119 @@ def _check_routes(routes: dict) -> Check:
         f"{len(routes)} route(s) configured: {', '.join(routes)}"
         if routes
         else "No routes under platforms.hookdeck.extra.routes",
+    )
+
+
+def _cli_config_project(path: Path) -> tuple[str, bool]:
+    """The active profile's project id, and whether the file could be read.
+
+    A Hookdeck CLI config is multi-section with a top-level ``profile`` key
+    selecting the active one, so the first ``project_id`` in the file is not
+    necessarily the one the CLI will use. Reading the wrong section reports a
+    mismatch that is not real, which is worse than not checking at all.
+
+    The bool distinguishes "no such file" from "file present, no project in
+    it" — the caller says something different about each.
+    """
+    try:
+        text = path.read_text()
+    except OSError:
+        return "", False
+
+    named = re.search(r"^\s*profile\s*=\s*['\"]?([^'\"\s]+)", text, re.M)
+    profile = named.group(1) if named else "default"
+    section = re.search(
+        rf"^\[{re.escape(profile)}\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S
+    )
+    body = section.group(1) if section else text
+    found = re.search(r"^\s*project_id\s*=\s*['\"]?([^'\"\s]+)", body, re.M)
+    return (found.group(1) if found else ""), True
+
+
+def _api_key_project() -> str:
+    """Which project the API key belongs to, read off anything it can see."""
+    async def _go() -> str:
+        async with HookdeckAPI() as api:
+            for fetch in (api.list_connections, api.list_sources):
+                try:
+                    result = await fetch(limit=1)
+                except (HookdeckAPIError, AttributeError):
+                    continue
+                models = (result or {}).get("models") or []
+                if models and models[0].get("team_id"):
+                    return str(models[0]["team_id"])
+        return ""
+
+    try:
+        return run_sync(_go())
+    except Exception:  # noqa: BLE001 - a diagnostic must not raise
+        return ""
+
+
+def _check_cli_project(extra: dict) -> Check:
+    """The two projects in play must be the same one.
+
+    An API key decides which project `setup`, `status` and the retry hand-back
+    act on. The Hookdeck CLI's own config decides which project `hookdeck
+    listen` forwards from. Nothing reconciles them, and when they differ every
+    visible signal says the gateway is fine: `setup` succeeds, the adapter logs
+    that it is listening, and only the tunnel's restart loop — "no connection
+    found matching filter" — says otherwise, while events accumulate as
+    CLI_DISCONNECTED ignored events.
+    """
+    configured = extra.get("cli_config_path")
+    if configured == "":
+        path = Path.home() / ".config" / "hookdeck" / "config.toml"
+        source = f"your own session ({path})"
+    else:
+        # Matches AdapterSettings: absent or None means the gateway's own.
+        path = (
+            Path(str(configured)).expanduser()
+            if configured
+            else default_cli_config_path()
+        )
+        source = f"the gateway's own session ({path})"
+
+    cli_project, readable = _cli_config_project(path)
+    if configured != "" and not readable:
+        return Check(
+            True,
+            "The gateway will authenticate its own CLI session on start",
+            note=f"{path} does not exist yet; it is created from the API key, "
+            "so it cannot point at the wrong project.",
+        )
+
+    key_project = _api_key_project()
+    if not key_project:
+        return Check(
+            True,
+            "Could not determine the API key's project — nothing provisioned yet",
+            note="Re-run doctor after `hermes hookdeck setup`.",
+        )
+    if not cli_project:
+        return Check(
+            False,
+            f"No project recorded in {source}",
+            note="The file exists but names no project for its active profile. "
+            "Re-authenticate the CLI, or delete the file and let the gateway "
+            "create it.",
+        )
+    if cli_project == key_project:
+        return Check(True, f"CLI and API key agree on project {key_project}")
+
+    fix = (
+        "Remove platforms.hookdeck.extra.cli_config_path so the gateway pins "
+        "its own CLI session from the API key."
+        if configured == ""
+        else "Delete the file and let the gateway re-create it from the API key."
+    )
+    return Check(
+        False,
+        f"Project mismatch: the API key manages {key_project} but the CLI "
+        f"forwards from {cli_project}",
+        note="setup provisions one project while `hookdeck listen` forwards "
+        f"from the other. The gateway will look healthy and every event will "
+        f"become a CLI_DISCONNECTED ignored event. {fix}",
     )
 
 
@@ -546,12 +676,13 @@ async def _check_live_connections(routes: dict) -> list[Check]:
 
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     extra = _platform_extra()
-    mode = extra.get("mode") or os.getenv("HOOKDECK_MODE") or "cli"
+    mode = extra.get("mode") or os.getenv(MODE_ENV) or "cli"
     routes = routes_from_config(_load_hermes_config())
 
     checks = [*_check_credentials(extra), _check_routes(routes)]
     if mode == "cli":
         checks += _check_cli(extra)
+        checks.append(_check_cli_project(extra))
     else:
         checks.append(
             Check(
@@ -572,7 +703,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     )
     _report_stranded_runs()
 
-    if os.getenv("HOOKDECK_API_KEY"):
+    if api_key():
         print()
         try:
             live = run_sync(_check_live_connections(routes))

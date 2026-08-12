@@ -17,7 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-from typing import Iterable, Mapping
+from collections.abc import Iterable, Mapping
 
 from .constants import DEFAULT_HEADER_PREFIX, SIGNATURE, SIGNATURE_2, header_name
 
@@ -29,11 +29,26 @@ def compute_signature(body: bytes, secret: str) -> str:
 
 
 def _matches_any(expected: str, provided: Iterable[str]) -> bool:
+    """Whether any candidate is *expected*, compared as bytes.
+
+    Bytes rather than ``str`` because ``compare_digest`` refuses two ``str``
+    arguments unless both are pure ASCII, and a candidate is a header value an
+    unauthenticated sender controls outright. One non-ASCII byte in it used to
+    raise ``TypeError`` straight out of the verification path, which aiohttp
+    turned into a 500 — wrong twice over: it bypassed the
+    ``EMITTED_STATUS_RETRYABLE`` guard every other response goes through, and
+    500 sits inside the provisioned retry rule's ``500-599`` range, so a
+    malformed request was retried rather than refused.
+
+    Encoding cannot fail on either side: *expected* is base64, and ``replace``
+    maps an undecodable candidate to bytes that simply do not match.
+    """
+    wanted = expected.encode("ascii")
     # compare_digest on every candidate rather than short-circuiting, so the
     # work done does not depend on which header happened to match.
     matched = False
     for candidate in provided:
-        if candidate and hmac.compare_digest(expected, candidate):
+        if candidate and hmac.compare_digest(wanted, candidate.encode("utf-8", "replace")):
             matched = True
     return matched
 

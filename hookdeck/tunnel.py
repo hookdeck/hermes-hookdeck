@@ -16,7 +16,10 @@ import asyncio
 import logging
 import os
 import shutil
-from typing import Optional
+import socket
+
+from .constants import CLI_API_KEY_ENV
+from .constants import api_key as resolve_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,20 @@ _HEALTHY_RUN_SECONDS = 20.0
 
 # Generous enough that CLI output never kills a working tunnel.
 _STDOUT_LINE_LIMIT = 1024 * 1024
+
+
+def _device_name() -> str:
+    """How this gateway's CLI sessions identify themselves to Hookdeck.
+
+    The CLI defaults to the bare hostname, so an operator running their own
+    `hookdeck listen` on the same machine shows up indistinguishably from the
+    gateway's. Prefixing says which is which in the dashboard.
+    """
+    try:
+        host = socket.gethostname() or "unknown"
+    except OSError:  # pragma: no cover - environment dependent
+        host = "unknown"
+    return f"hermes-{host}"
 
 
 class HookdeckCLIMissing(RuntimeError):
@@ -53,7 +70,7 @@ class HookdeckTunnel:
         connection_name: str = "",
         api_key: str = "",
         binary: str = "hookdeck",
-        login: bool = False,
+        config_path: str = "",
     ):
         if not source:
             raise ValueError(
@@ -65,11 +82,12 @@ class HookdeckTunnel:
         self._path = path
         self._source = source
         self._connection_name = connection_name
-        self._api_key = api_key or os.getenv("HOOKDECK_API_KEY", "")
-        self._login_enabled = login
+        self._api_key = api_key or resolve_api_key()
+        #: A CLI config this gateway owns, kept away from the operator's own.
+        self._config_path = config_path
         self._binary = binary
-        self._process: Optional[asyncio.subprocess.Process] = None
-        self._supervisor: Optional[asyncio.Task] = None
+        self._process: asyncio.subprocess.Process | None = None
+        self._supervisor: asyncio.Task | None = None
         self._stopping = False
 
     # ------------------------------------------------------------------
@@ -103,6 +121,12 @@ class HookdeckTunnel:
         # immediately when stdout is not a TTY — which it never is here, since
         # the supervisor pipes it into the gateway log.
         args += ["--output", "compact"]
+        if self._config_path:
+            # The gateway's own CLI session, so `listen` forwards from the same
+            # project the API key manages rather than whatever the operator's
+            # shared config happens to point at.
+            args += ["--hookdeck-config", self._config_path]
+        args += ["--device-name", _device_name()]
         return args
 
     # ------------------------------------------------------------------
@@ -111,7 +135,6 @@ class HookdeckTunnel:
 
     async def start(self) -> None:
         binary = self.resolve_binary()
-        await self._login(binary)
         self._stopping = False
         self._supervisor = asyncio.create_task(self._supervise(binary))
 
@@ -126,53 +149,76 @@ class HookdeckTunnel:
             self._supervisor = None
         await self._terminate()
 
-    async def _login(self, binary: str) -> None:
-        """Non-interactive auth, off by default because it is destructive.
+    async def authenticate(self) -> bool:
+        """Point the CLI at the same project the API key manages.
 
-        ``hookdeck ci --api-key`` is not the no-op it looks like. It rewrites
-        the shared CLI config at ``~/.config/hookdeck/config.toml``: it swaps
-        the stored key for a CLI session key and switches the CLI's *active
-        project*. Anyone using the CLI for other work — another ``hookdeck
-        listen``, a different project — finds their environment silently
-        repointed by starting a gateway.
+        These are two independent settings, and nothing reconciles them: the
+        API key decides which project ``setup`` provisions, while the CLI's own
+        config decides which project ``hookdeck listen`` forwards from. When
+        they disagree the failure is silent and expensive — ``setup`` succeeds,
+        the gateway reports itself connected, and the tunnel restart-loops on
+        "no connection found matching filter" while every event becomes a
+        ``CLI_DISCONNECTED`` ignored event.
 
-        So the gateway does not touch it unless asked. The default path relies
-        on the operator's existing ``hookdeck login`` and passes
-        ``HOOKDECK_API_KEY`` through the subprocess environment.
+        So the gateway authenticates a CLI config of its own, from the API key
+        it already has, and passes ``--hookdeck-config`` to every CLI call.
+        Two projects cannot drift apart when only one of them is configurable.
+
+        This is deliberately not ``hookdeck ci`` against the shared config.
+        That rewrites ``~/.config/hookdeck/config.toml`` and switches the CLI's
+        *active project*, so anyone using the CLI for other work would find
+        their environment repointed by starting a gateway — and it does so even
+        with ``--local``, which claims to write to the current directory
+        (observed on CLI 2.4.0). Pointing at our own path avoids the shared
+        file entirely.
+
+        Without an API key there is nothing to authenticate with, so the
+        operator's ambient session is used and the mismatch stays possible;
+        ``hermes hookdeck doctor`` reports it.
         """
-        if not self._login_enabled:
-            return
+        if not self._config_path:
+            return True
+        binary = self.resolve_binary()
         if not self._api_key:
-            logger.info(
-                "[hookdeck] cli_login is on but no HOOKDECK_API_KEY is set — "
-                "relying on an existing `hookdeck login` session"
+            logger.warning(
+                "[hookdeck] No API key, so the CLI session cannot be pinned to "
+                "the same project the adapter manages. Falling back to your "
+                "own `hookdeck login`. Run `hermes hookdeck doctor` to check "
+                "the two agree."
             )
-            return
-        logger.warning(
-            "[hookdeck] cli_login is on: running `hookdeck ci`, which rewrites "
-            "~/.config/hookdeck/config.toml and switches the CLI's active "
-            "project. Turn it off if you use the Hookdeck CLI for other work."
-        )
+            self._config_path = ""
+            return True
         try:
             process = await asyncio.create_subprocess_exec(
                 binary,
                 "ci",
                 "--api-key",
                 self._api_key,
+                "--hookdeck-config",
+                self._config_path,
+                "--name",
+                "hermes-gateway",
+                "--device-name",
+                _device_name(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
             if process.returncode != 0:
-                logger.warning(
-                    "[hookdeck] `hookdeck ci` exited %s: %s",
-                    process.returncode,
+                logger.error(
+                    "[hookdeck] Could not authenticate the gateway's CLI "
+                    "config (%s): %s",
+                    self._config_path,
                     (stdout or b"").decode("utf-8", "replace").strip()[:300],
                 )
+                return False
         except asyncio.TimeoutError:
-            logger.warning("[hookdeck] `hookdeck ci` timed out after 30s")
-        except Exception as exc:  # pragma: no cover - environment dependent
-            logger.warning("[hookdeck] `hookdeck ci` failed: %s", exc)
+            logger.error("[hookdeck] `hookdeck ci` timed out after 30s")
+            return False
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - environment dependent
+            logger.error("[hookdeck] `hookdeck ci` failed: %s", exc)
+            return False
+        return True
 
     async def _supervise(self, binary: str) -> None:
         backoff = _BACKOFF_INITIAL
@@ -182,7 +228,7 @@ class HookdeckTunnel:
                 await self._run_once(binary)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - the supervisor restarts, never dies
                 logger.error("[hookdeck] CLI tunnel error: %s", exc)
 
             if self._stopping:
@@ -211,7 +257,7 @@ class HookdeckTunnel:
             # otherwise exceed asyncio's 64KiB default and raise, bouncing an
             # otherwise healthy tunnel through the restart backoff.
             limit=_STDOUT_LINE_LIMIT,
-            env={**os.environ, **({"HOOKDECK_API_KEY": self._api_key} if self._api_key else {})},
+            env={**os.environ, **({CLI_API_KEY_ENV: self._api_key} if self._api_key else {})},
         )
         assert self._process.stdout is not None
         async for line in self._process.stdout:

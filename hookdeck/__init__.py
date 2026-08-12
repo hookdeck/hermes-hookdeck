@@ -17,12 +17,17 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .constants import PLATFORM_NAME
+from .constants import (
+    ALLOW_ALL_USERS_ENV,
+    ALLOWED_USERS_ENV,
+    PLATFORM_NAME,
+    WEBHOOK_SECRET_ENV,
+)
 
 logger = logging.getLogger(__name__)
 
-__version__ = "0.1.0"
-__all__ = ["register", "PLATFORM_NAME", "__version__"]
+__version__ = "0.1.0rc1"
+__all__ = ["PLATFORM_NAME", "__version__", "register"]
 
 PLATFORM_HINT = (
     "You were triggered by a webhook delivered through Hookdeck, not by a "
@@ -50,13 +55,13 @@ def _register_platform(ctx: Any) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         env_enablement_fn=env_enablement,
-        required_env=["HOOKDECK_WEBHOOK_SECRET"],
+        required_env=[WEBHOOK_SECRET_ENV],
         install_hint=(
             "pip install 'aiohttp==3.14.3' httpx   # aiohttp is a Hermes extra "
             "(messaging/slack/…), not a core dependency"
         ),
-        allowed_users_env="HOOKDECK_ALLOWED_USERS",
-        allow_all_env="HOOKDECK_ALLOW_ALL_USERS",
+        allowed_users_env=ALLOWED_USERS_ENV,
+        allow_all_env=ALLOW_ALL_USERS_ENV,
         emoji="🪝",
         platform_hint=PLATFORM_HINT,
         # Webhook payloads carry third-party names, emails and phone numbers.
@@ -114,7 +119,15 @@ def _register_skill(ctx: Any) -> None:
     register = getattr(ctx, "register_skill", None)
     if not callable(register):
         return
+    # Hermes wants a Path to the SKILL.md itself, not to its directory, and it
+    # calls .exists() on what it is given — a str gets an AttributeError that
+    # the caller catches, so the skill silently never registers.
     register(
         name="triage-webhook-failures",
-        path=str(Path(__file__).parent / "skills" / "triage-webhook-failures"),
+        path=Path(__file__).parent / "skills" / "triage-webhook-failures" / "SKILL.md",
+        description=(
+            "Investigate and clear failed webhook events in the Hookdeck queue. "
+            "Use when events failed while the gateway was down, when a route's "
+            "runs are erroring, or when asked to check whether anything was missed."
+        ),
     )

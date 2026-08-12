@@ -51,6 +51,20 @@ def test_an_empty_secret_never_passes():
     assert not verify_signature(signed, BODY, "")
 
 
+def test_a_non_ascii_signature_is_rejected_not_raised():
+    # The sender controls this header outright. compare_digest refuses two
+    # non-ASCII strs, and letting that TypeError escape turned a forged
+    # signature into a 500 — which the retry rule then treats as retryable.
+    assert not verify_signature(headers(**{"x-hookdeck-signature": "abcé"}), BODY, SECRET)
+
+
+def test_a_lone_surrogate_signature_is_rejected_not_raised():
+    # Not reachable through aiohttp today, but the guard is one encode call and
+    # the failure mode it prevents is a 500 on the security-critical path.
+    signed = headers(**{"x-hookdeck-signature": "\ud800bad"})
+    assert not verify_signature(signed, BODY, SECRET)
+
+
 def test_honours_a_custom_header_prefix():
     signed = headers(**{"x-acme-signature": compute_signature(BODY, SECRET)})
     assert verify_signature(signed, BODY, SECRET, prefix="x-acme")

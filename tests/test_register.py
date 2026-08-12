@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +25,14 @@ class RecordingContext:
         self.tools.append(kwargs)
 
     def register_skill(self, **kwargs) -> None:
+        # Mirror what Hermes actually does with the argument. A permissive
+        # recorder accepted a str here and let a real registration failure
+        # (AttributeError on .exists(), swallowed by _try_register) ship.
+        path = kwargs["path"]
+        if not isinstance(path, Path):
+            raise TypeError(f"register_skill(path=) wants a Path, got {type(path).__name__}")
+        if not path.exists():
+            raise FileNotFoundError(f"SKILL.md not found at {path}")
         self.skills.append(kwargs)
 
 

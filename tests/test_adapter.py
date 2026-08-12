@@ -10,6 +10,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from hookdeck.adapter import HookdeckAdapter
+from hookdeck.constants import WEBHOOK_SECRET_ENV
 from hookdeck.ledger import RunLedger
 from hookdeck.verify import compute_signature
 from tests.hermes_stub import PlatformConfig, ProcessingOutcome, SendResult
@@ -120,6 +121,24 @@ async def test_unsigned_delivery_is_rejected(client_factory):
 async def test_delivery_signed_with_the_wrong_secret_is_rejected(client_factory):
     _adapter, client = await client_factory({"default": {}})
     response = await post(client, {"hello": "world"}, secret="not-the-secret")
+    assert response.status == 401
+
+
+async def test_a_malformed_signature_is_refused_not_a_server_error(client_factory):
+    """A junk signature must answer 401, like any other forged one.
+
+    A non-ASCII byte in the header used to raise out of the verification path
+    and become a 500 — which skips ``assert_declared_status`` entirely and,
+    because the provisioned retry rule covers ``500-599``, had Hookdeck retry
+    an unauthenticated request instead of dropping it.
+    """
+    _adapter, client = await client_factory({"default": {}})
+    response = await post(
+        client,
+        {"hello": "world"},
+        sign=False,
+        extra_headers={"x-hookdeck-signature": "not-base64-é"},
+    )
     assert response.status == 401
 
 
@@ -443,7 +462,7 @@ def test_startup_refuses_an_unknown_ack_mode(tmp_path):
 
 
 def test_startup_refuses_a_missing_secret(tmp_path, monkeypatch):
-    monkeypatch.delenv("HOOKDECK_WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv(WEBHOOK_SECRET_ENV, raising=False)
     config = PlatformConfig(
         extra={"mode": "push", "host": "0.0.0.0", "secret": "", "routes": {"a": {}}}
     )
@@ -891,6 +910,38 @@ async def test_a_delivery_with_no_event_id_is_processed_but_warned_about(
     assert "without deduplication or retry" in caplog.text
 
 
+async def test_a_proxys_request_id_is_not_mistaken_for_an_event_id(
+    client_factory, caplog
+):
+    """`X-Request-ID` is not a Hookdeck identifier and must not stand in.
+
+    Anything in front of the gateway can set it, it is not subject to
+    `header_prefix`, and one Hookdeck request fans out to one event per
+    matching connection — so it is not even unique per delivery. Accepting it
+    would key the ledger on the wrong thing and silence the warning that tells
+    an operator their `header_prefix` is wrong.
+    """
+    adapter, client = await client_factory({"default": {}})
+    seen: list[Any] = []
+    adapter.run_agent = lambda event: _record(seen, event)
+
+    raw = json.dumps({"n": 1}).encode()
+    response = await client.post(
+        "/hookdeck",
+        data=raw,
+        headers={
+            "content-type": "application/json",
+            "x-hookdeck-signature": compute_signature(raw, SECRET),
+            "X-Request-ID": "req_from_some_proxy",
+        },
+    )
+    assert response.status == 202
+    await _settle()
+    assert "without deduplication or retry" in caplog.text
+    assert adapter._ledger is not None
+    assert adapter._ledger.get("req_from_some_proxy") is None
+
+
 # ----------------------------------------------------------------------
 # Deduplication precedence
 # ----------------------------------------------------------------------
@@ -1030,6 +1081,59 @@ async def test_a_timed_out_sync_run_still_hands_its_failure_back(client_factory,
     gate.set()
     await _settle()
     assert adapter._api.retried == ["evt_slow_fail"]
+
+
+async def test_an_abandoned_hand_back_still_clears_its_sync_marker(
+    client_factory, monkeypatch
+):
+    """The marker goes once the hand-back decision is made, not once it works.
+
+    Keeping it on the failure path grows the set for the life of the process,
+    and a later sync-mode run of the same id would be treated as having been
+    acked early when it was not.
+    """
+    from hookdeck.api import HookdeckAPIError
+
+    monkeypatch.setattr("hookdeck.adapter._REDELIVERY_RETRY_INITIAL_SECONDS", 0.0)
+    adapter, client = await client_factory(
+        {"default": {}}, ack_mode="sync", sync_timeout_seconds=0.05
+    )
+    adapter._api.fail_with = HookdeckAPIError(0, "POST", "/events/x/retry", "no route")
+    gate = asyncio.Event()
+
+    async def _slow_failure(_event):
+        await gate.wait()
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _slow_failure
+    assert (await post(client, {"n": 1}, event_id="evt_abandoned")).status == 202
+    assert "evt_abandoned" in adapter._acked_before_completion
+
+    gate.set()
+    await _settle()
+    assert adapter._api.retried == []
+    assert adapter._acked_before_completion == set()
+
+
+async def test_an_exhausted_event_clears_its_sync_marker_too(client_factory):
+    adapter, client = await client_factory(
+        {"default": {}},
+        ack_mode="sync",
+        sync_timeout_seconds=0.05,
+        max_agent_retries=0,
+    )
+    gate = asyncio.Event()
+
+    async def _slow_failure(_event):
+        await gate.wait()
+        return ProcessingOutcome.FAILURE
+
+    adapter.run_agent = _slow_failure
+    assert (await post(client, {"n": 1}, event_id="evt_spent")).status == 202
+
+    gate.set()
+    await _settle()
+    assert adapter._acked_before_completion == set()
 
 
 async def test_a_sync_failure_within_the_timeout_is_left_to_hookdeck(client_factory):

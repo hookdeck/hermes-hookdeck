@@ -26,7 +26,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 try:
     from aiohttp import web
@@ -52,15 +52,20 @@ from .constants import (
     ATTEMPT_COUNT,
     ATTEMPT_TRIGGER,
     EVENT_ID,
+    MODE_ENV,
     OPERATOR_TRIGGERS,
+    PATH_ENV,
     PLATFORM_NAME,
+    PORT_ENV,
+    SOURCE_ENV,
     SOURCE_NAME,
+    WEBHOOK_SECRET_ENV,
     WILL_RETRY_AFTER,
     assert_declared_status,
     header_name,
 )
-from .settings import AdapterSettings
 from .ledger import RunLedger
+from .settings import AdapterSettings
 from .tunnel import HookdeckCLIMissing, HookdeckTunnel
 
 logger = logging.getLogger(__name__)
@@ -135,8 +140,8 @@ class HookdeckAdapter(WebhookAdapter):
         self._routes = self.settings.routes
         self._max_body_bytes = self.settings.max_body_bytes
 
-        self._ledger: Optional[RunLedger] = None
-        self._api: Optional[HookdeckAPI] = None
+        self._ledger: RunLedger | None = None
+        self._api: HookdeckAPI | None = None
         self._tunnels: list[HookdeckTunnel] = []
         self._site_runner = None
 
@@ -147,7 +152,7 @@ class HookdeckAdapter(WebhookAdapter):
         # failures need the same explicit hand-back an async_retry run gets,
         # because Hookdeck has already recorded the delivery as successful.
         self._acked_before_completion: set[str] = set()
-        self._maintenance: Optional[asyncio.Task] = None
+        self._maintenance: asyncio.Task | None = None
         self._last_sweep = 0.0
 
     @staticmethod
@@ -184,7 +189,7 @@ class HookdeckAdapter(WebhookAdapter):
         route to the same outcome, and its contract fits: authorization
         performed by a trusted upstream over an authenticated transport, with
         no local policy to consult, because a Hookdeck source is not an account
-        an operator configures in ``HOOKDECK_ALLOWED_USERS``.
+        an operator configures in ``HOOKDECK_EG_ALLOWED_USERS``.
 
         Not a fail-open — false whenever verification is off, so the local
         allowlist still applies to an ``INSECURE_NO_AUTH`` route. That makes it
@@ -263,7 +268,7 @@ class HookdeckAdapter(WebhookAdapter):
         """Start a listener per address. One family may be absent; both failing is fatal."""
         assert self._site_runner is not None
         started: list[str] = []
-        last_error: Optional[OSError] = None
+        last_error: OSError | None = None
         for host in self.settings.bind_hosts:
             try:
                 await web.TCPSite(self._site_runner, host, self._port).start()
@@ -285,16 +290,33 @@ class HookdeckAdapter(WebhookAdapter):
         return True
 
     async def _start_tunnels(self) -> bool:
+        """One CLI session for the gateway, then one `listen` per route.
+
+        Authentication happens once, before any tunnel starts. Doing it per
+        tunnel would have several `hookdeck ci` processes writing the same
+        config file while the first `hookdeck listen` is already reading it,
+        and would mint a session per route for one gateway.
+        """
         try:
-            for route_name, source in self.settings.tunnels.items():
-                tunnel = HookdeckTunnel(
+            tunnels = [
+                HookdeckTunnel(
                     port=self._port,
                     path=f"{self._path}/{route_name}",
                     source=source,
                     connection_name=route_name,
                     binary=self.settings.cli_binary,
-                    login=self.settings.cli_login,
+                    config_path=self.settings.cli_config_path,
                 )
+                for route_name, source in self.settings.tunnels.items()
+            ]
+            if tunnels and not await tunnels[0].authenticate():
+                logger.error(
+                    "[hookdeck] Refusing to start: the gateway's CLI session "
+                    "could not be authenticated, so `hookdeck listen` would "
+                    "restart-loop against an unusable config."
+                )
+                return False
+            for tunnel in tunnels:
                 await tunnel.start()
                 self._tunnels.append(tunnel)
         except HookdeckCLIMissing as exc:
@@ -513,7 +535,7 @@ class HookdeckAdapter(WebhookAdapter):
 
     async def _read_verified_body(
         self, request: web.Request
-    ) -> tuple[bytes, Optional[web.Response]]:
+    ) -> tuple[bytes, web.Response | None]:
         """Read the body within limits and verify it, before anything parses it."""
         too_large = self._respond({"error": "Payload too large"}, status=413)
 
@@ -523,7 +545,7 @@ class HookdeckAdapter(WebhookAdapter):
             raw_body = await request.read()
         except web.HTTPRequestEntityTooLarge:
             return b"", too_large
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - any read failure is a bad request
             logger.error("[hookdeck] Failed to read body: %s", exc)
             return b"", self._respond({"error": "Bad request"}, status=400)
         if len(raw_body) > self.settings.max_body_bytes:
@@ -552,12 +574,17 @@ class HookdeckAdapter(WebhookAdapter):
 
     def _parse_delivery(
         self, request: web.Request, raw_body: bytes
-    ) -> tuple[Delivery, Optional[web.Response]]:
+    ) -> tuple[Delivery, web.Response | None]:
         """Build a :class:`Delivery` from a verified request."""
         source_name = self._header(request, SOURCE_NAME)
-        event_id = self._header(request, EVENT_ID) or request.headers.get(
-            "X-Request-ID", ""
-        )
+        # No fallback. An id that did not come from Hookdeck is worse than
+        # none: `_admit` has a deliberate branch for a delivery with no event
+        # id, which warns loudly and names `header_prefix` as the likely cause,
+        # and a substitute id silences exactly that warning while breaking both
+        # things the id is for. Dedup keyed on a value Hookdeck did not mint is
+        # dedup on the wrong thing, and `POST /events/{id}/retry` with it 404s,
+        # so the failed run is never handed back.
+        event_id = self._header(request, EVENT_ID)
         try:
             attempt = int(self._header(request, ATTEMPT_COUNT) or 0)
         except ValueError:
@@ -625,7 +652,7 @@ class HookdeckAdapter(WebhookAdapter):
 
     async def _reject_if_filtered(
         self, request: web.Request, delivery: Delivery
-    ) -> Optional[web.Response]:
+    ) -> web.Response | None:
         """Apply the route's own filters. Ignored events answer 200, not an error."""
         route = delivery.route
 
@@ -696,7 +723,7 @@ class HookdeckAdapter(WebhookAdapter):
             }
         )
 
-    def _already_handled(self, delivery: Delivery) -> Optional[str]:
+    def _already_handled(self, delivery: Delivery) -> str | None:
         """Why this delivery needs no run, if it needs none.
 
         Read-only on purpose. Answering this *before* the capacity check is
@@ -715,7 +742,7 @@ class HookdeckAdapter(WebhookAdapter):
             logger.info("[hookdeck] Skipping %s: %s", delivery.event_id, reason)
         return reason
 
-    def _admit(self, delivery: Delivery) -> Optional[web.Response]:
+    def _admit(self, delivery: Delivery) -> web.Response | None:
         """Claim a slot and a ledger entry, or defer.
 
         Nothing is recorded for a deferred event: a ledger entry would make
@@ -963,6 +990,7 @@ class HookdeckAdapter(WebhookAdapter):
             self._ledger.mark_exhausted(
                 event_id, reason, session_chat_id=session_chat_id
             )
+            self._acked_before_completion.discard(event_id)
             logger.error(
                 "[hookdeck] Event %s failed %d times — giving up. Inspect it in "
                 "Hookdeck and retry it with `hermes hookdeck retry %s`.",
@@ -986,7 +1014,14 @@ class HookdeckAdapter(WebhookAdapter):
             )
 
         self._ledger.mark_failed(event_id, reason, session_chat_id=session_chat_id)
-        if not self._should_hand_back(event_id):
+        hand_back = self._should_hand_back(event_id)
+        # The marker has done its job the moment that decision is made, whether
+        # or not the hand-back then succeeds. Leaving it behind on the failure
+        # path would grow the set for the lifetime of the process, and a later
+        # sync-mode run of the same event would be treated as having been acked
+        # early when it was not.
+        self._acked_before_completion.discard(event_id)
+        if not hand_back:
             return
         if await self._request_redelivery(event_id):
             logger.info(
@@ -1020,11 +1055,10 @@ class HookdeckAdapter(WebhookAdapter):
         """
         assert self._api is not None
         delay = _REDELIVERY_RETRY_INITIAL_SECONDS
-        last: Optional[HookdeckAPIError] = None
+        last: HookdeckAPIError | None = None
         for attempt in range(1, _REDELIVERY_ATTEMPTS + 1):
             try:
                 await self._api.retry_event(event_id)
-                self._acked_before_completion.discard(event_id)
                 return True
             except HookdeckAPIError as exc:
                 last = exc
@@ -1054,7 +1088,7 @@ class HookdeckAdapter(WebhookAdapter):
         body: dict,
         *,
         status: int = 200,
-        headers: Optional[dict] = None,
+        headers: dict | None = None,
     ) -> web.Response:
         """Answer a delivery, refusing any status whose retryability is undeclared.
 
@@ -1160,7 +1194,7 @@ class HookdeckAdapter(WebhookAdapter):
                 content = build_skill_invocation_message(command, user_instruction=prompt)
                 if content:
                     return content
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a missing skill must not lose the event
             logger.warning("[hookdeck] Skill loading failed: %s", exc)
         return prompt
 
@@ -1210,7 +1244,7 @@ class HookdeckAdapter(WebhookAdapter):
     def _validate_startup(self) -> None:
         self.settings.validate()
 
-    def _bind_hosts(self) -> list[Optional[str]]:
+    def _bind_hosts(self) -> list[str | None]:
         return self.settings.bind_hosts
 
     def _tunnel_plan(self) -> dict[str, str]:
@@ -1258,7 +1292,7 @@ def is_connected(config: PlatformConfig) -> bool:
     return validate_config(config)
 
 
-def env_enablement() -> Optional[dict]:
+def env_enablement() -> dict | None:
     """Seed ``PlatformConfig.extra`` from the environment.
 
     Lets ``hermes gateway status`` report an env-only setup without
@@ -1266,14 +1300,15 @@ def env_enablement() -> Optional[dict]:
     """
     import os
 
-    if not os.getenv("HOOKDECK_WEBHOOK_SECRET"):
+    secret = os.getenv(WEBHOOK_SECRET_ENV, "")
+    if not secret:
         return None
-    seeded: dict[str, Any] = {"secret": os.getenv("HOOKDECK_WEBHOOK_SECRET", "")}
+    seeded: dict[str, Any] = {"secret": secret}
     for env_var, key, cast in (
-        ("HOOKDECK_MODE", "mode", str),
-        ("HOOKDECK_PORT", "port", int),
-        ("HOOKDECK_PATH", "path", str),
-        ("HOOKDECK_SOURCE", "source", str),
+        (MODE_ENV, "mode", str),
+        (PORT_ENV, "port", int),
+        (PATH_ENV, "path", str),
+        (SOURCE_ENV, "source", str),
     ):
         value = os.getenv(env_var)
         if not value:

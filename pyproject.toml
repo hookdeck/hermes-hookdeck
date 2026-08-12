@@ -1,16 +1,59 @@
+# `license = "MIT"` is a PEP 639 SPDX expression, which setuptools only
+# understands from 77 — without this pin a build on an older setuptools fails
+# confusingly, or silently inlines the whole licence text into the metadata.
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hermes-hookdeck"
-version = "0.1.0"
+# Read from `hookdeck.__version__` rather than repeated here. Two copies drift,
+# and the one that drifts is always the one nobody looks at — `hermes plugins`
+# reports the module's, PyPI reports this one.
+dynamic = ["version"]
 description = "Hookdeck event gateway plugin for Hermes Agent — verified, queued, retryable webhook triggers"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Hookdeck", email = "support@hookdeck.com" }]
+keywords = [
+    "hookdeck",
+    "hermes-agent",
+    "webhooks",
+    "event-gateway",
+    "webhook-verification",
+    "ai-agent",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+
 dependencies = [
     # Both are already Hermes dependencies; listed so the plugin can be
     # installed and tested standalone.
     "aiohttp>=3.9",
     "httpx>=0.27",
 ]
+
+# The sidebar on the PyPI page. Without these it shows nothing at all, and the
+# only route back to the source is whatever the README happens to link.
+[project.urls]
+Homepage = "https://github.com/hookdeck/hermes-hookdeck"
+Repository = "https://github.com/hookdeck/hermes-hookdeck"
+Issues = "https://github.com/hookdeck/hermes-hookdeck/issues"
+"Hookdeck Event Gateway" = "https://hookdeck.com/docs"
+"Hermes Agent" = "https://github.com/NousResearch/hermes-agent"
 
 # Makes `pip install hermes-hookdeck` a working install: Hermes scans this
 # group and calls `register(ctx)` on whatever the value imports to. Without it
@@ -22,11 +65,56 @@ hookdeck = "hookdeck"
 # fastapi is provided by the Hermes web server at runtime, not by this
 # plugin — it is a dev dependency only, so the dashboard routes can be
 # tested without a Hermes checkout.
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "fastapi>=0.110"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "fastapi>=0.110", "ruff>=0.16"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+# 88 is what the code was already written to; the handful of lines over it are
+# long string literals, which `E501` is told to leave alone below.
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes — unused imports and names, the ones that are always bugs
+    "I",    # import sorting
+    "UP",   # pyupgrade, bounded by target-version
+    "B",    # bugbear — mutable defaults, `except` that swallows, loop closures
+    "C4",   # comprehensions
+    "BLE",  # blind `except` — see below
+    "RUF",  # ruff's own, mostly correctness
+]
+ignore = [
+    # Off rather than enforced. `line-length` still guides `ruff format` for
+    # anyone who runs it, but the repo is not formatter-managed: turning E501
+    # into an error means either reformatting every file at once, burying the
+    # history, or a wave of awkward wraps through argparse calls and log
+    # statements that read worse split. Nothing here is long by accident.
+    "E501",
+    # `raise ... from` is used where the chain is informative and deliberately
+    # omitted where the original exception is noise.
+    "B904",
+]
+
+# BLE001 is selected on purpose rather than ignored. This adapter degrades
+# instead of aborting in a dozen places — a failed API call at boot, a failed
+# maintenance tick, a plugin surface that will not register — and every one of
+# those is a decision, not an oversight. Selecting the rule means each blind
+# `except` carries a `noqa: BLE001` saying which it is, and a new one has to be
+# argued for rather than merged unnoticed.
+
+[tool.ruff.lint.per-file-ignores]
+# The `hermes_stub` import in conftest runs for its side effect and must happen
+# before anything imports the adapter; `plugin_api` imports its siblings only
+# after `_load_plugin_package()`. Both are load-bearing order, and both already
+# say so with an inline `noqa: E402` at the import itself, which is where a
+# reader needs it.
+"tests/*" = ["E402"]
 
 [tool.setuptools]
 # The manifest, the dashboard bundle and the bundled skill are the plugin as
@@ -34,6 +122,9 @@ testpaths = ["tests"]
 # something that cannot register.
 packages = ["hookdeck", "hookdeck.dashboard"]
 include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "hookdeck.__version__" }
 
 [tool.setuptools.package-data]
 hookdeck = [

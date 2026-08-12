@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -57,10 +56,11 @@ def _load_plugin_package():
 _load_plugin_package()
 
 from hookdeck.api import HookdeckAPI, HookdeckAPIError  # noqa: E402
+from hookdeck.constants import api_key  # noqa: E402
+from hookdeck.ledger import RunLedger  # noqa: E402
 from hookdeck.provision import routes_from_config  # noqa: E402
 from hookdeck.settings import configured_state_path  # noqa: E402
 from hookdeck.settings import load_hermes_config as _load_hermes_config  # noqa: E402
-from hookdeck.ledger import RunLedger  # noqa: E402
 
 router = APIRouter()
 
@@ -118,7 +118,7 @@ def _own_connections(raw: Any) -> tuple[list[dict], int]:
 
 async def _hookdeck_state() -> dict:
     """What Hookdeck still owes this gateway."""
-    if not os.getenv("HOOKDECK_API_KEY"):
+    if not api_key():
         return {"configured": False}
 
     async with HookdeckAPI() as api:

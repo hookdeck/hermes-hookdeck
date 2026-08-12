@@ -6,19 +6,19 @@ from hookdeck import cli
 
 
 def _args(**kwargs) -> argparse.Namespace:
-    defaults = dict(
-        route="",
-        all=False,
-        source="",
-        source_type="",
-        mode="",
-        url="",
-        path="",
-        rate_limit=None,
-        rate_limit_period="concurrent",
-        group_key="",
-        dry_run=True,
-    )
+    defaults = {
+        "route": "",
+        "all": False,
+        "source": "",
+        "source_type": "",
+        "mode": "",
+        "url": "",
+        "path": "",
+        "rate_limit": None,
+        "rate_limit_period": "concurrent",
+        "group_key": "",
+        "dry_run": True,
+    }
     defaults.update(kwargs)
     return argparse.Namespace(hookdeck_action="setup", **defaults)
 
@@ -157,3 +157,68 @@ def test_no_warning_in_sync_mode_where_the_cap_does_work(monkeypatch, capsys):
               url="https://example.com/hookdeck/r")
     )
     assert "has no effect" not in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------
+# doctor: the CLI and the API key must agree on a project
+# ----------------------------------------------------------------------
+
+
+def _write_cli_config(path, body: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    return path
+
+
+def test_the_active_profile_decides_which_project_the_cli_uses(tmp_path):
+    """A CLI config is multi-section, with `profile` selecting the active one.
+
+    Reading the first `project_id` in the file reports a mismatch that is not
+    real for anyone with more than one profile — worse than not checking.
+    """
+    config = _write_cli_config(
+        tmp_path / "config.toml",
+        "profile = 'work'\n\n[default]\nproject_id = 'tm_personal'\n\n"
+        "[work]\nproject_id = 'tm_work'\n",
+    )
+    assert cli._cli_config_project(config) == ("tm_work", True)
+
+
+def test_the_default_profile_is_assumed_when_none_is_named(tmp_path):
+    config = _write_cli_config(
+        tmp_path / "config.toml", "[default]\nproject_id = 'tm_a'\n"
+    )
+    assert cli._cli_config_project(config) == ("tm_a", True)
+
+
+def test_a_missing_config_is_distinguished_from_one_without_a_project(tmp_path):
+    # doctor says something different about each: an absent file is fine
+    # because the gateway creates it, an unusable one is not.
+    assert cli._cli_config_project(tmp_path / "nope.toml") == ("", False)
+    present = _write_cli_config(tmp_path / "c.toml", "[default]\napi_key = 'k'\n")
+    assert cli._cli_config_project(present) == ("", True)
+
+
+def test_a_project_mismatch_is_reported(tmp_path, monkeypatch):
+    config = _write_cli_config(
+        tmp_path / "config.toml", "[default]\nproject_id = 'tm_cli'\n"
+    )
+    monkeypatch.setattr(cli, "_api_key_project", lambda: "tm_key")
+    check = cli._check_cli_project({"cli_config_path": str(config)})
+    assert not check.ok
+    assert "tm_key" in check.message and "tm_cli" in check.message
+
+
+def test_agreement_is_reported_as_fine(tmp_path, monkeypatch):
+    config = _write_cli_config(
+        tmp_path / "config.toml", "[default]\nproject_id = 'tm_same'\n"
+    )
+    monkeypatch.setattr(cli, "_api_key_project", lambda: "tm_same")
+    assert cli._check_cli_project({"cli_config_path": str(config)}).ok
+
+
+def test_a_config_the_gateway_has_not_created_yet_is_not_a_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_api_key_project", lambda: "tm_key")
+    check = cli._check_cli_project({"cli_config_path": str(tmp_path / "absent.toml")})
+    assert check.ok
+    assert "does not exist yet" in check.note

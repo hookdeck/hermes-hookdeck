@@ -11,9 +11,10 @@ traffic.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any
 
 from .constants import (
     ACK_MODES,
@@ -30,9 +31,14 @@ from .constants import (
     DEFAULT_RUN_TIMEOUT_SECONDS,
     DEFAULT_SYNC_TIMEOUT_SECONDS,
     INSECURE_NO_AUTH,
+    MODE_ENV,
+    PATH_ENV,
+    PORT_ENV,
+    SOURCE_ENV,
+    WEBHOOK_SECRET_ENV,
 )
-from .routing import tunnel_plan
 from .ledger import default_state_path
+from .routing import tunnel_plan
 
 MODES = ("cli", "push")
 
@@ -62,7 +68,7 @@ def load_hermes_config() -> dict:
         return {}
 
 
-def platform_extra(config: Optional[Mapping[str, Any]] = None) -> dict:
+def platform_extra(config: Mapping[str, Any] | None = None) -> dict:
     """``gateway.platforms.hookdeck.extra`` from a parsed config."""
     parsed = load_hermes_config() if config is None else config
     gateway = parsed.get("gateway") or {}
@@ -82,10 +88,29 @@ def configured_state_path() -> Path:
     return Path(configured).expanduser() if configured else default_state_path()
 
 
+def _cli_config_path(extra: Mapping[str, Any]) -> str:
+    """Resolve `cli_config_path`, expanding `~` and treating None as unset.
+
+    `~` matters: the Hookdeck CLI does not expand it either, so an unexpanded
+    path makes the CLI create a directory literally named `~` in the working
+    directory — and `doctor` would inspect a different file than the adapter
+    writes.
+    """
+    if "cli_config_path" not in extra or extra["cli_config_path"] is None:
+        return str(default_cli_config_path())
+    configured = str(extra["cli_config_path"])
+    return str(Path(configured).expanduser()) if configured else ""
+
+
+def default_cli_config_path() -> Path:
+    """Where the gateway keeps its own Hookdeck CLI session."""
+    return default_state_path().parent / "cli-config.toml"
+
+
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
-def is_loopback(host: Optional[str]) -> bool:
+def is_loopback(host: str | None) -> bool:
     return bool(host) and host in LOOPBACK_HOSTS
 
 
@@ -97,7 +122,7 @@ class AdapterSettings:
 
     # ── Transport ──────────────────────────────────────────────────
     mode: str = "cli"
-    host: Optional[str] = None
+    host: str | None = None
     port: int = DEFAULT_PORT
     path: str = DEFAULT_PATH
     source: str = ""
@@ -122,14 +147,17 @@ class AdapterSettings:
     ledger_ttl_seconds: float = DEFAULT_LEDGER_TTL_SECONDS
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     cli_binary: str = "hookdeck"
-    cli_login: bool = False
+    #: A CLI config the gateway owns, so `hookdeck listen` forwards from the
+    #: same project the API key manages. Set to "" to use your own ambient
+    #: `hookdeck login` session instead, and accept that the two can diverge.
+    cli_config_path: str = ""
 
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_extra(cls, extra: Optional[Mapping[str, Any]]) -> "AdapterSettings":
+    def from_extra(cls, extra: Mapping[str, Any] | None) -> AdapterSettings:
         """Build settings from ``platforms.hookdeck.extra``, with env fallbacks.
 
         Environment variables are a fallback rather than an override, so a
@@ -139,10 +167,10 @@ class AdapterSettings:
         """
         extra = extra or {}
 
-        def text(key: str, env: str = "", default: str = "") -> str:
-            return str(extra.get(key) or (os.getenv(env) if env else "") or default)
+        def text(key: str, env_var: str = "", default: str = "") -> str:
+            return str(extra.get(key) or (os.getenv(env_var, "") if env_var else "") or default)
 
-        mode = text("mode", "HOOKDECK_MODE", "cli").lower()
+        mode = text("mode", MODE_ENV, "cli").lower()
 
         return cls(
             routes=dict(extra.get("routes") or {}),
@@ -150,10 +178,10 @@ class AdapterSettings:
             # cli mode is loopback-only by construction: the CLI is the only
             # thing that should be able to reach the listener.
             host="127.0.0.1" if mode == "cli" else (extra.get("host") or None),
-            port=int(extra.get("port") or os.getenv("HOOKDECK_PORT") or DEFAULT_PORT),
-            path="/" + text("path", "HOOKDECK_PATH", DEFAULT_PATH).strip("/"),
-            source=text("source", "HOOKDECK_SOURCE"),
-            signing_secret=text("secret", "HOOKDECK_WEBHOOK_SECRET"),
+            port=int(extra.get("port") or os.getenv(PORT_ENV) or DEFAULT_PORT),
+            path="/" + text("path", PATH_ENV, DEFAULT_PATH).strip("/"),
+            source=text("source", SOURCE_ENV),
+            signing_secret=text("secret", WEBHOOK_SECRET_ENV),
             header_prefix=text("header_prefix", default=DEFAULT_HEADER_PREFIX),
             ack_mode=text("ack_mode", default=DEFAULT_ACK_MODE).lower(),
             max_concurrent=int(extra.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
@@ -186,10 +214,15 @@ class AdapterSettings:
             # An npm global shadowing a Homebrew install is the common case,
             # and PATH silently picks the older one.
             cli_binary=text("cli_binary", default="hookdeck"),
-            # Off by default: `hookdeck ci` rewrites the shared CLI config and
-            # repoints its active project — not something starting a gateway
-            # should do to a tool the operator uses for other work.
-            cli_login=bool(extra.get("cli_login", False)),
+            # Beside the ledger, and never the operator's own config: pointing
+            # `hookdeck ci` at the shared file switches its active project,
+            # which is not something starting a gateway should do to a tool
+            # used for other work.
+            # `cli_config_path:` with no value parses as None, which `str()`
+            # would turn into the literal "None" and write a file by that name
+            # into the gateway's cwd. An explicit empty string is different and
+            # must survive: it means "use my own ambient session".
+            cli_config_path=_cli_config_path(extra),
         )
 
     # ------------------------------------------------------------------
@@ -201,7 +234,7 @@ class AdapterSettings:
         return self.signing_secret not in ("", INSECURE_NO_AUTH)
 
     @property
-    def bind_hosts(self) -> list[Optional[str]]:
+    def bind_hosts(self) -> list[str | None]:
         """Addresses to listen on.
 
         In cli mode that is *both* loopback families. The Hookdeck CLI forwards
@@ -236,7 +269,7 @@ class AdapterSettings:
             )
         if not self.signing_secret:
             raise ValueError(
-                "[hookdeck] No signing secret. Set HOOKDECK_WEBHOOK_SECRET (or "
+                f"[hookdeck] No signing secret. Set {WEBHOOK_SECRET_ENV} (or "
                 "platforms.hookdeck.extra.secret) to the signing secret from "
                 "your Hookdeck project settings. For local testing only, set "
                 f"it to '{INSECURE_NO_AUTH}' while bound to loopback."
