@@ -66,16 +66,32 @@ name it explicitly rather than retrying hopefully.
 
 ## Retry, not replay
 
-Everything here uses Hookdeck's **retry**: a fresh delivery attempt for the
-same event. Hookdeck also has **replay**, which re-ingests the original request
-and creates *new* events with the connection's current rules applied — the
-right tool after fixing a filter or transformation, and not something these
-tools do. If retrying is not working because the connection itself is
-misconfigured, say so rather than retrying repeatedly.
+Every tool here does **retry** — a fresh delivery attempt for the same event.
+Hookdeck also has **replay**, which reprocesses the original *request*, and no
+tool here can do it. Replay is what you want after fixing a filter,
+transformation or routing mistake; retry will not pick those up. So if retrying
+is failing because the connection itself is misconfigured, say so and stop
+retrying — the fix is a replay, and it needs a human.
+
+- Retry semantics: <https://hookdeck.com/docs/retries>
+- Replay, and why ignored events differ from failed ones:
+  <https://hookdeck.com/docs/requests>
 
 ## Pausing
 
-`hookdeck_pause_connection` holds events in Hookdeck instead of dropping them.
-Reach for it before a restart, or when you have established that runs are
-failing for a reason you cannot fix yet — queueing is better than a run of
-failures. Always resume afterwards with `hookdeck_resume_connection`.
+`hookdeck_pause_connection` holds events in Hookdeck instead of letting them
+fail. Reach for it before a restart, or once you have established that runs are
+failing for a reason you cannot fix yet — queueing beats a run of failures.
+Always resume afterwards with `hookdeck_resume_connection`.
+
+Prefer pausing to disabling: what each one does to events already in flight is
+documented at
+<https://hookdeck.com/docs/guides/how-to-pause-connections>. Check it before
+suggesting either to a human.
+
+## When the question is about Hookdeck, not this queue
+
+This skill covers triaging *this gateway's* failed events with the tools above.
+For how the product behaves — connection rules, retention, sources and
+destinations — the docs are the source of truth, not this file:
+<https://hookdeck.com/docs>.
