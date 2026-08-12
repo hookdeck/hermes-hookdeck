@@ -24,6 +24,20 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: ruff check --output-format=github .
 
+  dashboard:
+    # The dashboard bundle ships in the wheel and its two action buttons
+    # mutate a live Hookdeck project, so it needs a check of its own — the
+    # Python suite cannot see it. No npm install: the bundle takes everything
+    # from the injected SDK, so a fake one under node:vm exercises the real
+    # file, and node's own test runner runs it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --test "tests/dashboard/*.test.mjs"
+
   test:
     runs-on: ubuntu-latest
     strategy:
