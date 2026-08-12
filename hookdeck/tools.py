@@ -22,6 +22,11 @@ from .api import HookdeckAPI, HookdeckAPIError
 
 TOOLSET = "hookdeck"
 
+#: How many failed events `hookdeck_queue_status` counts before giving up and
+#: reporting a floor. High enough that a real inbox is counted exactly, low
+#: enough that a badly broken one does not stall the tool.
+FAILED_SCAN_LIMIT = 100
+
 
 def _run(coro: Any) -> Any:
     """Run *coro* from a synchronous tool handler.
@@ -140,13 +145,18 @@ def hookdeck_queue_status(_args: dict) -> str:
     async def _go() -> str:
         async with HookdeckAPI() as api:
             depth = await api.queue_depth()
-            failed = await api.list_events(status="FAILED", limit=1)
-            issues = await api.list_issues(status="OPENED", limit=1)
+            failed = await api.list_events(status="FAILED", limit=FAILED_SCAN_LIMIT)
+            open_issues = await api.count_issues(status="OPENED")
+        seen = len(_models(failed))
         return json.dumps(
             {
                 "queue_depth": depth,
-                "failed_events_page_count": len(_models(failed)),
-                "open_issues_page_count": len(_models(issues)),
+                "failed_events": seen,
+                # Events have no count endpoint, so this is what one page
+                # holds. Saying when it is capped stops the model reporting a
+                # ceiling as though it were a total.
+                "failed_events_is_at_least": seen >= FAILED_SCAN_LIMIT,
+                "open_issues": open_issues,
             }
         )
 
