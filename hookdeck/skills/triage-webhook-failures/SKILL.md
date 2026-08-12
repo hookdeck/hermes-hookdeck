@@ -19,8 +19,20 @@ broken.
 Call `hookdeck_list_failed_events`. Group what comes back by `error_code` and
 `response_status` before touching anything. The grouping is the diagnosis:
 
-- **`503` / `ERR_CONNECTION` in a burst** — the gateway hit its concurrency
-  limit or was down. The events are fine; retrying is the whole fix.
+- **`CLI_UNAVAILABLE` with no `response_status`** — in `cli` mode, no listen
+  session was attached: the gateway was not running, or its tunnel was down.
+  The events are fine; retrying once the gateway is up is the whole fix.
+- **`503` with no `error_code`** — a listen session *was* attached but the
+  local port refused the connection. Usually a gateway that had not finished
+  starting, had just crashed, or was bound to a different port. Also fine to
+  retry once it is up.
+
+  Do not read `503` as "the gateway hit its concurrency limit". That is a real
+  cause but a much rarer one, and nothing in the event distinguishes the two —
+  so check the cheap thing first: is the gateway up and listening on the port
+  the route expects? Both codes can appear on the *same* event when a gateway
+  is restarting, which is itself the signature of a bounce rather than a
+  capacity problem.
 - **`401`** — a signing-secret mismatch. Retrying changes nothing until
   `HOOKDECK_EG_WEBHOOK_SECRET` matches the project's signing secret. Say so
   instead of retrying.
@@ -28,6 +40,12 @@ Call `hookdeck_list_failed_events`. Group what comes back by `error_code` and
   events will keep failing otherwise.
 - **`500` on a handful of events while others on the same route succeeded** —
   the payloads differ. Read one with `hookdeck_get_event_body` before deciding.
+
+A status code narrows the cause; it rarely settles it. Where two causes fit
+what you can see, say which one you checked and which you could not, and give
+the reader the discriminator rather than picking the more interesting story.
+A wrong root cause stated confidently is worse than "these two both fit" —
+it sends someone tuning a limit that was never the problem.
 
 ## 3. Retry only what will actually succeed
 

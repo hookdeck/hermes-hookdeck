@@ -68,9 +68,16 @@ another is worse than not checking. Set `cli_binary` to pin it explicitly.
 Two behaviours worth recognising in the Hookdeck event log when the local
 server is down. With no listen session attached at all, attempts record
 `CLI_UNAVAILABLE` and no response status. With a session attached but the local
-port refusing, the CLI reports a **500** upstream — which is one reason the
-provisioned retry rule covers `500-599`: a gateway that has not finished
-starting produces exactly this, and those events must come back.
+port refusing, the CLI reports a **503** upstream (observed on CLI 2.4.0) —
+which is one reason the provisioned retry rule covers `500-599`: a gateway that
+has not finished starting produces exactly this, and those events must come
+back.
+
+A restarting gateway can record both signatures on the *same* event, since the
+listen session drops and returns while retries are in flight. That pattern —
+`CLI_UNAVAILABLE` and `503` interleaved across attempts of one event — is a
+bounce, not a capacity problem, and is the discriminator the bundled triage
+skill tells the agent to check before blaming a concurrency limit.
 
 Install the [Hookdeck CLI](https://hookdeck.com/docs/cli), add a route to
 `~/.hermes/config.yaml` (see [`examples/config.yaml`](../examples/config.yaml)),
