@@ -58,6 +58,9 @@ class FakeAPI:
     async def list_issues(self, **kw):
         return await self._record("list_issues", **kw)
 
+    async def count_issues(self, **kw):
+        return await self._record("count_issues", **kw) or 0
+
     async def get_event_raw_body(self, event_id):
         return await self._record("get_event_raw_body", event_id)
 
@@ -466,3 +469,49 @@ def test_every_required_parameter_is_a_declared_parameter():
         params = schema["function"]["parameters"]
         missing = set(params["required"]) - set(params["properties"])
         assert not missing, f"{name} requires undeclared {missing}"
+
+
+# ----------------------------------------------------------------------
+# Queue status reports numbers, not page sizes
+# ----------------------------------------------------------------------
+
+
+def test_queue_status_reports_the_real_number_of_open_issues(api):
+    # Counted from the dedicated endpoint. Counting from a listing would count
+    # to whatever limit was asked for — a project with four open issues used
+    # to be reported as one, and the model then guessed at what "1" meant.
+    api.responses["count_issues"] = 4
+    api.responses["list_events"] = {"models": []}
+    status = json.loads(call("hookdeck_queue_status"))
+
+    assert status["open_issues"] == 4
+    assert calls_named(api, "count_issues") == [
+        ("count_issues", (), {"status": "OPENED"})
+    ]
+    # The old page-size fields are gone, not merely renamed alongside.
+    assert "open_issues_page_count" not in status
+    assert "failed_events_page_count" not in status
+
+
+def test_queue_status_counts_failed_events_exactly_when_it_can(api):
+    api.responses["list_events"] = {"models": [{"id": f"evt_{i}"} for i in range(7)]}
+    status = json.loads(call("hookdeck_queue_status"))
+    assert status["failed_events"] == 7
+    assert status["failed_events_is_at_least"] is False
+
+
+def test_a_full_page_of_failures_is_flagged_as_a_floor(api):
+    # Events have no count endpoint, so a full page means "at least this
+    # many". Reporting it bare would let the model state a ceiling as a total.
+    api.responses["list_events"] = {
+        "models": [{"id": f"evt_{i}"} for i in range(tools.FAILED_SCAN_LIMIT)]
+    }
+    status = json.loads(call("hookdeck_queue_status"))
+    assert status["failed_events"] == tools.FAILED_SCAN_LIMIT
+    assert status["failed_events_is_at_least"] is True
+
+
+def test_queue_status_asks_for_more_than_one_failure(api):
+    api.responses["list_events"] = {"models": []}
+    call("hookdeck_queue_status")
+    assert calls_named(api, "list_events")[0][2]["limit"] == tools.FAILED_SCAN_LIMIT

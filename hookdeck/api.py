@@ -229,6 +229,18 @@ class HookdeckAPI:
     async def list_issues(self, **params: Any) -> Any:
         return await self.request("GET", "/issues", params=params)
 
+    async def count_issues(self, **params: Any) -> int:
+        """How many issues match, in total rather than on a page.
+
+        The list endpoints paginate and their ``count`` is the page's own size,
+        so counting from a list means counting to whatever limit was asked for.
+        Issues have a dedicated count endpoint; events do not.
+        """
+        result = await self.request("GET", "/issues/count", params=params)
+        if isinstance(result, dict):
+            return int(result.get("count") or 0)
+        return 0
+
 
 def run_sync(coro: Any) -> Any:
     """Run *coro* from synchronous CLI code."""
