@@ -4,7 +4,7 @@
 
 Agent runs are not ordinary webhook handlers. They take seconds to minutes, cost money per execution, and must not run twice for the same event. Hermes's built-in webhook platform is fine for trying things out, but in production it drops bursts over 30/min and forgets duplicates after a restart. Any run that fails after the 202 is sent is simply lost. This plugin replaces that ingestion path with the [Hookdeck Event Gateway](https://hookdeck.com/docs), plus a local ledger that tracks the outcomes Hookdeck can't see.
 
-> Inbound only. This is the Event Gateway — third-party events arriving at your agent. It is not [Outpost](https://hookdeck.com/docs/outpost), which points the other way, and nothing here helps Hermes publish webhooks.
+> Inbound only, for third-party events arriving at your agent. It is not [Outpost](https://hookdeck.com/docs/outpost) and nothing here helps Hermes publish webhooks.
 
 ## Why
 
