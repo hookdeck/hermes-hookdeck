@@ -1,10 +1,16 @@
-# Tag-driven release to PyPI.
+# Release-driven publish to PyPI.
 #
-#   1. bump `__version__` in hookdeck/__init__.py (pyproject reads it from there)
-#   2. git tag v0.2.0 && git push --tags
+#   1. get everything you want released onto `main`
+#   2. bump `__version__` in hookdeck/__init__.py (pyproject reads it from there)
+#   3. publish a GitHub release whose tag is v<that version>, targeting main
 #
-# Release notes are generated from the commits in the range, so the commit
-# messages are the changelog.
+# Publishing the release is the decision to ship — there is no second approval
+# step. `skills/hermes-hookdeck-release` walks an agent through it; the human
+# version is in README.md § Releasing.
+#
+# The tag is created by the release, so nothing here pushes tags. A release
+# whose tag disagrees with `hookdeck.__version__` fails before anything is
+# uploaded.
 #
 # Publishing uses PyPI Trusted Publishing (OIDC), so there is no API token in
 # the repository to leak or rotate. It needs a one-time setup on PyPI:
@@ -13,9 +19,8 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
-  workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -25,19 +30,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A release can target any commit. Build the one it actually points
+          # at, not the tip of the default branch.
+          ref: ${{ github.event.release.tag_name }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e '.[dev]' build twine
 
-      - name: The tag and the package version must agree
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: The release tag and the package version must agree
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          tagged="${GITHUB_REF_NAME#v}"
+          tagged="${TAG#v}"
           declared=$(python -c 'import hookdeck; print(hookdeck.__version__)')
           if [ "$tagged" != "$declared" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match hookdeck.__version__ ($declared)"
+            echo "::error::release $TAG does not match hookdeck.__version__ ($declared)."
+            echo "::error::Delete the release and its tag, fix the version on main, and publish again."
             exit 1
           fi
           echo "✓ releasing $declared"
@@ -71,29 +82,20 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
-  github-release:
+  attach-artifacts:
+    # The human created the release, so it has notes but no files. Attach the
+    # exact artifacts that went to PyPI, so the GitHub release is not a
+    # description of a build nobody can see.
     needs: publish
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
-      - name: Publish the GitHub release
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          # v0.1.0rc1 and friends are pre-releases. Saying so keeps them off
-          # the repository's "latest release", which otherwise points people at
-          # a release candidate.
-          prerelease=""
-          case "$GITHUB_REF_NAME" in
-            *a[0-9]*|*b[0-9]*|*rc[0-9]*) prerelease="--prerelease" ;;
-          esac
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes $prerelease
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

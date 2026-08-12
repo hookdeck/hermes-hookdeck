@@ -119,6 +119,32 @@ A bundled `triage-webhook-failures` skill teaches the agent to group failures by
 - Recovery is bounded by your Hookdeck plan's retention window (3-30 days by tier).
 - Boot-time recovery is at-least-once: an event whose run completed just before a crash may run again. Keep agent actions idempotent where you can.
 
+## Releasing
+
+Publishing a GitHub release is what ships the package — there is no separate
+approval step, and pushing a bare tag does nothing.
+
+1. **Get everything onto `main`** and make sure its checks are green.
+2. **Bump `__version__`** in [`hookdeck/__init__.py`](hookdeck/__init__.py) and
+   merge that to `main`. The release tag must equal `v` + this value; the
+   workflow checks it before building and fails the release otherwise.
+3. **Publish a GitHub release** — *Releases → Draft a new release*, tag
+   `vMAJOR.MINOR.PATCH`, target `main`, write the notes, Publish. Tick
+   *Set as a pre-release* for `rc` versions.
+
+[`release.yml`](.github/workflows/release.yml) then runs the test suite against
+the release's own commit, builds, publishes to PyPI via Trusted Publishing (no
+stored token), and attaches the wheel and sdist to the release.
+
+**PyPI is append-only** — a published version number can never be reused, so
+get it right before publishing. Anything under `hookdeck/` ships inside the
+wheel, including the bundled skill; anything outside it does not.
+
+Asking an agent to "create a new release" runs
+[`skills/hermes-hookdeck-release`](skills/hermes-hookdeck-release/SKILL.md),
+which covers the same ground with the SemVer rules and the gates to check
+first.
+
 ## License
 
 MIT

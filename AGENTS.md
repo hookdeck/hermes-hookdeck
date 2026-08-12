@@ -32,6 +32,27 @@ here. Say the fact, then link the page.
 
 ## Skills
 
+Two directories here are called "skills" and they are not the same thing.
+Check which one you are in before editing:
+
+| | `hookdeck/skills/` | `skills/` (repo root) |
+|---|---|---|
+| Audience | The agent running in a gateway | Whoever maintains this repo |
+| Ships in the wheel | **Yes** — so editing one is a release | No |
+| Registered with Hermes | Yes, as `hookdeck:<name>` | No |
+| Example | `triage-webhook-failures` | `hermes-hookdeck-release` |
+
+`.claude/skills`, `.cursor/skills` and `.agents/skills` are symlinks to the
+root `skills/`, so each agent finds the maintainer skills where it expects
+them. They are symlinks rather than copies deliberately — a copy drifts, and
+nothing here would catch it.
+
+The consequence worth remembering: **a one-word fix to
+`hookdeck/skills/triage-webhook-failures/SKILL.md` is a patch release**, while
+a rewrite of this file is not. `skills/hermes-hookdeck-release` has the rule.
+
+### Where a Hookdeck skill belongs
+
 `hookdeck/agent-skills` is the home for Hookdeck skills:
 <https://github.com/hookdeck/agent-skills>. Its purpose is to point an agent at
 the official docs as the source of truth, and it is distributed to any agent
