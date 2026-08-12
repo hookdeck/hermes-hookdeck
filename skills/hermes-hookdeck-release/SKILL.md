@@ -198,10 +198,15 @@ only for a first-time contributor or an exceptionally large contribution.
 6. **CI:**
 
    ```bash
-   gh api "repos/hookdeck/hermes-hookdeck/commits/$(git rev-parse origin/main)/status" --jq .state
+   gh api "repos/hookdeck/hermes-hookdeck/commits/$(git rev-parse origin/main)/check-runs" \
+     --jq '.check_runs[] | "\(.name): \(.status)/\(.conclusion // "-")"'
    ```
 
-   Do not release on `failure`, or on `pending` for required checks.
+   Every run must be `completed/success`. Do not release otherwise.
+
+   Ask for **check-runs**, not `/status`. The latter reports the legacy commit
+   Status API, which this repo does not use — with no statuses recorded it
+   answers `pending` forever, so it reads as a red gate on a green `main`.
 
 ## Safety and governance
 
