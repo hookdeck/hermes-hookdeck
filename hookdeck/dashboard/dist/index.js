@@ -74,8 +74,8 @@
         h(CardHeader, null, h(CardTitle, null, "Hookdeck")),
         h(CardContent, null,
           h("p", { className: "text-sm text-muted-foreground" },
-            "HOOKDECK_API_KEY is not set, so the queue cannot be read. The adapter " +
-            "still runs — this tab is read-only observability, not a dependency.")));
+            "Set HOOKDECK_EG_API_KEY to show queue and delivery data here. " +
+            "The gateway keeps running without it.")));
     }
 
     const failed = hd.failed || [];
@@ -129,8 +129,9 @@
         h(CardHeader, null, h(CardTitle, { className: "text-lg" }, "Agent runs")),
         h(CardContent, { className: "flex flex-col gap-2" },
           h("p", { className: "text-sm text-muted-foreground" },
-            "From the local ledger. A run that failed after the 202 is only " +
-            "visible here — Hookdeck recorded that delivery as successful."),
+            "What this gateway did with each delivery. A run that failed after " +
+            "the event was accepted appears only here — Hookdeck recorded that " +
+            "delivery as successful."),
           !local.exists
             ? h("p", { className: "text-sm" }, "No deliveries recorded yet.")
             : h("div", { className: "flex flex-wrap gap-2" },
@@ -169,8 +170,8 @@
             : null,
           others
             ? h("p", { className: "mb-2 text-xs text-muted-foreground" },
-                others + " other connection(s) in this project are not shown — they " +
-                "belong to something else, and a Pause button next to them is a misclick away from an outage.")
+                others + " other connection(s) in this project are not shown. " +
+                "Only connections matching a configured route appear here.")
             : null,
           conns.map(function (c) {
             return h(Row, { key: c.id },
