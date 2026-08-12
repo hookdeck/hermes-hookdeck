@@ -119,7 +119,15 @@ def _register_skill(ctx: Any) -> None:
     register = getattr(ctx, "register_skill", None)
     if not callable(register):
         return
+    # Hermes wants a Path to the SKILL.md itself, not to its directory, and it
+    # calls .exists() on what it is given — a str gets an AttributeError that
+    # the caller catches, so the skill silently never registers.
     register(
         name="triage-webhook-failures",
-        path=str(Path(__file__).parent / "skills" / "triage-webhook-failures"),
+        path=Path(__file__).parent / "skills" / "triage-webhook-failures" / "SKILL.md",
+        description=(
+            "Investigate and clear failed webhook events in the Hookdeck queue. "
+            "Use when events failed while the gateway was down, when a route's "
+            "runs are erroring, or when asked to check whether anything was missed."
+        ),
     )
