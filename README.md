@@ -40,12 +40,22 @@ export HOOKDECK_EG_API_KEY=...        # provisions connections
 export HOOKDECK_EG_WEBHOOK_SECRET=... # verifies deliveries
 ```
 
+CLI mode is the default, and it needs the [Hookdeck CLI](https://hookdeck.com/docs/cli) — a separate binary, not bundled with this plugin and not installed by pip:
+
+```bash
+brew install hookdeck/hookdeck/hookdeck   # or: npm install -g hookdeck-cli
+```
+
+You do not need to run `hookdeck login`. The gateway authenticates a CLI session of its own from `HOOKDECK_EG_API_KEY` and keeps it in `~/.hermes/hookdeck/`, so it never touches a session you use for other work — and cannot end up forwarding from a different project than the one it provisions. [Push mode](docs/operations.md) needs no CLI at all.
+
 Then create a route and check the setup:
 
 ```bash
 hermes hookdeck setup my-route
 hermes hookdeck doctor
 ```
+
+`doctor` is the check that everything above landed: it reports a missing or too-old CLI, a secret that is not set, and a CLI pointed at the wrong project.
 
 A [free Hookdeck account](https://dashboard.hookdeck.com/signup) is enough for development and small production workloads.
 
