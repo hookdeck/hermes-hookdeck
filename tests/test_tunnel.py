@@ -326,39 +326,123 @@ async def test_terminating_an_already_dead_process_is_a_no_op(spawned):
     assert not process.terminated
 
 
+
 # ----------------------------------------------------------------------
-# `hookdeck ci`
+# Authenticating the gateway's own CLI session
 # ----------------------------------------------------------------------
+#
+# `authenticate()` is what stops the gateway's project and the operator's
+# drifting apart. It runs `hookdeck ci` against a config the gateway owns,
+# never the shared one, and the adapter refuses to start if it fails.
 
 
-async def test_login_is_skipped_unless_it_was_asked_for(spawned):
-    # The default, and deliberately so: `hookdeck ci` rewrites the operator's
-    # shared CLI config and repoints its active project.
-    tunnel = HookdeckTunnel(port=1, path="/x", source="s", api_key="k", login=False)
-    await tunnel._login("/usr/bin/hookdeck")
-    assert spawned.commands == []
+@pytest.fixture()
+def ci_succeeds(monkeypatch):
+    """Let `hookdeck ci` complete, without waiting on a real subprocess."""
 
-
-async def test_login_without_a_key_falls_back_to_an_existing_session(spawned, caplog):
-    tunnel = HookdeckTunnel(port=1, path="/x", source="s", api_key="", login=True)
-    with caplog.at_level(logging.INFO):
-        await tunnel._login("/usr/bin/hookdeck")
-    assert spawned.commands == []
-    assert "existing `hookdeck login` session" in caplog.text
-
-
-async def test_login_warns_before_rewriting_the_shared_config(spawned, caplog, monkeypatch):
-    async def communicate_ok(self):
+    async def communicate(self):
         self.returncode = 0
-        return (b"", None)
+        return (b"Done! The Hookdeck CLI is configured in project GW", None)
 
-    monkeypatch.setattr(FakeProcess, "communicate", communicate_ok, raising=False)
+    monkeypatch.setattr(FakeProcess, "communicate", communicate, raising=False)
     monkeypatch.setattr(
-        tunnel_mod.asyncio, "wait_for", lambda awaitable, timeout: awaitable
+        tunnel_mod.asyncio, "wait_for", lambda awaitable, timeout=None: awaitable
     )
 
-    tunnel = HookdeckTunnel(port=1, path="/x", source="s", api_key="k", login=True)
-    await tunnel._login("/usr/bin/hookdeck")
 
-    assert "rewrites" in caplog.text
-    assert spawned.commands[0][0][1:] == ("ci", "--api-key", "k")
+async def test_the_session_is_written_to_the_gateways_own_config(spawned, ci_succeeds):
+    # Never the shared ~/.config/hookdeck/config.toml: `hookdeck ci` switches
+    # the active project of whatever config it touches, so an operator using
+    # the CLI for other work would be repointed by starting a gateway.
+    tunnel = HookdeckTunnel(
+        port=1, path="/x", source="s", api_key="key_abc",
+        config_path="/tmp/gw/config.toml",
+    )
+    assert await tunnel.authenticate() is True
+
+    argv = spawned.commands[0][0]
+    assert argv[1] == "ci"
+    assert "--hookdeck-config" in argv
+    assert argv[argv.index("--hookdeck-config") + 1] == "/tmp/gw/config.toml"
+    assert argv[argv.index("--api-key") + 1] == "key_abc"
+
+
+async def test_no_config_path_means_no_session_to_authenticate(spawned):
+    # Opting out is allowed; it just leaves the ambient session in charge.
+    tunnel = HookdeckTunnel(port=1, path="/x", source="s", api_key="k")
+    assert await tunnel.authenticate() is True
+    assert spawned.commands == []
+
+
+async def test_without_an_api_key_it_degrades_to_the_ambient_session(spawned, caplog):
+    # There is nothing to authenticate with, so the gateway falls back rather
+    # than refusing to start — but it must stop claiming a pinned config, or
+    # `hookdeck listen` would be pointed at a file that was never written.
+    tunnel = HookdeckTunnel(
+        port=1, path="/x", source="s", api_key="", config_path="/tmp/gw/config.toml"
+    )
+    with caplog.at_level(logging.INFO):
+        assert await tunnel.authenticate() is True
+
+    assert spawned.commands == []
+    assert tunnel._config_path == ""
+    assert "--hookdeck-config" not in tunnel.listen_args()
+    assert "doctor" in caplog.text  # points at the command that finds the drift
+
+
+async def test_a_failed_authentication_is_reported_rather_than_assumed(
+    spawned, caplog, monkeypatch
+):
+    # The adapter refuses to start on False. Returning True here would give a
+    # gateway that reports healthy and forwards nothing — the exact failure
+    # this whole mechanism exists to prevent.
+    async def communicate(self):
+        self.returncode = 1
+        return (b"Authentication failed: your API key is invalid or expired.", None)
+
+    monkeypatch.setattr(FakeProcess, "communicate", communicate, raising=False)
+    monkeypatch.setattr(
+        tunnel_mod.asyncio, "wait_for", lambda awaitable, timeout=None: awaitable
+    )
+
+    tunnel = HookdeckTunnel(
+        port=1, path="/x", source="s", api_key="bad", config_path="/tmp/gw/config.toml"
+    )
+    assert await tunnel.authenticate() is False
+    assert "Could not authenticate" in caplog.text
+    # The CLI's own words, so the operator knows it is the key and not us.
+    assert "invalid or expired" in caplog.text
+
+
+async def test_a_hung_authentication_does_not_hang_the_gateway(
+    spawned, caplog, monkeypatch
+):
+    async def never_returns(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(FakeProcess, "communicate", never_returns, raising=False)
+
+    async def expire(awaitable, timeout=None):
+        if asyncio.iscoroutine(awaitable):
+            awaitable.close()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(tunnel_mod.asyncio, "wait_for", expire)
+
+    tunnel = HookdeckTunnel(
+        port=1, path="/x", source="s", api_key="k", config_path="/tmp/gw/config.toml"
+    )
+    assert await tunnel.authenticate() is False
+    assert "timed out" in caplog.text
+
+
+async def test_the_session_names_itself_so_it_is_findable_in_the_dashboard(
+    spawned, ci_succeeds
+):
+    tunnel = HookdeckTunnel(
+        port=1, path="/x", source="s", api_key="k", config_path="/tmp/gw/config.toml"
+    )
+    await tunnel.authenticate()
+    argv = spawned.commands[0][0]
+    assert argv[argv.index("--device-name") + 1].startswith("hermes-")
+    assert argv[argv.index("--name") + 1] == "hermes-gateway"
