@@ -26,6 +26,14 @@ That is the durable path — paused events are held at `HOLD` and delivered on
 resume. Never reach for `disable` instead: it cancels pending events
 irrecoverably, as does deleting the connection.
 
+Pausing also covers a second, less obvious loss. A run already in flight when
+you stop the gateway is interrupted, and Hermes reports an interrupted run to
+the plugin as a *success* — so the adapter records `succeeded` and boot
+recovery, which only looks for rows left `running`, finds nothing to bring
+back. A gateway that is killed outright recovers; one stopped politely
+mid-run does not. Pausing first means there is no delivery in flight to
+interrupt. See [limitations](limitations.md).
+
 **The gateway keeps its own CLI session.** Two independent things decide "which
 project": your API key decides what `setup`, `status` and the retry hand-back
 act on, while the Hookdeck CLI's own config decides what `hookdeck listen`

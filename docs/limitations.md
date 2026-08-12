@@ -41,16 +41,22 @@ including those that only surface once you provision connections yourself.
 - Boot-time recovery re-runs an event whose run might in fact have completed
   in the instant before a crash. That is the at-least-once contract the whole
   design assumes; set `recover_on_boot: false` if it is wrong for your routes.
-- Boot recovery catches a *crash*, not every interruption. On a graceful
-  shutdown whose drain times out, Hermes interrupts the run and then reports it
-  to the plugin as a success — the run produced no response, and an empty
-  response with nothing to deliver is Hermes' definition of a run that went
-  fine. The adapter records `succeeded`, the row is never `running` at the next
-  start, and the event is not redelivered. The plugin only ever sees the
-  outcome it is handed, so it cannot tell this apart from real success. This is
-  the concrete reason [operations](operations.md) says to **pause the
-  connection before stopping the gateway**: a paused connection has no run to
-  interrupt.
+- **Stopping the gateway normally can lose an in-flight event, where killing it
+  does not.** Boot recovery finds orphans by looking for ledger rows still
+  marked `running`, which is what a process that died without warning leaves
+  behind. A `Ctrl+C` or `systemctl stop` does not leave that. Hermes waits a
+  short while for in-flight runs, interrupts the ones that do not finish, and
+  then reports each interrupted run to the plugin as a **success** — its test
+  for a run that went fine is whether delivering the response failed, and an
+  interrupted run produced no response to deliver. So the adapter is told
+  "succeeded", writes exactly that, and the next start sees nothing to
+  reconcile. The 202 went to Hookdeck long before, so nothing else will bring
+  the event back either.
+
+  The adapter cannot tell this apart from real success; it only ever sees the
+  outcome it is handed. This is the concrete reason
+  [operations](operations.md) says to **pause the connection before stopping
+  the gateway** — a paused connection has no delivery in flight to interrupt.
 
 ## Hookdeck can do more than this plugin asks it to
 
