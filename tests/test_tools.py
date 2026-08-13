@@ -401,6 +401,33 @@ def test_an_event_body_is_truncated_before_it_reaches_the_context(api):
     assert len(call("hookdeck_get_event_body", {"event_id": "evt_1"})) == 8000
 
 
+def test_the_raw_body_envelope_is_unwrapped(api):
+    # The endpoint answers {"body": "<text>"}. Returning that whole hands the
+    # model an escaped string inside an envelope instead of the payload —
+    # invisible in a transcript, because the model tidies it up when it
+    # summarises.
+    api.responses["get_event_raw_body"] = {
+        "body": '{"kind":"charge.succeeded","amount":2000}'
+    }
+    assert call("hookdeck_get_event_body", {"event_id": "evt_1"}) == (
+        '{"kind":"charge.succeeded","amount":2000}'
+    )
+
+
+def test_an_unwrapped_string_body_still_works(api):
+    api.responses["get_event_raw_body"] = '{"kind":"already-plain"}'
+    assert call("hookdeck_get_event_body", {"event_id": "evt_1"}) == (
+        '{"kind":"already-plain"}'
+    )
+
+
+def test_a_wrapper_holding_a_structured_body_is_serialised(api):
+    api.responses["get_event_raw_body"] = {"body": {"kind": "structured"}}
+    assert json.loads(call("hookdeck_get_event_body", {"event_id": "evt_1"})) == {
+        "kind": "structured"
+    }
+
+
 def test_a_structured_body_is_serialised(api):
     api.responses["get_event_raw_body"] = {"type": "charge.succeeded"}
     assert json.loads(call("hookdeck_get_event_body", {"event_id": "evt_1"})) == {

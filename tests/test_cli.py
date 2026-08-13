@@ -756,3 +756,34 @@ def test_a_plain_webhook_source_is_not_nagged_about_provider_secrets(
     out = capsys.readouterr().out
     assert "verification is unconfirmed" not in out
     assert not calls_named(fake_api, "list_requests")
+
+
+def test_doctor_reads_auth_type_directly_when_the_source_states_it(
+    doctor_env, fake_api, monkeypatch, capsys
+):
+    # A generic source carrying `auth_type: STRIPE` reports it back, so there
+    # is no need to infer verification from traffic. A typed source hides its
+    # config entirely, which is why the traffic fallback exists at all.
+    from hookdeck.provision import retryable_status_codes
+
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    doctor_env.setattr(cli.shutil, "which", lambda _b: "/usr/local/bin/hookdeck")
+    doctor_env.setattr(cli, "_cli_version", lambda _b: "2.4.0")
+    doctor_env.setattr(cli, "_other_hookdeck_binaries", lambda _r: [])
+    fake_api.responses["list_connections"] = {
+        "models": [{"name": "payments", "team_id": "tm_1",
+                    "rules": [{"type": "retry", "count": 10,
+                               "response_status_codes": retryable_status_codes()}]}]
+    }
+    fake_api.responses["list_sources"] = {
+        "models": [{"id": "src_1", "name": "payments",
+                    "config": {"auth_type": "STRIPE", "auth": {}}}]
+    }
+    _configure(doctor_env, secret="s", cli_config_path="",
+               routes={"payments": {"source": "payments", "source_type": "STRIPE"}})
+
+    assert cli.hookdeck_command(_ns("doctor")) == 0
+    out = capsys.readouterr().out
+    assert "configured to verify as STRIPE" in out
+    # No need to guess from traffic when the source answers directly.
+    assert not calls_named(fake_api, "list_requests")

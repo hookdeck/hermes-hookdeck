@@ -515,11 +515,18 @@ async def _check_source_verification(api: HookdeckAPI, routes: dict) -> list[Che
     one carrying `sha256=deadbeef` were both accepted by a GITHUB source with
     no secret, and both produced events.
 
-    The source's own record does not say whether a secret is configured; a
-    source with one set is byte-identical to one without over the API. So the
-    only signal is observed traffic, where each request carries `verified`.
-    That means this can confirm a problem but never confirm its absence, and it
-    says which of the two it is doing rather than implying the stronger one.
+    There are two source shapes and the API is only forthcoming about one:
+
+    * a **typed** source (`type: STRIPE`) hides its config entirely — one with
+      a secret set is byte-identical to one without, confirmed against a source
+      whose secret was definitely configured. Nothing to read.
+    * a **generic** source carrying `auth_type: STRIPE` reports that
+      `auth_type` back, though not the secret. That is a direct answer.
+
+    So this reads `auth_type` when it is there, and falls back to observed
+    traffic — the `verified` flag on inbound requests — when it is not. The
+    fallback can confirm a problem but never its absence, and says which of the
+    two it is doing rather than implying the stronger one.
     """
     typed = {
         name: route
@@ -537,6 +544,19 @@ async def _check_source_verification(api: HookdeckAPI, routes: dict) -> list[Che
         if not found:
             continue
         source = found[0]
+
+        # A generic source states its auth_type, so no inference is needed.
+        configured = ((source.get("config") or {}).get("auth_type") or "").upper()
+        if configured:
+            checks.append(
+                Check(
+                    True,
+                    f"source '{source.get('name')}' is configured to verify as "
+                    f"{configured}",
+                )
+            )
+            continue
+
         requests = _models(
             await api.list_requests(source_id=source.get("id"), limit=10)
         )
