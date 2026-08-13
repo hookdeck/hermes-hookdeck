@@ -686,7 +686,9 @@ def _typed_route_doctor(doctor_env, fake_api, monkeypatch, *, requests):
                     "rules": [{"type": "retry", "count": 10,
                                "response_status_codes": retryable_status_codes()}]}]
     }
-    fake_api.responses["list_sources"] = {"models": [{"id": "src_1", "name": "payments"}]}
+    fake_api.responses["list_sources"] = {
+        "models": [{"id": "src_1", "name": "payments", "type": "STRIPE"}]
+    }
     fake_api.responses["list_requests"] = {"models": requests}
     _configure(doctor_env, secret="s", cli_config_path="",
                routes={"payments": {"source": "payments", "source_type": "STRIPE"}})
@@ -776,14 +778,78 @@ def test_doctor_reads_auth_type_directly_when_the_source_states_it(
                                "response_status_codes": retryable_status_codes()}]}]
     }
     fake_api.responses["list_sources"] = {
-        "models": [{"id": "src_1", "name": "payments",
+        "models": [{"id": "src_1", "name": "payments", "type": "WEBHOOK",
                     "config": {"auth_type": "STRIPE", "auth": {}}}]
     }
+    fake_api.responses["list_requests"] = {"models": []}
     _configure(doctor_env, secret="s", cli_config_path="",
                routes={"payments": {"source": "payments", "source_type": "STRIPE"}})
 
     assert cli.hookdeck_command(_ns("doctor")) == 0
     out = capsys.readouterr().out
     assert "configured to verify as STRIPE" in out
-    # No need to guess from traffic when the source answers directly.
-    assert not calls_named(fake_api, "list_requests")
+    assert "no traffic yet to confirm the secret is the right one" in out
+    # Configured is not working: the traffic check still runs, because a wrong
+    # secret looks identical to a missing one from the outside.
+    assert calls_named(fake_api, "list_requests")
+
+
+def test_a_declared_auth_type_does_not_excuse_failing_traffic(
+    doctor_env, fake_api, monkeypatch, capsys
+):
+    # The regression this exists for: reporting "configured to verify as
+    # STRIPE" and stopping there. A wrong secret leaves auth_type set and every
+    # request failing — and Stripe issues a different secret per endpoint, so
+    # pasting the wrong one is a realistic way to arrive here.
+    from hookdeck.provision import retryable_status_codes
+
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    doctor_env.setattr(cli.shutil, "which", lambda _b: "/usr/local/bin/hookdeck")
+    doctor_env.setattr(cli, "_cli_version", lambda _b: "2.4.0")
+    doctor_env.setattr(cli, "_other_hookdeck_binaries", lambda _r: [])
+    fake_api.responses["list_connections"] = {
+        "models": [{"name": "payments", "team_id": "tm_1",
+                    "rules": [{"type": "retry", "count": 10,
+                               "response_status_codes": retryable_status_codes()}]}]
+    }
+    fake_api.responses["list_sources"] = {
+        "models": [{"id": "src_1", "name": "payments", "type": "WEBHOOK",
+                    "config": {"auth_type": "STRIPE", "auth": {}}}]
+    }
+    fake_api.responses["list_requests"] = {"models": [{"verified": False}] * 3}
+    _configure(doctor_env, secret="s", cli_config_path="",
+               routes={"payments": {"source": "payments", "source_type": "STRIPE"}})
+
+    assert cli.hookdeck_command(_ns("doctor")) == 1
+    out = capsys.readouterr().out
+    assert "3 of its last 3 requests were not verified" in out
+    assert "the one for the endpoint actually sending" in out
+
+
+def test_the_source_is_read_from_the_api_not_from_our_config(
+    doctor_env, fake_api, monkeypatch, capsys
+):
+    # Config says what we would provision; the source says what is there. A
+    # source changed in the dashboard afterwards is the case worth catching, so
+    # a route claiming WEBHOOK must not hide a provider-typed source.
+    from hookdeck.provision import retryable_status_codes
+
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    doctor_env.setattr(cli.shutil, "which", lambda _b: "/usr/local/bin/hookdeck")
+    doctor_env.setattr(cli, "_cli_version", lambda _b: "2.4.0")
+    doctor_env.setattr(cli, "_other_hookdeck_binaries", lambda _r: [])
+    fake_api.responses["list_connections"] = {
+        "models": [{"name": "payments", "team_id": "tm_1",
+                    "rules": [{"type": "retry", "count": 10,
+                               "response_status_codes": retryable_status_codes()}]}]
+    }
+    fake_api.responses["list_sources"] = {
+        "models": [{"id": "src_1", "name": "payments", "type": "GITHUB"}]
+    }
+    fake_api.responses["list_requests"] = {"models": [{"verified": False}]}
+    # Route says nothing about a source type at all.
+    _configure(doctor_env, secret="s", cli_config_path="",
+               routes={"payments": {"source": "payments"}})
+
+    assert cli.hookdeck_command(_ns("doctor")) == 1
+    assert "should verify as GITHUB" in capsys.readouterr().out

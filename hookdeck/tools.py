@@ -119,10 +119,14 @@ def _payload_text(body: Any) -> str:
 
     Missed for a long time because a model tidies it up when it summarises, so
     a transcript looks right while the tool's own return value is wrong.
+
+    Matched exactly — one key, holding a string — rather than on the presence
+    of ``body``. A payload is third-party JSON and may well have a ``body``
+    field of its own; unwrapping that would quietly return a fragment of the
+    event as though it were the whole thing.
     """
-    if isinstance(body, dict) and "body" in body:
-        inner = body["body"]
-        return inner if isinstance(inner, str) else json.dumps(inner)
+    if isinstance(body, dict) and set(body) == {"body"} and isinstance(body["body"], str):
+        return body["body"]
     return body if isinstance(body, str) else json.dumps(body)
 
 

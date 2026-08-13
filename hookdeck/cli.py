@@ -507,97 +507,99 @@ def _api_key_project() -> str:
 
 
 async def _check_source_verification(api: HookdeckAPI, routes: dict) -> list[Check]:
-    """Whether a provider-typed source is actually verifying anything.
+    """Whether a source that should be verifying actually is.
 
-    Setting a source's type to STRIPE or GITHUB does *not* switch verification
-    on. The provider's own signing secret has to be set on the source, and
-    until it is the source accepts anything — measured: an unsigned request and
-    one carrying `sha256=deadbeef` were both accepted by a GITHUB source with
-    no secret, and both produced events.
+    Naming a provider does not switch verification on. The provider's own
+    signing secret has to be set, and until it is the source accepts anything —
+    measured: an unsigned request and one carrying `sha256=deadbeef` were both
+    accepted by a GITHUB source with no secret, and both produced events.
 
-    There are two source shapes and the API is only forthcoming about one:
+    Two things are asked, because they answer different questions:
 
-    * a **typed** source (`type: STRIPE`) hides its config entirely — one with
-      a secret set is byte-identical to one without, confirmed against a source
-      whose secret was definitely configured. Nothing to read.
-    * a **generic** source carrying `auth_type: STRIPE` reports that
-      `auth_type` back, though not the secret. That is a direct answer.
+    * **Is it configured?** A generic source carrying `auth_type: STRIPE`
+      reports that back, so this is a direct answer. A source whose `type`
+      names the provider hides its config entirely — one with a secret set is
+      byte-identical to one without — so for those there is nothing to read.
+    * **Is it working?** Only traffic can say. Each inbound request carries
+      `verified`, and a configured-but-wrong secret looks exactly like a
+      missing one from the outside. Stripe issues a different secret per
+      endpoint, so a mismatch is a realistic way to get here.
 
-    So this reads `auth_type` when it is there, and falls back to observed
-    traffic — the `verified` flag on inbound requests — when it is not. The
-    fallback can confirm a problem but never its absence, and says which of the
-    two it is doing rather than implying the stronger one.
+    Configured is therefore never treated as sufficient: it refines the message
+    and never suppresses the traffic check.
+
+    The source is read from the API rather than from our config, because the
+    config says what we would provision, not what is there. A source created by
+    hand, or changed in the dashboard afterwards, is the case worth catching.
     """
-    typed = {
-        name: route
-        for name, route in routes.items()
-        if str(route.get("source_type") or "WEBHOOK").upper() != "WEBHOOK"
-    }
-    if not typed:
-        return []
-
     checks: list[Check] = []
-    for route_name, route in typed.items():
-        source_type = str(route["source_type"]).upper()
+    for route_name, route in routes.items():
         source_name = route.get("source") or route_name
         found = _models(await api.list_sources(name=source_name))
         if not found:
             continue
         source = found[0]
+        name = source.get("name") or source_name
+        declared = ((source.get("config") or {}).get("auth_type") or "").upper()
+        source_type = str(source.get("type") or "WEBHOOK").upper()
 
-        # A generic source states its auth_type, so no inference is needed.
-        configured = ((source.get("config") or {}).get("auth_type") or "").upper()
-        if configured:
-            checks.append(
-                Check(
-                    True,
-                    f"source '{source.get('name')}' is configured to verify as "
-                    f"{configured}",
-                )
-            )
+        # A plain WEBHOOK source with no provider auth verifies with the
+        # project's own signing secret, which the adapter checks on every
+        # delivery. Nothing to say.
+        if source_type == "WEBHOOK" and not declared:
             continue
 
+        scheme = declared or source_type
         requests = _models(
             await api.list_requests(source_id=source.get("id"), limit=10)
         )
-        if not requests:
-            checks.append(
-                Check(
-                    True,
-                    f"source '{source.get('name')}' is type {source_type} — no "
-                    "traffic yet, so verification is unconfirmed",
-                    note=(
-                        f"A {source_type} source verifies nothing until the "
-                        "provider's signing secret is set on it in the Hookdeck "
-                        "dashboard, and the API does not report whether it is. "
-                        "Until then the source accepts forged payloads."
-                    ),
-                )
-            )
-            continue
-
         unverified = [r for r in requests if not r.get("verified")]
+
         if unverified:
             checks.append(
                 Check(
                     False,
-                    f"source '{source.get('name')}' is type {source_type} but "
+                    f"source '{name}' should verify as {scheme}, but "
                     f"{len(unverified)} of its last {len(requests)} requests "
                     "were not verified — its signing secret is missing or does "
                     "not match the sender's.",
                     note=(
                         "Set the provider's signing secret on the source in the "
-                        "Hookdeck dashboard. Without it the source accepts "
-                        "anything, including forged payloads."
+                        "Hookdeck dashboard, and check it is the one for the "
+                        "endpoint actually sending. Until it matches, the "
+                        "source accepts anything, including forged payloads."
                     ),
+                )
+            )
+        elif requests:
+            checks.append(
+                Check(
+                    True,
+                    f"source '{name}' verified all of its last {len(requests)} "
+                    f"requests as {scheme}",
+                )
+            )
+        elif declared:
+            checks.append(
+                Check(
+                    True,
+                    f"source '{name}' is configured to verify as {scheme} — no "
+                    "traffic yet to confirm the secret is the right one",
                 )
             )
         else:
             checks.append(
                 Check(
                     True,
-                    f"source '{source.get('name')}' verified all of its last "
-                    f"{len(requests)} requests as {source_type}",
+                    f"source '{name}' is type {scheme} — no traffic yet, so "
+                    "verification is unconfirmed",
+                    note=(
+                        f"A {scheme} source verifies nothing until the "
+                        "provider's signing secret is set on it in the Hookdeck "
+                        "dashboard, and for this source shape the API does not "
+                        "report whether it is. Until then it accepts forged "
+                        "payloads."
+                    ),
                 )
             )
     return checks

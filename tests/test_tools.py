@@ -421,10 +421,21 @@ def test_an_unwrapped_string_body_still_works(api):
     )
 
 
-def test_a_wrapper_holding_a_structured_body_is_serialised(api):
+def test_only_the_exact_envelope_shape_is_unwrapped(api):
+    # Measured: the endpoint always answers exactly {"body": "<string>"}. So a
+    # dict shaped any other way is the payload, not the envelope — including
+    # third-party JSON that happens to carry its own `body` field. Unwrapping
+    # that would return a fragment of the event as though it were the whole
+    # thing, which is worse than the envelope it replaced.
+    api.responses["get_event_raw_body"] = {"body": "inner", "from": "acme"}
+    assert json.loads(call("hookdeck_get_event_body", {"event_id": "evt_1"})) == {
+        "body": "inner",
+        "from": "acme",
+    }
+
     api.responses["get_event_raw_body"] = {"body": {"kind": "structured"}}
     assert json.loads(call("hookdeck_get_event_body", {"event_id": "evt_1"})) == {
-        "kind": "structured"
+        "body": {"kind": "structured"}
     }
 
 
