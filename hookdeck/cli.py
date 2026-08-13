@@ -553,14 +553,28 @@ async def _check_source_verification(api: HookdeckAPI, routes: dict) -> list[Che
         requests = _models(
             await api.list_requests(source_id=source.get("id"), limit=10)
         )
-        unverified = [r for r in requests if not r.get("verified")]
+        # Only requests that actually carry the field can be judged. Treating
+        # an absent `verified` as false would turn a listing that simply does
+        # not report it into "your source is accepting forgeries" — a false
+        # alarm that sends someone to re-paste a secret that was never wrong.
+        judged = [r for r in requests if "verified" in r]
+        unverified = [r for r in judged if not r["verified"]]
 
-        if unverified:
+        if requests and not judged:
+            checks.append(
+                Check(
+                    True,
+                    f"source '{name}' should verify as {scheme}, but this "
+                    "Hookdeck response does not report whether its requests "
+                    "were verified — unconfirmed",
+                )
+            )
+        elif unverified:
             checks.append(
                 Check(
                     False,
                     f"source '{name}' should verify as {scheme}, but "
-                    f"{len(unverified)} of its last {len(requests)} requests "
+                    f"{len(unverified)} of its last {len(judged)} requests "
                     "were not verified — its signing secret is missing or does "
                     "not match the sender's.",
                     note=(
@@ -571,11 +585,11 @@ async def _check_source_verification(api: HookdeckAPI, routes: dict) -> list[Che
                     ),
                 )
             )
-        elif requests:
+        elif judged:
             checks.append(
                 Check(
                     True,
-                    f"source '{name}' verified all of its last {len(requests)} "
+                    f"source '{name}' verified all of its last {len(judged)} "
                     f"requests as {scheme}",
                 )
             )

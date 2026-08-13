@@ -853,3 +853,63 @@ def test_the_source_is_read_from_the_api_not_from_our_config(
 
     assert cli.hookdeck_command(_ns("doctor")) == 1
     assert "should verify as GITHUB" in capsys.readouterr().out
+
+
+def test_requests_without_a_verified_field_are_unknown_not_failures(
+    doctor_env, fake_api, monkeypatch, capsys
+):
+    # A sibling integration measured `/requests` listings that omit `verified`.
+    # It is present on this project, but if it ever is not, reading a missing
+    # key as false turns "the API did not say" into "your source is accepting
+    # forgeries" — and sends someone to re-paste a secret that was fine.
+    from hookdeck.provision import retryable_status_codes
+
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    doctor_env.setattr(cli.shutil, "which", lambda _b: "/usr/local/bin/hookdeck")
+    doctor_env.setattr(cli, "_cli_version", lambda _b: "2.4.0")
+    doctor_env.setattr(cli, "_other_hookdeck_binaries", lambda _r: [])
+    fake_api.responses["list_connections"] = {
+        "models": [{"name": "payments", "team_id": "tm_1",
+                    "rules": [{"type": "retry", "count": 10,
+                               "response_status_codes": retryable_status_codes()}]}]
+    }
+    fake_api.responses["list_sources"] = {
+        "models": [{"id": "src_1", "name": "payments", "type": "STRIPE"}]
+    }
+    # Requests exist, but none reports the field.
+    fake_api.responses["list_requests"] = {"models": [{"id": "req_1"}, {"id": "req_2"}]}
+    _configure(doctor_env, secret="s", cli_config_path="",
+               routes={"payments": {"source": "payments", "source_type": "STRIPE"}})
+
+    assert cli.hookdeck_command(_ns("doctor")) == 0  # unknowable, not broken
+    out = capsys.readouterr().out
+    assert "does not report whether its requests were verified" in out
+    assert "were not verified" not in out
+
+
+def test_a_mix_is_judged_only_on_what_reports_itself(
+    doctor_env, fake_api, monkeypatch, capsys
+):
+    from hookdeck.provision import retryable_status_codes
+
+    monkeypatch.setenv("HOOKDECK_API_KEY", "key")
+    doctor_env.setattr(cli.shutil, "which", lambda _b: "/usr/local/bin/hookdeck")
+    doctor_env.setattr(cli, "_cli_version", lambda _b: "2.4.0")
+    doctor_env.setattr(cli, "_other_hookdeck_binaries", lambda _r: [])
+    fake_api.responses["list_connections"] = {
+        "models": [{"name": "payments", "team_id": "tm_1",
+                    "rules": [{"type": "retry", "count": 10,
+                               "response_status_codes": retryable_status_codes()}]}]
+    }
+    fake_api.responses["list_sources"] = {
+        "models": [{"id": "src_1", "name": "payments", "type": "STRIPE"}]
+    }
+    fake_api.responses["list_requests"] = {
+        "models": [{"verified": False}, {"id": "no_field"}, {"verified": True}]
+    }
+    _configure(doctor_env, secret="s", cli_config_path="",
+               routes={"payments": {"source": "payments", "source_type": "STRIPE"}})
+
+    assert cli.hookdeck_command(_ns("doctor")) == 1
+    # Two judged, not three: the one that said nothing is not counted either way.
+    assert "1 of its last 2 requests were not verified" in capsys.readouterr().out
