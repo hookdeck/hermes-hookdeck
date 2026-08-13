@@ -110,6 +110,26 @@ def _with_ledger(action) -> None:
         ledger.close()
 
 
+def _payload_text(body: Any) -> str:
+    """The payload out of ``GET /events/{id}/raw_body``.
+
+    The endpoint answers ``{"body": "<text>"}`` — a wrapper, not the payload.
+    Returning it whole hands the model an escaped string inside an envelope
+    when what it asked for was what the provider sent.
+
+    Missed for a long time because a model tidies it up when it summarises, so
+    a transcript looks right while the tool's own return value is wrong.
+
+    Matched exactly — one key, holding a string — rather than on the presence
+    of ``body``. A payload is third-party JSON and may well have a ``body``
+    field of its own; unwrapping that would quietly return a fragment of the
+    event as though it were the whole thing.
+    """
+    if isinstance(body, dict) and set(body) == {"body"} and isinstance(body["body"], str):
+        return body["body"]
+    return body if isinstance(body, str) else json.dumps(body)
+
+
 def _models(result: Any) -> list[dict]:
     if not isinstance(result, dict):
         return []
@@ -203,8 +223,7 @@ def hookdeck_get_event_body(args: dict) -> str:
     async def _go() -> str:
         async with HookdeckAPI() as api:
             body = await api.get_event_raw_body(event_id)
-        text = json.dumps(body) if not isinstance(body, str) else body
-        return text[:8000]
+        return _payload_text(body)[:8000]
 
     return _run(_go())
 
